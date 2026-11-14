@@ -60,7 +60,7 @@ installer-icon = "assets/icon.ico"
 installer-mode = "currentUser"
 
 [package.metadata.packager.macos]
-minimum-system-version = "12.0"
+minimum-system-version = "13.4"
 
 # Demosaicing 61 MP in an unoptimised build is painfully slow; keep debug builds usable.
 [profile.dev]

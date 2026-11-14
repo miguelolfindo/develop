@@ -15,6 +15,8 @@ env:
   # release and checked before packaging.
   MODEL_URL: https://github.com/darktable-org/darktable-ai/releases/download/release-5.6.0/rawdenoise-nind.dtmodel
   MODEL_SHA256: d71b5f1e727c85a359e6f74dca9e2016c9d8fc3e2f7ac3e9b347d80ceca969af
+  # ONNX Runtime's prebuilt macOS library targets macOS 13.4; build for the same.
+  MACOSX_DEPLOYMENT_TARGET: "13.4"
 
 jobs:
   package:
