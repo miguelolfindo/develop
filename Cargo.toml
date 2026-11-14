@@ -44,7 +44,8 @@ description = "GPU raw photo processor"
 category = "Photography"
 out-dir = "dist"
 before-packaging-command = "cargo build --release"
-icons = ["assets/icon.png", "assets/icon.ico"]
+# macOS builds its .icns from the PNGs (512 px, and 1024 px as 512 @2x); Windows uses the .ico.
+icons = ["assets/icon-512.png", "assets/icon@2x.png", "assets/icon.ico"]
 resources = [
     # The AI denoise model (GPL-3.0, from darktable-ai), looked for in `models/` beside the app.
     { src = "models/rawnind_bayer.onnx", target = "models/rawnind_bayer.onnx" },
