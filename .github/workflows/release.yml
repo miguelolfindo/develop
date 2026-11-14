@@ -55,7 +55,9 @@ jobs:
           rm model.zip
 
       - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
 
       - name: Build and package
         run: cargo packager --release --formats ${{ matrix.format }}
