@@ -26,7 +26,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             format: nsis
             artifact: dist/*.exe
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             format: dmg
             artifact: dist/*.dmg
