@@ -1,4 +1,4 @@
-//! Stage 1 (runs once per file, off the UI thread): decode the ARW, normalise black/white
+//! Stage 1 (runs once per file, off the UI thread): decode the file, normalise black/white
 //! levels, demosaic, and build the RGBA16F mip chain that gets uploaded to the GPU.
 //!
 //! The result is *camera-space* linear RGB. White balance and the camera -> sRGB matrix are
@@ -42,7 +42,7 @@ pub struct DecodedImage {
     pub baseline_exposure: Option<f32>,
     /// Bits per sample in the file.
     pub bits: u8,
-    /// Camera and lens, and the camera's own lens corrections (Sony ARW), for lens correction.
+    /// Camera and lens, and the camera's own lens corrections (if the file has them), for lens correction.
     pub exif: crate::lens::Exif,
     pub embedded: Option<crate::lens::Embedded>,
 }
@@ -569,7 +569,7 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
         bits: meta.bits,
         embedded: info.as_ref().and_then(|i| {
             let tail = |v: &Vec<i32>| v.get(1..).map(|s| s.to_vec()).unwrap_or_default();
-            crate::lens::Embedded::from_tags(&tail(&i.sony_distortion), &tail(&i.sony_ca), &tail(&i.sony_vignetting))
+            crate::lens::Embedded::from_tags(&tail(&i.embedded_distortion), &tail(&i.embedded_ca), &tail(&i.embedded_vignetting))
         }),
         exif: meta.exif,        baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
     })

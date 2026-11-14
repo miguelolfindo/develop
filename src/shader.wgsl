@@ -62,7 +62,7 @@ struct Params {
     vig: vec4<f32>,
     vig2: vec4<f32>,
     fringe: vec4<f32>,
-    // Embedded (Sony) correction per knot: distortion, red CA, blue CA, vignetting falloff.
+    // The camera's embedded correction per knot: distortion, red CA, blue CA, vignetting falloff.
     knots: array<vec4<f32>, 16>,
 };
 
@@ -164,7 +164,7 @@ fn curve_lookup(x: f32) -> f32 {
 }
 
 // Built-in "Standard" curve, fitted to patch measurements of Lightroom's default rendering
-// of an a7R V file: an exponential shoulder times a toe that keeps deep shadows dark.
+// of the reference file: an exponential shoulder times a toe that keeps deep shadows dark.
 fn fitted_curve(x: vec3<f32>) -> vec3<f32> {
     let toe = vec3<f32>(0.22) + 0.78 * smoothstep(vec3<f32>(0.0), vec3<f32>(0.20), x);
     return (vec3<f32>(1.0) - exp(-4.4 * x)) * toe;

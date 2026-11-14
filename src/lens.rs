@@ -1,6 +1,6 @@
 //! Lens correction: a loader for Lensfun XML databases dropped into a folder, matching of
 //! the open photo's lens, interpolation of the calibration to its focal length and aperture,
-//! Sony's own correction data embedded in ARW files, and the numbers the shader needs.
+//! the camera's own correction data embedded in raw files, and the numbers the shader needs.
 //!
 //! Lensfun conventions (from its source, libs/lensfun/mod-*.cpp):
 //! - Distortion and TCA use Hugin units: r = 1 at half the shorter side of a 3:2 frame of the
@@ -10,7 +10,7 @@
 //! - The models map undistorted (output) radius to distorted (source) radius, which is the
 //!   direction a shader needs; vignetting is corrected by dividing by the polynomial.
 //!
-//! Sony embedded corrections (as darktable reads them): ARW tags 0x7037 (distortion),
+//! Embedded corrections (as darktable reads them from ARW files): tags 0x7037 (distortion),
 //! 0x7035 (chromatic aberration, red then blue) and 0x7032 (vignetting), each a count `nc`
 //! followed by the values; knots at (i + 0.5) / (nc - 1) of the half diagonal.
 
@@ -36,7 +36,7 @@ impl Source {
         match self {
             Source::Auto => "Auto (Lensfun / Embedded)",
             Source::Lensfun => "Lensfun XML",
-            Source::Embedded => "Sony Embedded",
+            Source::Embedded => "Camera Embedded",
         }
     }
 
@@ -172,7 +172,7 @@ pub struct Exif {
     pub fnumber: f32,
 }
 
-/// Sony's own correction tables from an ARW file, already converted to factors.
+/// The camera's own correction tables from a raw file, already converted to factors.
 #[derive(Clone, Debug)]
 pub struct Embedded {
     /// Per knot: distortion factor, red and blue CA factors, vignetting falloff.

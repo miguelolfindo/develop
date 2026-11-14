@@ -10,7 +10,7 @@ license = "GPL-3.0-or-later"
 eframe = { version = "0.27", features = ["wgpu"] }
 bytemuck = { version = "1.14", features = ["derive"] }
 rfd = "0.14"      # native file dialog
-rawler = "0.7"    # ARW decoding (knows the a7R V, including lossless-compressed ARW)
+rawler = "0.7"    # raw decoding (ARW, DNG and other camera formats)
 rayon = "1.8"     # multi-threaded CPU demosaic
 half = "2"        # f32 -> f16 for the RGBA16F texture
 # Export: resizing and JPEG / PNG / TIFF encoding.

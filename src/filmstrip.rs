@@ -598,11 +598,11 @@ pub struct TiffInfo {
     pub lens_model: Option<String>,
     pub focal: Option<f32>,
     pub fnumber: Option<f32>,
-    /// Sony's embedded lens corrections (tags 0x7037, 0x7035, 0x7032), each starting with
+    /// The camera's embedded lens corrections (tags 0x7037, 0x7035, 0x7032), each starting with
     /// its count.
-    pub sony_distortion: Vec<i32>,
-    pub sony_ca: Vec<i32>,
-    pub sony_vignetting: Vec<i32>,
+    pub embedded_distortion: Vec<i32>,
+    pub embedded_ca: Vec<i32>,
+    pub embedded_vignetting: Vec<i32>,
 }
 
 /// Walk the directories of a TIFF structure that starts at `base` in `r`.
@@ -708,9 +708,9 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
                             })
                             .collect();
                         match tag {
-                            0x7037 => info.sony_distortion = values,
-                            0x7035 => info.sony_ca = values,
-                            _ => info.sony_vignetting = values,
+                            0x7037 => info.embedded_distortion = values,
+                            0x7035 => info.embedded_ca = values,
+                            _ => info.embedded_vignetting = values,
                         }
                     }
                 }

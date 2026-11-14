@@ -1,11 +1,11 @@
 //! Per-photo settings, remembered between photos and between runs.
 //!
-//! Each edited or rated photo has a small sidecar file next to it (`DSC01234.ARW.srp`), so
+//! Each edited or rated photo has a small sidecar file next to it (`DSC01234.ARW.dvlp`), so
 //! its settings travel with it when the photo is moved or copied together with the sidecar.
 //! A folder's sidecars are read when the folder is first shown. Only photos whose settings
 //! differ from their defaults, or that have a rating, get a sidecar.
 //!
-//! `%APPDATA%\SonyRawProcessor\photo-settings.tsv` (`~/.config/...` elsewhere) is the older
+//! `photo-settings.tsv` in the settings folder (see `settings_dir`) is the older
 //! central store, keyed by path. It is still read; its entries are moved into sidecars as
 //! their folders are opened, and it keeps only photos in folders that cannot be written.
 
@@ -57,7 +57,22 @@ pub struct Store {
     changed: Option<Instant>,
 }
 
-fn store_file() -> Option<PathBuf> {
+/// The app's settings folder: `%APPDATA%\Develop` on Windows,
+/// `~/Library/Application Support/Develop` on macOS, `~/.config/develop` elsewhere.
+pub fn settings_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Develop"))
+    } else if cfg!(target_os = "macos") {
+        Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Develop"))
+    } else if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(dir).join("develop"))
+    } else {
+        Some(PathBuf::from(std::env::var_os("HOME")?).join(".config/develop"))
+    }
+}
+
+/// Where earlier versions kept their settings (`SonyRawProcessor`).
+fn legacy_settings_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?)
     } else if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -65,7 +80,32 @@ fn store_file() -> Option<PathBuf> {
     } else {
         PathBuf::from(std::env::var_os("HOME")?).join(".config")
     };
-    Some(base.join("SonyRawProcessor").join("photo-settings.tsv"))
+    Some(base.join("SonyRawProcessor"))
+}
+
+/// Copy settings from the folder earlier versions used into the current one, once: only
+/// files the new folder does not have yet. The old folder is left as it was.
+pub fn migrate_legacy_settings() {
+    let (Some(old), Some(new)) = (legacy_settings_dir(), settings_dir()) else { return };
+    if !old.is_dir() || new.join("photo-settings.tsv").exists() {
+        return;
+    }
+    fn copy_missing(from: &Path, to: &Path) {
+        let _ = std::fs::create_dir_all(to);
+        for entry in std::fs::read_dir(from).into_iter().flatten().filter_map(|e| e.ok()) {
+            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            if src.is_dir() {
+                copy_missing(&src, &dst);
+            } else if !dst.exists() {
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+    }
+    copy_missing(&old, &new);
+}
+
+fn store_file() -> Option<PathBuf> {
+    Some(settings_dir()?.join("photo-settings.tsv"))
 }
 
 /// Where the export settings and presets are kept.
@@ -109,14 +149,22 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens }))
 }
 
-/// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.srp` beside it.
+/// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.dvlp` beside it.
 pub fn sidecar_path(photo: &Path) -> PathBuf {
+    sidecar_with(photo, SIDECAR_EXTENSION)
+}
+
+fn sidecar_with(photo: &Path, extension: &str) -> PathBuf {
     let mut name = photo.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-    name.push(".srp");
+    name.push(".");
+    name.push(extension);
     photo.with_file_name(name)
 }
 
-const SIDECAR_HEADER: &str = "Sony RAW Processor settings\t1";
+const SIDECAR_EXTENSION: &str = "dvlp";
+/// Earlier versions' sidecar extension; such files are read and replaced by `.dvlp` ones.
+const LEGACY_SIDECAR_EXTENSION: &str = "srp";
+const SIDECAR_HEADER: &str = "Develop settings\t1";
 
 /// The settings fields of a stored line (everything after the path).
 fn saved_fields(s: &Saved) -> String {
@@ -203,10 +251,20 @@ impl Store {
         self.folders.insert(dir.to_path_buf());
         for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("srp")) {
+            let extension = path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let legacy = extension == LEGACY_SIDECAR_EXTENSION;
+            if extension != SIDECAR_EXTENSION && !legacy {
                 continue;
             }
-            let photo = path.with_extension(""); // DSC01234.ARW.srp -> DSC01234.ARW
+            let photo = path.with_extension(""); // DSC01234.ARW.dvlp -> DSC01234.ARW
+            // An old-style sidecar is only used when there is no current one; it is then
+            // written out as `.dvlp` (and removed) on the next save.
+            if legacy {
+                if sidecar_path(&photo).exists() {
+                    continue;
+                }
+                self.touch(&photo);
+            }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             let (saved, rating) = parse_sidecar(&text);
             match saved {
@@ -291,9 +349,11 @@ impl Store {
         for photo in std::mem::take(&mut self.dirty) {
             let sidecar = sidecar_path(&photo);
             let (saved, rating) = (self.photos.get(&photo), self.rating(&photo));
+            let legacy = sidecar_with(&photo, LEGACY_SIDECAR_EXTENSION);
             if saved.is_none() && rating == 0 {
                 // Nothing left to remember: no sidecar, no central entry.
                 let _ = std::fs::remove_file(&sidecar);
+                let _ = std::fs::remove_file(&legacy);
                 self.central_changed |= self.central.remove(&photo);
                 continue;
             }
@@ -306,6 +366,7 @@ impl Store {
             }
             if write_whole(&sidecar, &text) {
                 self.central_changed |= self.central.remove(&photo);
+                let _ = std::fs::remove_file(&legacy);
             } else {
                 // The folder cannot be written (a card, a read-only disk): keep it centrally.
                 self.central.insert(photo);

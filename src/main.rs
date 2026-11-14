@@ -1,4 +1,4 @@
-//! Sony a7R V raw processor.
+//! Develop: a GPU raw photo processor.
 //!
 //! Stage 1 (raw.rs, background thread, once per file): decode -> normalise -> demosaic -> GPU texture.
 //! Stage 2 (shader.wgsl, every frame): white balance, exposure, tone, contrast, saturation, sRGB.
@@ -68,7 +68,7 @@ fn main() -> eframe::Result<()> {
                     wgpu::Limits::default()
                 };
                 wgpu::DeviceDescriptor {
-                    label: Some("sony raw device"),
+                    label: Some("develop device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits {
                         max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
@@ -170,8 +170,8 @@ enum Profile {
 }
 
 /// Baseline exposure (stops) Adobe applies to this camera before the profile's tone curve.
-/// It is not stored in ARW files or in the .dcp, so it is a constant here: +0.35 matches
-/// Lightroom's sky tones on an a7R V file and is exactly what Sony's camera-matching
+/// It is not stored in the raw file or in the .dcp, so it is a constant here: +0.35 matches
+/// Lightroom's sky tones on the reference file and is exactly what the camera-matching
 /// profiles cancel with their -0.35 offset. `--baseline` overrides it for testing.
 const BASELINE_EXPOSURE: f32 = 0.35;
 
@@ -182,10 +182,10 @@ const TINT_STRENGTH: f32 = 0.0034;
 const SHARPEN_SCALE: f32 = 0.0295;
 
 /// Contrast that turns Adobe Standard into an approximation of Lightroom's "Adobe Color":
-/// fitted to shadow and sky patches of Lightroom exports of an a7R V file.
+/// fitted to shadow and sky patches of Lightroom exports of the reference file.
 const ADOBE_COLOR_CONTRAST: f32 = 1.18;
 
-/// Adobe camera profiles installed for `camera` (for example "Sony ILCE-7RM5"), Adobe
+/// Adobe camera profiles installed for `camera` (maker and model, as Adobe names them), Adobe
 /// Standard first, then the camera-matching ones.
 fn find_camera_profiles(camera: &str) -> Vec<(String, dcp::Dcp, f32)> {
     let mut roots = Vec::new();
@@ -237,7 +237,7 @@ struct Loaded {
     full_size: (u32, u32),
     bits: u8,
     seconds: f32,
-    /// Camera and lens for lens correction, and Sony's embedded corrections.
+    /// Camera and lens for lens correction, and the camera's own embedded corrections.
     exif: lens::Exif,
     embedded: Option<lens::Embedded>,
     width: f32,
@@ -393,6 +393,8 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        // Settings from versions that kept them under another folder name.
+        settings::migrate_legacy_settings();
         theme::apply(&cc.egui_ctx);
         let render_state = cc.wgpu_render_state.clone().expect("eframe must run with the wgpu renderer");
         let renderer = ImageRenderer::new(&render_state.device, &render_state.queue, render_state.target_format);
@@ -2241,10 +2243,10 @@ impl App {
                     let at = loaded_exif.as_ref().map_or(String::new(), |e| if e.focal > 0.0 { format!(" at {:.0} mm", e.focal) } else { String::new() });
                     (format!("Lensfun: {} {}{at}", l.maker, l.model), theme::TEAL, l.contents())
                 }
-                Some(lens::Active::Embedded) => ("Sony embedded corrections".to_owned(), theme::TEAL, "distortion, chromatic aberration, vignetting".to_owned()),
+                Some(lens::Active::Embedded) => ("Camera embedded corrections".to_owned(), theme::TEAL, "distortion, chromatic aberration, vignetting".to_owned()),
                 _ => {
                     let lens_name = loaded_exif.as_ref().map(|e| e.lens_model.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| "this lens".to_owned());
-                    (format!("No profile for {lens_name}"), theme::FADED, if has_embedded { "Sony embedded data is available".to_owned() } else { String::new() })
+                    (format!("No profile for {lens_name}"), theme::FADED, if has_embedded { "The camera's embedded corrections are available".to_owned() } else { String::new() })
                 }
             };
             ui.add(egui::Label::new(egui::RichText::new(status.0).font(theme::font(11.5)).color(status.1)).truncate(true)).on_hover_text(status.2);
