@@ -14,6 +14,7 @@ mod explorer;
 mod export;
 mod filmstrip;
 mod heic;
+mod lens;
 mod pipeline;
 mod profile;
 mod raw;
@@ -236,6 +237,9 @@ struct Loaded {
     full_size: (u32, u32),
     bits: u8,
     seconds: f32,
+    /// Camera and lens for lens correction, and Sony's embedded corrections.
+    exif: lens::Exif,
+    embedded: Option<lens::Embedded>,
     width: f32,
     height: f32,
     color: CameraColor,
@@ -330,6 +334,13 @@ struct App {
     ab_split: bool,
     ab_pos: f32,
     clipping: bool,
+    /// Presence (texture, clarity, dehaze) and lens correction of the open photo, the Lensfun
+    /// profiles found, the profile matched to the open photo, and the maker picked in the panel.
+    presence: [f32; 3],
+    lens: lens::LensSettings,
+    lens_db: lens::Database,
+    lens_auto: Option<usize>,
+    lens_make_pick: Option<String>,
     icon: Option<egui::TextureHandle>,
     /// Crop of the open photo (on the picture as stored), the crop the user last asked for
     /// (rotating shrinks the real one to fit; rotating back restores this), and the
@@ -427,6 +438,11 @@ impl App {
             ab_split: false,
             ab_pos: 0.5,
             clipping: false,
+            presence: [0.0; 3],
+            lens: lens::LensSettings::default(),
+            lens_db: lens::Database::load(),
+            lens_auto: None,
+            lens_make_pick: None,
             icon: image::load_from_memory(include_bytes!("../assets/icon-256.png")).ok().map(|icon| {
                 let small = icon.resize(72, 72, image::imageops::FilterType::Lanczos3).to_rgba8();
                 let pixels = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
@@ -586,9 +602,18 @@ impl App {
                 self.crop_drag = None;
                 self.sharpen = settings::SHARPEN_DEFAULT;
                 self.tint = 0.0;
+                self.presence = [0.0; 3];
+                self.lens = lens::LensSettings::default();
+                self.lens_make_pick = None;
+                self.lens_auto = self.lens_db.auto_match(&image.exif);
                 self.input_mode = image.input_mode;
                 self.file_baseline = image.baseline_exposure;
-                self.can_denoise = image.input_mode == 0;
+                // Bayer raws use one RawNIND model, linear DNGs (phones) the other.
+                self.can_denoise = match image.input_mode {
+                    0 => denoise::model_path(denoise::Model::Bayer).is_some(),
+                    1 => denoise::model_path(denoise::Model::Linear).is_some(),
+                    _ => false,
+                };
                 if image.input_mode == 2 {
                     self.sharpen[0] = 0.0; // a finished picture has been sharpened already
                 }
@@ -662,6 +687,17 @@ impl App {
                         "--blacks" => a.blacks = value.clamp(-100.0, 100.0),
                         // Crop, for testing: straighten angle, the four sides (0..1), crop mode.
                         "--tint" => self.tint = value.clamp(-150.0, 150.0),
+                        // Presence and lens correction, for testing.
+                        "--texture" => self.presence[0] = value.clamp(-100.0, 100.0),
+                        "--clarity" => self.presence[1] = value.clamp(-100.0, 100.0),
+                        "--dehaze" => self.presence[2] = value.clamp(-100.0, 100.0),
+                        "--lens" => self.lens.enabled = value > 0.5,
+                        "--lens-source" => self.lens.source = [lens::Source::Auto, lens::Source::Lensfun, lens::Source::Embedded][(value as usize).min(2)],
+                        "--lens-distortion" => self.lens.distortion = value.clamp(-100.0, 100.0),
+                        "--lens-constrain" => self.lens.constrain = value > 0.5,
+                        "--lens-vignette" => self.lens.vignette = value.clamp(-100.0, 100.0),
+                        "--red-cyan" => self.lens.red_cyan = value.clamp(-100.0, 100.0),
+                        "--purple" => self.lens.purple_amount = value.clamp(0.0, 100.0),
                         "--sharpen" => self.sharpen[0] = value.clamp(0.0, 150.0),
                         "--sharpen-radius" => self.sharpen[1] = value.clamp(0.5, 3.0),
                         "--sharpen-detail" => self.sharpen[2] = value.clamp(0.0, 100.0),
@@ -694,6 +730,8 @@ impl App {
                     full_size: (image.full_width, image.full_height),
                     bits: image.bits,
                     seconds,
+                    exif: image.exif.clone(),
+                    embedded: image.embedded.clone(),
                     width: shown.width as f32,
                     height: shown.height as f32,
                     color,
@@ -803,6 +841,8 @@ impl App {
         }
         self.adjust = Adjust::from_array(values);
         self.sharpen = saved.sharpen;
+        self.presence = saved.presence;
+        self.lens = saved.lens.clone();
         self.tint = saved.tint;
         self.profile = match saved.profile.as_str() {
             "Linear" => Profile::Linear,
@@ -883,6 +923,8 @@ impl App {
             angle: self.angle,
             sharpen: self.sharpen,
             tint: self.tint,
+            presence: self.presence,
+            lens: self.lens.clone(),
             values: self.adjust.to_array(),
             quarter_turns: self.quarter_turns % 4,
             profile: match self.profile {
@@ -939,19 +981,22 @@ impl App {
     /// picture to draw (size and centre in image-UV units); the viewport and export differ
     /// only in that and in who applies the sRGB encoding.
     fn uniforms(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool) -> Uniforms {
-        self.uniforms_with(loaded, view, shader_encodes_srgb, &self.adjust, self.tint, self.sharpen)
+        self.uniforms_with(loaded, view, shader_encodes_srgb, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens)
     }
 
     /// The same picture with the photo's default sliders: the "before" of the A/B split.
     /// Profile, crop, rotation and denoise stay as they are.
     fn uniforms_before(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool) -> Uniforms {
         match &self.defaults {
-            Some(d) => self.uniforms_with(loaded, view, shader_encodes_srgb, &Adjust::from_array(d.values), d.tint, d.sharpen),
+            Some(d) => self.uniforms_with(loaded, view, shader_encodes_srgb, &Adjust::from_array(d.values), d.tint, d.sharpen, d.presence, &d.lens),
             None => self.uniforms(loaded, view, shader_encodes_srgb),
         }
     }
 
-    fn uniforms_with(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool, a: &Adjust, tint: f32, sharpen: [f32; 4]) -> Uniforms {
+    #[allow(clippy::too_many_arguments)]
+    fn uniforms_with(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool, a: &Adjust, tint: f32, sharpen: [f32; 4], presence: [f32; 3], lens_settings: &lens::LensSettings) -> Uniforms {
+        let active = self.lens_active(lens_settings, loaded);
+        let lens_gpu = lens::Gpu::new(lens_settings, &active, &self.lens_db, &loaded.exif, loaded.embedded.as_ref(), loaded.width / loaded.height.max(1.0));
         let mut gains = loaded.color.wb_gains(a.kelvin);
         // Tint: green against magenta. Positive (magenta) lowers the green gain.
         gains[1] *= (-TINT_STRENGTH * tint).exp();
@@ -1007,6 +1052,16 @@ impl App {
             },
             crop: self.crop_display(),
             input: [self.input_mode as f32, 0.0, 0.0, 0.0],
+            presence: [presence[0] / 100.0, presence[1] / 100.0, presence[2] / 100.0, 0.0],
+            lens_dist: lens_gpu.dist,
+            lens_geo: lens_gpu.geo,
+            lens_str: lens_gpu.strength,
+            tca_r: lens_gpu.tca_r,
+            tca_b: lens_gpu.tca_b,
+            vig: lens_gpu.vig,
+            vig2: lens_gpu.vig2,
+            fringe: lens_gpu.fringe,
+            knots: lens_gpu.knots,
             sharpen: {
                 let [amount, radius, detail, masking] = sharpen;
                 [
@@ -1761,6 +1816,8 @@ impl App {
         self.adjust = Adjust { kelvin, ..Adjust::default() };
         self.sharpen = settings::SHARPEN_DEFAULT;
         self.tint = 0.0;
+        self.presence = [0.0; 3];
+        self.lens = lens::LensSettings::default();
         self.reset_crop();
     }
 
@@ -1960,6 +2017,13 @@ impl App {
             ui::pro_slider(ui, "Blacks", &mut a.blacks, -100.0..=100.0, 0.0, "", amber);
         });
 
+        ui::section(ui, "Presence", true, "", |ui| {
+            let [texture, clarity, dehaze] = &mut self.presence;
+            ui::pro_slider_with(ui, "Texture", texture, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+            ui::pro_slider_with(ui, "Clarity", clarity, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+            ui::pro_slider_with(ui, "Dehaze", dehaze, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+        });
+
         ui::section(ui, "Color", true, "", |ui| {
             let as_shot = self.loaded.as_ref().map(|l| l.color.as_shot_kelvin);
             let is_raw = self.input_mode != 2;
@@ -2011,22 +2075,22 @@ impl App {
         });
 
         ui::section(ui, "Detail", true, "", |ui| {
-            let has_model = denoise::model_path().is_some();
+            let has_model = denoise::model_path(denoise::Model::Bayer).is_some() || denoise::model_path(denoise::Model::Linear).is_some();
             let mut on = self.denoise;
-            let can_switch = has_model && self.loaded.is_some() && self.loading.is_none() && self.batch.is_none() && self.can_denoise;
+            let can_switch = self.loaded.is_some() && self.loading.is_none() && self.batch.is_none() && self.can_denoise;
             let hint = "Cleans noise from the sensor data with the RawNIND model. Takes a moment each time the photo is opened; the sliders stay live afterwards.";
             let flipped = ui
                 .add_enabled_ui(can_switch, |ui| ui::toggle(ui, &mut on, "AI Denoise"))
                 .inner
                 .on_hover_text(hint)
-                .on_disabled_hover_text("Needs the model file and a Bayer raw photo")
+                .on_disabled_hover_text("Works on raw photos (ARW, DNG) when the model files are installed")
                 .changed();
             if flipped {
                 self.denoise_override = Some(on);
                 self.reload = true;
             }
             if !has_model {
-                ui.label(ui::dim("Model file not found (models/rawnind_bayer.onnx).", 11.5));
+                ui.label(ui::dim("Model files not found (models/rawnind_bayer.onnx, rawnind_linear.onnx).", 11.5));
             }
             ui.add_space(8.0);
             let [amount, radius, detail, masking] = &mut self.sharpen;
@@ -2036,7 +2100,207 @@ impl App {
             ui::pro_slider(ui, "Detail", detail, 0.0..=100.0, defaults[2], "", amber);
             ui::pro_slider(ui, "Masking", masking, 0.0..=100.0, defaults[3], "", amber);
         });
+
+        ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));
     }
+
+    /// Which lens correction applies to the open photo with these settings.
+    fn lens_active(&self, settings: &lens::LensSettings, loaded: &Loaded) -> lens::Active {
+        if !settings.enabled {
+            return lens::Active::None;
+        }
+        let lensfun = if settings.profile.is_empty() { self.lens_auto } else { self.lens_db.find_key(&settings.profile) };
+        let embedded = loaded.embedded.is_some();
+        match settings.source {
+            lens::Source::Auto => match lensfun {
+                Some(i) => lens::Active::Lensfun(i),
+                None if embedded => lens::Active::Embedded,
+                None => lens::Active::None,
+            },
+            lens::Source::Lensfun => lensfun.map_or(lens::Active::None, lens::Active::Lensfun),
+            lens::Source::Embedded if embedded => lens::Active::Embedded,
+            lens::Source::Embedded => lens::Active::None,
+        }
+    }
+
+    /// Read the Lensfun folders again and match the open photo.
+    fn reload_lenses(&mut self) {
+        self.lens_db = lens::Database::load();
+        self.lens_auto = self.loaded.as_ref().and_then(|l| self.lens_db.auto_match(&l.exif));
+    }
+
+    /// A small uppercase label inside a section.
+    fn sub_heading(ui: &mut egui::Ui, text: &str) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text.to_uppercase()).font(theme::bold(10.5)).color(theme::FADED));
+        ui.add_space(2.0);
+    }
+
+    /// The "Lens Correction" section.
+    fn lens_panel(&mut self, ui: &mut egui::Ui) {
+        let amber = theme::ACCENT;
+        let loaded_exif = self.loaded.as_ref().map(|l| l.exif.clone());
+        let has_embedded = self.loaded.as_ref().is_some_and(|l| l.embedded.is_some());
+
+        let mut enabled = self.lens.enabled;
+        if ui::toggle(ui, &mut enabled, "Enable Profile Corrections").changed() {
+            self.lens.enabled = enabled;
+        }
+        ui.add_space(4.0);
+        ui.add_enabled_ui(self.lens.enabled, |ui| {
+            let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label).color(theme::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        add(ui);
+                    });
+                });
+            };
+            row(ui, "Source", &mut |ui| {
+                egui::ComboBox::from_id_source("lens_source").selected_text(self.lens.source.label()).width(176.0).show_ui(ui, |ui| {
+                    for source in lens::Source::ALL {
+                        ui.selectable_value(&mut self.lens.source, source, source.label());
+                    }
+                });
+            });
+
+            // Make, Model, Profile: the Lensfun entry in use (automatic unless one is chosen).
+            let current = if self.lens.profile.is_empty() { self.lens_auto } else { self.lens_db.find_key(&self.lens.profile) };
+            let current_lens = current.map(|i| self.lens_db.lenses[i].clone());
+            let make = self.lens_make_pick.clone().or_else(|| current_lens.as_ref().map(|l| l.maker.clone()));
+            let auto = self.lens.profile.is_empty();
+            let mut choose: Option<String> = None; // Some("") = automatic
+            let makers = self.lens_db.makers();
+            row(ui, "Make", &mut |ui| {
+                let shown = match (&make, auto) {
+                    (Some(m), true) => format!("{m} (auto)"),
+                    (Some(m), false) => m.clone(),
+                    (None, _) => "Auto".to_owned(),
+                };
+                egui::ComboBox::from_id_source("lens_make").selected_text(shown).width(176.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(auto, "Auto").clicked() {
+                        choose = Some(String::new());
+                    }
+                    for m in &makers {
+                        if ui.selectable_label(make.as_deref() == Some(m.as_str()), m).clicked() {
+                            self.lens_make_pick = Some(m.clone());
+                        }
+                    }
+                });
+            });
+            let models: Vec<(String, String)> = match &make {
+                Some(m) => {
+                    let mut list: Vec<(String, String)> = self.lens_db.lenses.iter().filter(|l| &l.maker == m).map(|l| (l.model.clone(), l.key())).collect();
+                    list.dedup_by(|a, b| a.0 == b.0);
+                    list
+                }
+                None => Vec::new(),
+            };
+            row(ui, "Model", &mut |ui| {
+                let shown = current_lens.as_ref().filter(|l| Some(&l.maker) == make.as_ref()).map_or_else(|| "—".to_owned(), |l| l.model.clone());
+                egui::ComboBox::from_id_source("lens_model").selected_text(shown).width(176.0).show_ui(ui, |ui| {
+                    if models.is_empty() {
+                        ui.label(ui::dim("No lenses", 12.0));
+                    }
+                    for (model, key) in &models {
+                        let selected = current_lens.as_ref().is_some_and(|l| &l.model == model);
+                        if ui.selectable_label(selected, model).clicked() {
+                            choose = Some(key.clone());
+                        }
+                    }
+                });
+            });
+            let variants: Vec<lens::Lens> = match &current_lens {
+                Some(c) => self.lens_db.lenses.iter().filter(|l| l.maker == c.maker && l.model == c.model).cloned().collect(),
+                None => Vec::new(),
+            };
+            row(ui, "Profile", &mut |ui| {
+                let label = |l: &lens::Lens| format!("{} — {}", l.file.trim_end_matches(".xml"), l.mounts.first().cloned().unwrap_or_default());
+                let shown = current_lens.as_ref().map_or_else(|| "None".to_owned(), label);
+                egui::ComboBox::from_id_source("lens_profile").selected_text(shown).width(176.0).show_ui(ui, |ui| {
+                    for v in &variants {
+                        let selected = current_lens.as_ref().is_some_and(|c| c.key() == v.key());
+                        if ui.selectable_label(selected, label(v)).on_hover_text(v.contents()).clicked() {
+                            choose = Some(v.key());
+                        }
+                    }
+                });
+            });
+            if let Some(key) = choose {
+                if key.is_empty() {
+                    self.lens_make_pick = None;
+                }
+                self.lens.profile = key;
+            }
+
+            // What is being applied, and where the profiles come from.
+            let status = match self.loaded.as_ref().map(|l| self.lens_active(&self.lens, l)) {
+                Some(lens::Active::Lensfun(i)) => {
+                    let l = &self.lens_db.lenses[i];
+                    let at = loaded_exif.as_ref().map_or(String::new(), |e| if e.focal > 0.0 { format!(" at {:.0} mm", e.focal) } else { String::new() });
+                    (format!("Lensfun: {} {}{at}", l.maker, l.model), theme::TEAL, l.contents())
+                }
+                Some(lens::Active::Embedded) => ("Sony embedded corrections".to_owned(), theme::TEAL, "distortion, chromatic aberration, vignetting".to_owned()),
+                _ => {
+                    let lens_name = loaded_exif.as_ref().map(|e| e.lens_model.clone()).filter(|m| !m.is_empty()).unwrap_or_else(|| "this lens".to_owned());
+                    (format!("No profile for {lens_name}"), theme::FADED, if has_embedded { "Sony embedded data is available".to_owned() } else { String::new() })
+                }
+            };
+            ui.add(egui::Label::new(egui::RichText::new(status.0).font(theme::font(11.5)).color(status.1)).truncate(true)).on_hover_text(status.2);
+        });
+
+        ui.horizontal(|ui| {
+            let files = self.lens_db.files;
+            let text = format!("{files} Lensfun file{} • {} lenses", if files == 1 { "" } else { "s" }, self.lens_db.lenses.len());
+            ui.label(ui::dim(text, 11.5)).on_hover_text(self.lens_db.folders.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui::icon_button(ui, ui::Icon::Folder, 22.0, ui::Look::ghost()).on_hover_text("Open the Lensfun folder: drop Lensfun .xml files there, then reload").clicked() {
+                    if let Some(dir) = self.lens_db.folder_to_open() {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                        let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                    }
+                }
+                if ui::icon_button(ui, ui::Icon::Refresh, 22.0, ui::Look::ghost()).on_hover_text("Reload the Lensfun files").clicked() {
+                    self.reload_lenses();
+                }
+            });
+        });
+        if !self.lens_db.problems.is_empty() {
+            ui.label(egui::RichText::new(format!("{} file(s) could not be read", self.lens_db.problems.len())).font(theme::font(11.5)).color(ui.visuals().error_fg_color))
+                .on_hover_text(self.lens_db.problems.join("\n"));
+        }
+
+        let active = self.loaded.as_ref().map(|l| self.lens_active(&self.lens, l));
+        if !matches!(active, None | Some(lens::Active::None)) {
+            ui.add_space(6.0);
+            ui::pro_slider(ui, "Profile Distortion", &mut self.lens.profile_distortion, 0.0..=200.0, 100.0, "%", amber);
+            ui::pro_slider(ui, "Profile Vignetting", &mut self.lens.profile_vignetting, 0.0..=200.0, 100.0, "%", amber);
+        }
+
+        Self::sub_heading(ui, "Distortion");
+        ui::pro_slider(ui, "Distortion", &mut self.lens.distortion, -100.0..=100.0, 0.0, "", amber);
+        let mut constrain = self.lens.constrain;
+        if ui::toggle(ui, &mut constrain, "Constrain Crop").on_hover_text("Enlarge just enough that corrections never show empty borders").changed() {
+            self.lens.constrain = constrain;
+        }
+        ui.add_space(6.0);
+
+        Self::sub_heading(ui, "Defringe");
+        ui::pro_slider_with(ui, "Red / Cyan", &mut self.lens.red_cyan, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+        ui::pro_slider_with(ui, "Blue / Yellow", &mut self.lens.blue_yellow, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+        ui::pro_slider_with(ui, "Purple Amount", &mut self.lens.purple_amount, 0.0..=100.0, 0.0, "", amber, 0, 1.0, true);
+        ui::pro_slider_with(ui, "Purple Hue", &mut self.lens.purple_hue, 0.0..=100.0, 50.0, "", amber, 0, 1.0, true);
+        ui::pro_slider_with(ui, "Green Amount", &mut self.lens.green_amount, 0.0..=100.0, 0.0, "", amber, 0, 1.0, true);
+        ui::pro_slider_with(ui, "Green Hue", &mut self.lens.green_hue, 0.0..=100.0, 50.0, "", amber, 0, 1.0, true);
+
+        Self::sub_heading(ui, "Vignette");
+        ui::pro_slider_with(ui, "Amount", &mut self.lens.vignette, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+        ui::pro_slider_with(ui, "Midpoint", &mut self.lens.midpoint, 0.0..=100.0, 50.0, "", amber, 0, 1.0, true);
+    }
+
+
 
     /// Right pane, pinned at the bottom: Export.
     fn pane_bottom(&mut self, ui: &mut egui::Ui) {

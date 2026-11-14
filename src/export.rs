@@ -173,6 +173,7 @@ pub struct PhotoMeta {
     pub make: String,
     pub model: String,
     pub lens_model: Option<String>,
+    pub lens_make: Option<String>,
     pub exposure_time: Option<(u32, u32)>,
     pub fnumber: Option<(u32, u32)>,
     pub iso: Option<u32>,

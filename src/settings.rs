@@ -32,6 +32,9 @@ pub struct Saved {
     pub sharpen: [f32; 4],
     /// Tint relative to the as-shot white balance: negative = greener, positive = more magenta.
     pub tint: f32,
+    /// Texture, clarity, dehaze (-100..100).
+    pub presence: [f32; 3],
+    pub lens: crate::lens::LensSettings,
 }
 
 /// Sharpening a photo starts with (Lightroom's defaults for raw files).
@@ -101,7 +104,9 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
         _ => SHARPEN_DEFAULT,
     };
     let tint = number().unwrap_or(0.0).clamp(-150.0, 150.0);
-    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint }))
+    let presence = [0; 3].map(|_| number().unwrap_or(0.0).clamp(-100.0, 100.0));
+    let lens = crate::lens::LensSettings::from_fields(&mut fields);
+    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens }))
 }
 
 /// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.srp` beside it.
@@ -117,7 +122,7 @@ const SIDECAR_HEADER: &str = "Sony RAW Processor settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -131,7 +136,11 @@ fn saved_fields(s: &Saved) -> String {
         s.sharpen[1],
         s.sharpen[2],
         s.sharpen[3],
-        s.tint
+        s.tint,
+        s.presence[0],
+        s.presence[1],
+        s.presence[2],
+        s.lens.to_fields()
     )
 }
 

@@ -17,6 +17,7 @@ half = "2"        # f32 -> f16 for the RGBA16F texture
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
 tiff = "0.11"     # TIFF written directly, for resolution and text tags
 crc32fast = "1"   # checksum for the PNG resolution chunk
+roxmltree = "0.20" # Lensfun lens-profile XML files
 # AI denoise: ONNX Runtime (prebuilt, fetched at build time). The GPU backend is chosen per
 # platform below.
 ort = "=2.0.0-rc.15"
@@ -47,6 +48,9 @@ icons = ["assets/icon.png", "assets/icon.ico"]
 resources = [
     # The AI denoise model (GPL-3.0, from darktable-ai), looked for in `models/` beside the app.
     { src = "models/rawnind_bayer.onnx", target = "models/rawnind_bayer.onnx" },
+    { src = "models/rawnind_linear.onnx", target = "models/rawnind_linear.onnx" },
+    # Lensfun lens profiles (.xml), if a `lensfun` folder is added to the project.
+    { src = "lensfun", target = "lensfun" },
     # ONNX Runtime's DirectML helper on Windows (no such file on macOS).
     { src = "target/release/*.dll", target = "." },
 ]

@@ -162,9 +162,8 @@ where
     fn size_hint(&self) -> (usize, Option<usize>) {
         (**self).size_hint()
     }
-    fn nth(&mut self, n: usize) -> Option<<<Self as Deref>::Target as Iterator>::Item> where <<I as IvarType>::Type as InnerIvarType>::Output: Iterator {
-        (**self).nth(n)
-    }
+    // Patched for Develop: the `nth` override was removed. Newer Rust compilers reject its
+    // signature ("... is not an iterator"); the standard default does the same job.
 }
 
 impl<I: IvarType> DoubleEndedIterator for Ivar<I>
@@ -174,9 +173,7 @@ where
     fn next_back(&mut self) -> Option<<<Self as Deref>::Target as Iterator>::Item> {
         (**self).next_back()
     }
-    fn nth_back(&mut self, n: usize) -> Option<<<Self as Deref>::Target as Iterator>::Item> where <<I as IvarType>::Type as InnerIvarType>::Output: Iterator {
-        (**self).nth_back(n)
-    }
+    // Patched for Develop: the `nth_back` override was removed, as `nth` above.
 }
 
 impl<I: IvarType> ExactSizeIterator for Ivar<I>

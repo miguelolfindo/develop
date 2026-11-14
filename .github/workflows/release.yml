@@ -50,8 +50,9 @@ jobs:
           else
             echo "$MODEL_SHA256  model.zip" | shasum -a 256 -c -
           fi
-          unzip -o -j model.zip "rawdenoise-nind/model_bayer.onnx" -d models
+          unzip -o -j model.zip "rawdenoise-nind/model_bayer.onnx" "rawdenoise-nind/model_linear.onnx" -d models
           mv models/model_bayer.onnx models/rawnind_bayer.onnx
+          mv models/model_linear.onnx models/rawnind_linear.onnx
           rm model.zip
 
       - name: Install cargo-packager

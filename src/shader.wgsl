@@ -426,27 +426,25 @@ fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
     // Dehaze (atmospheric scattering, I = J t + A (1 - t)): airlight A from the brightest of
     // a coarse grid at level 8, a dark channel from level 3.5, then J = (I - A) / t + A.
     if (p.z != 0.0) {
-        var airlight = vec3<f32>(1.0e-3);
-        var brightest = -1.0;
+        var brightest = 0.0;
         for (var j = 0; j < 4; j++) {
             for (var i = 0; i < 6; i++) {
                 let sample = work_at(vec2<f32>((f32(i) + 0.5) / 6.0, (f32(j) + 0.5) / 4.0), 8.0);
-                let l = dot(sample, params.luma.xyz);
-                if (l > brightest) {
-                    brightest = l;
-                    airlight = max(sample, vec3<f32>(1.0e-3));
-                }
+                brightest = max(brightest, dot(sample, params.luma.xyz));
             }
         }
+        // A neutral airlight: taking its colour from the scene (a warm sun, say) would
+        // shift every hue towards the complement. Capped so a blown sun does not set it.
+        let airlight = vec3<f32>(clamp(brightest, 0.05, 1.0) * 0.95);
         let base = work_at(uv, min(shown, 3.5));
         var clear: vec3<f32>;
         if (p.z > 0.0) {
             let low = work_at(uv, 3.5);
             let dark = clamp(min(low.r / airlight.r, min(low.g / airlight.g, low.b / airlight.b)), 0.0, 1.0);
-            let t = max(1.0 - 0.95 * p.z * dark, 0.15);
+            let t = max(1.0 - 0.85 * p.z * dark, 0.2);
             clear = max((base - airlight) / t + airlight, vec3<f32>(0.0));
         } else {
-            clear = mix(base, airlight, -p.z * 0.6);
+            clear = mix(base, airlight, -p.z * 0.4);
         }
         color *= clamp(clear / max(base, vec3<f32>(1.0e-4)), vec3<f32>(0.0), vec3<f32>(6.0));
     }

@@ -591,6 +591,18 @@ pub struct TiffInfo {
     pub baseline_exposure: Option<f32>,
     /// DNG LinearizationTable: stored value -> linear value.
     pub linearization: Option<Vec<u16>>,
+    /// Camera and lens, for lens-profile matching.
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub lens_make: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal: Option<f32>,
+    pub fnumber: Option<f32>,
+    /// Sony's embedded lens corrections (tags 0x7037, 0x7035, 0x7032), each starting with
+    /// its count.
+    pub sony_distortion: Vec<i32>,
+    pub sony_ca: Vec<i32>,
+    pub sony_vignetting: Vec<i32>,
 }
 
 /// Walk the directories of a TIFF structure that starts at `base` in `r`.
@@ -664,6 +676,42 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
                         queue.push((value, false));
                     } else if let Some(bytes) = read_at(r, value, n.min(8) * 4) {
                         queue.extend(bytes.chunks_exact(4).map(|b| (u32_at(b) as u64, false)));
+                    }
+                }
+                0x010F if !is_exif && info.make.is_none() => info.make = text(r),
+                0x0110 if !is_exif && info.model.is_none() => info.model = text(r),
+                0xA433 => info.lens_make = text(r),
+                0xA434 => info.lens_model = text(r),
+                0x920A | 0x829D if kind == 5 || kind == 10 => {
+                    if let Some(b) = read_at(r, value, 8) {
+                        let (num, den) = (u32_at(&b) as f32, u32_at(&b[4..]) as f32);
+                        if den > 0.0 {
+                            if tag == 0x920A {
+                                info.focal = Some(num / den);
+                            } else {
+                                info.fnumber = Some(num / den);
+                            }
+                        }
+                    }
+                }
+                0x7037 | 0x7035 | 0x7032 if matches!(kind, 3 | 8 | 4 | 9) && (1..=64).contains(&n) => {
+                    let size = if kind == 3 || kind == 8 { 2 } else { 4 };
+                    let bytes = if n * size <= 4 { Some(entry[8..8 + n * size].to_vec()) } else { read_at(r, value, n * size) };
+                    if let Some(bytes) = bytes {
+                        let values: Vec<i32> = bytes
+                            .chunks_exact(size)
+                            .map(|b| match kind {
+                                3 => u16_at(b) as i32,
+                                8 => u16_at(b) as i16 as i32,
+                                4 => u32_at(b) as i32,
+                                _ => u32_at(b) as i32,
+                            })
+                            .collect();
+                        match tag {
+                            0x7037 => info.sony_distortion = values,
+                            0x7035 => info.sony_ca = values,
+                            _ => info.sony_vignetting = values,
+                        }
                     }
                 }
                 0xC618 if kind == 3 && n >= 2 && info.linearization.is_none() => {

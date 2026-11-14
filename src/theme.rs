@@ -56,10 +56,6 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
-/// Padding inside panels.
-pub fn panel_frame() -> egui::Frame {
-    egui::Frame::none().fill(PANEL).inner_margin(egui::Margin::symmetric(12.0, 8.0))
-}
 
 /// Use the system's interface fonts where they exist (Segoe UI and Consolas on Windows, the
 /// San Francisco text fonts on macOS), keeping egui's own as the fallback for missing glyphs.

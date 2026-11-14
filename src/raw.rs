@@ -42,6 +42,9 @@ pub struct DecodedImage {
     pub baseline_exposure: Option<f32>,
     /// Bits per sample in the file.
     pub bits: u8,
+    /// Camera and lens, and the camera's own lens corrections (Sony ARW), for lens correction.
+    pub exif: crate::lens::Exif,
+    pub embedded: Option<crate::lens::Embedded>,
 }
 
 /// What the decoder produced.
@@ -64,6 +67,8 @@ struct Bayer {
 
 struct Meta {
     bits: u8,
+    /// Camera and lens, for lens-profile matching.
+    exif: crate::lens::Exif,
     xyz_to_cam: Mat3,
     as_shot_wb: [f32; 3],
     quarter_turns: u8,
@@ -90,6 +95,7 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
                 make: md.make.clone(),
                 model: md.model.clone(),
                 lens_model: e.lens_model.clone(),
+                lens_make: e.lens_make.clone(),
                 exposure_time: e.exposure_time.as_ref().map(r),
                 fnumber: e.fnumber.as_ref().map(r),
                 iso: e.iso_speed.or(e.recommended_exposure_index).or(e.iso_speed_ratings.map(u32::from)),
@@ -134,7 +140,17 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
         .or_else(|| raw.color_matrix.values().next())
         .filter(|m| m.len() >= 9)
         .ok_or("The decoder has no colour matrix for this camera.")?;
+    let ratio = |r: Option<(u32, u32)>| r.map_or(0.0, |(n, d)| if d > 0 { n as f32 / d as f32 } else { 0.0 });
+    let exif = crate::lens::Exif {
+        make: raw.clean_make.clone(),
+        model: raw.clean_model.clone(),
+        lens_make: photo.lens_make.clone().unwrap_or_default(),
+        lens_model: photo.lens_model.clone().unwrap_or_default(),
+        focal: ratio(photo.focal_length),
+        fnumber: ratio(photo.fnumber),
+    };
     let meta = Meta {
+        exif,
         // The sensor's real depth, from its white level (the container is often 16-bit).
         bits: raw.whitelevel.as_vec().first().map_or(raw.bps as u8, |&w| if w > 1.5 { (w + 1.0).log2().ceil() as u8 } else { raw.bps as u8 }),
         xyz_to_cam: [[matrix[0], matrix[1], matrix[2]], [matrix[3], matrix[4], matrix[5]], [matrix[6], matrix[7], matrix[8]]],
@@ -384,6 +400,46 @@ fn denoised_rgb(b: &Bayer, plain: &[f32]) -> Result<(Vec<f32>, String), String> 
     Ok((out, result.note))
 }
 
+/// AI denoise for a raw file that is already RGB (linear DNG): camera colour is turned into
+/// white-balanced linear Rec.2020, which the RawNIND linear model expects, and back again.
+fn denoised_linear(data: &[f32], width: usize, height: usize, meta: &Meta) -> Result<(Vec<f32>, String), String> {
+    use crate::color::{invert, mul, Mat3};
+    const REC2020_FROM_XYZ: Mat3 = [[1.716_651, -0.355_671, -0.253_366], [-0.666_684, 1.616_481, 0.015_769], [0.017_640, -0.042_771, 0.942_103]];
+    let cam_from_xyz = meta.xyz_to_cam;
+    let xyz_from_cam = invert(&cam_from_xyz).ok_or("The camera colour matrix cannot be inverted.")?;
+    // Camera -> Rec.2020, scaled so that the camera's white (1 / white-balance gains) comes
+    // out neutral: each row then sums to one once the gains are applied.
+    let mut m = mul(&REC2020_FROM_XYZ, &xyz_from_cam);
+    let gains = meta.as_shot_wb;
+    let g = if gains[1] > 0.0 { gains[1] } else { 1.0 };
+    for row in m.iter_mut() {
+        for (c, v) in row.iter_mut().enumerate() {
+            *v *= if gains[c] > 0.0 { gains[c] / g } else { 1.0 };
+        }
+        let sum: f32 = row.iter().sum();
+        if sum.abs() > 1.0e-6 {
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        }
+    }
+    let back = invert(&m).ok_or("The colour conversion cannot be inverted.")?;
+    let apply = |m: &Mat3, src: &[f32], dst: &mut [f32]| {
+        dst.par_chunks_mut(3).zip(src.par_chunks(3)).for_each(|(d, s)| {
+            for r in 0..3 {
+                d[r] = m[r][0] * s[0] + m[r][1] * s[1] + m[r][2] * s[2];
+            }
+        });
+    };
+    let mut rec2020 = vec![0f32; data.len()];
+    apply(&m, data, &mut rec2020);
+    let result = crate::denoise::run_linear(&rec2020, width, height)?;
+    let mut out = vec![0f32; data.len()];
+    apply(&back, &result.rgb, &mut out);
+    out.par_iter_mut().for_each(|v| *v = v.max(0.0));
+    Ok((out, result.note))
+}
+
 /// A finished picture (JPEG, PNG, TIFF, HEIC): decode it and turn its sRGB values back into
 /// linear light, so the same sliders work on it. It has no camera matrix or raw white
 /// balance; it is described as a "camera" whose colour is already sRGB.
@@ -406,9 +462,21 @@ fn load_picture(path: &Path) -> Result<(Vec<f32>, usize, usize, Meta), String> {
         Some(8) => 3,
         _ => 0,
     };
+    let info = crate::filmstrip::tiff_info(path);
+    let exif = match &info {
+        Some(i) => crate::lens::Exif {
+            make: i.make.clone().unwrap_or_default(),
+            model: i.model.clone().unwrap_or_default(),
+            lens_make: i.lens_make.clone().unwrap_or_default(),
+            lens_model: i.lens_model.clone().unwrap_or_default(),
+            focal: i.focal.unwrap_or(0.0),
+            fnumber: i.fnumber.unwrap_or(0.0),
+        },
+        None => crate::lens::Exif::default(),
+    };
     let meta = Meta {
-        bits,
-        // XYZ (D65) to linear sRGB.
+        exif,
+        bits,        // XYZ (D65) to linear sRGB.
         xyz_to_cam: [[3.2406, -1.5372, -0.4986], [-0.9689, 1.8758, 0.0415], [0.0557, -0.2040, 1.0570]],
         as_shot_wb: [1.0, 1.0, 1.0],
         quarter_turns,
@@ -440,7 +508,19 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
                 }
                 (rgb, w, h, meta, 0u8)
             }
-            (Pixels::Rgb { data, width, height }, meta) => (data, width, height, meta, 1u8),
+            (Pixels::Rgb { mut data, width, height }, meta) => {
+                if denoise {
+                    match denoised_linear(&data, width, height, &meta) {
+                        Ok((clean, note)) => {
+                            data = clean;
+                            denoised = true;
+                            denoise_note = Some(note);
+                        }
+                        Err(message) => denoise_note = Some(format!("AI denoise did not run: {message}")),
+                    }
+                }
+                (data, width, height, meta, 1u8)
+            }
         }
     } else {
         let (data, w, h, meta) = load_picture(path)?;
@@ -487,7 +567,11 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
         denoise_note,
         input_mode,
         bits: meta.bits,
-        baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
+        embedded: info.as_ref().and_then(|i| {
+            let tail = |v: &Vec<i32>| v.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            crate::lens::Embedded::from_tags(&tail(&i.sony_distortion), &tail(&i.sony_ca), &tail(&i.sony_vignetting))
+        }),
+        exif: meta.exif,        baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
     })
 }
 /// Diagnostic (`app --dump-raw <file> <out.txt>`): what the decoder reports for a raw file.
