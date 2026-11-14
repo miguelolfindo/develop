@@ -1,0 +1,73 @@
+# Builds the installers when a version tag (v1.2.3) is pushed and attaches them to the
+# GitHub release: a Windows x64 NSIS installer (.exe) and an Apple Silicon disk image (.dmg).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # The AI denoise model is not kept in the repository; it is fetched from darktable's
+  # release and checked before packaging.
+  MODEL_URL: https://github.com/darktable-org/darktable-ai/releases/download/release-5.6.0/rawdenoise-nind.dtmodel
+  MODEL_SHA256: d71b5f1e727c85a359e6f74dca9e2016c9d8fc3e2f7ac3e9b347d80ceca969af
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            format: nsis
+            artifact: dist/*.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            format: dmg
+            artifact: dist/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: true
+
+      - name: Fetch the denoise model
+        shell: bash
+        run: |
+          mkdir -p models
+          curl -L --fail -o model.zip "$MODEL_URL"
+          if command -v sha256sum >/dev/null; then
+            echo "$MODEL_SHA256  model.zip" | sha256sum -c -
+          else
+            echo "$MODEL_SHA256  model.zip" | shasum -a 256 -c -
+          fi
+          unzip -o -j model.zip "rawdenoise-nind/model_bayer.onnx" -d models
+          mv models/model_bayer.onnx models/rawnind_bayer.onnx
+          rm model.zip
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Build and package
+        run: cargo packager --release --formats ${{ matrix.format }}
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.artifact }}
+
+      - name: Keep the installer as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-${{ matrix.target }}
+          path: ${{ matrix.artifact }}

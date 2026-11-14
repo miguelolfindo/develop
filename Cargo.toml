@@ -1,0 +1,67 @@
+[package]
+name = "develop"
+version = "0.1.0"
+edition = "2021"
+description = "Develop: a GPU raw photo processor"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# wgpu is used through eframe's re-export (eframe::wgpu) so the versions can never drift apart.
+eframe = { version = "0.27", features = ["wgpu"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+rfd = "0.14"      # native file dialog
+rawler = "0.7"    # ARW decoding (knows the a7R V, including lossless-compressed ARW)
+rayon = "1.8"     # multi-threaded CPU demosaic
+half = "2"        # f32 -> f16 for the RGBA16F texture
+# Export: resizing and JPEG / PNG / TIFF encoding.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+tiff = "0.11"     # TIFF written directly, for resolution and text tags
+crc32fast = "1"   # checksum for the PNG resolution chunk
+# AI denoise: ONNX Runtime (prebuilt, fetched at build time). The GPU backend is chosen per
+# platform below.
+ort = "=2.0.0-rc.15"
+
+# Puts the app icon into develop.exe on Windows (Explorer, taskbar, shortcuts).
+[build-dependencies]
+embed-resource = "3"
+
+# DirectML runs on any DirectX 12 GPU (NVIDIA, AMD, Intel); CoreML is the Apple Silicon path.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["directml"] }
+# HEIC pictures are decoded by Windows' own codec (Windows Imaging Component).
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["coreml"] }
+
+# Installers (cargo-packager): `cargo install cargo-packager --locked`, then
+# `cargo packager --release`. Windows gives an NSIS .exe installer, macOS a .dmg.
+[package.metadata.packager]
+product-name = "Develop"
+identifier = "com.develop.rawprocessor"
+description = "GPU raw photo processor"
+category = "Photography"
+out-dir = "dist"
+before-packaging-command = "cargo build --release"
+icons = ["assets/icon.png", "assets/icon.ico"]
+resources = [
+    # The AI denoise model (GPL-3.0, from darktable-ai), looked for in `models/` beside the app.
+    { src = "models/rawnind_bayer.onnx", target = "models/rawnind_bayer.onnx" },
+    # ONNX Runtime's DirectML helper on Windows (no such file on macOS).
+    { src = "target/release/*.dll", target = "." },
+]
+
+[package.metadata.packager.nsis]
+installer-icon = "assets/icon.ico"
+installer-mode = "currentUser"
+
+[package.metadata.packager.macos]
+minimum-system-version = "12.0"
+
+# Demosaicing 61 MP in an unoptimised build is painfully slow; keep debug builds usable.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
