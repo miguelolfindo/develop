@@ -71,4 +71,7 @@ opt-level = 3
 lto = "thin"
 
 [patch.crates-io]
+# macOS: two copies of objc2 (0.4.1 through winit, 0.3.0-beta.3.patch-leaks.3 through accesskit)
+# have Iterator overrides that current Rust rejects; the patched copies drop them.
 objc2 = { path = "patches/objc2" }
+objc2-03 = { package = "objc2", path = "patches/objc2-0.3" }
