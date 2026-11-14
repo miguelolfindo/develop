@@ -39,6 +39,10 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           cache: true
+          # The action defaults to RUSTFLAGS="-D warnings", which turns warnings in the
+          # vendored crates under patches/ into errors. A release build should not fail on
+          # warnings, so clear it.
+          rustflags: ""
 
       - name: Fetch the denoise model
         shell: bash
