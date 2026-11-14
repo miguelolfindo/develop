@@ -415,6 +415,44 @@ fn perceived(c: vec3<f32>) -> f32 {
 // Texture (fine detail), Clarity (local contrast) and Dehaze, from the picture's own mip
 // levels. Each compares the pixel with a blurred version of its surroundings; the pixel is
 // taken at the level of detail actually shown, so zoomed out it looks like a resized export.
+// Brightness of the surroundings at a coarse scale, counting only what is similar to the
+// pixel itself (bilateral weights), so a dark roof against the sky sees roof, not sky.
+fn edge_aware_surroundings(uv: vec2<f32>, own: f32, lod: f32) -> f32 {
+    let texels = vec2<f32>(textureDimensions(raw_texture, 0));
+    let step = vec2<f32>(exp2(lod)) / texels;
+    var total = 0.0;
+    var weights = 0.0;
+    for (var j = -2; j <= 2; j++) {
+        for (var i = -2; i <= 2; i++) {
+            let tap = perceived(work_at(uv + vec2<f32>(f32(i), f32(j)) * step, lod - 1.0));
+            // Similarity in stops (perceived values are square roots of luminance).
+            let stops = 2.0 * log2(max(tap, 1.0e-3) / max(own, 1.0e-3));
+            let w = exp(-0.5 * stops * stops);
+            total += w * tap;
+            weights += w;
+        }
+    }
+    return total / max(weights, 1.0e-4);
+}
+
+// Fitted to Lightroom exports of the reference file at -100, -50, +50 and +100.
+const TEXTURE_FINE: f32 = 1.0;
+const TEXTURE_LOD: f32 = 3.0;
+const TEXTURE_STRENGTH: f32 = 0.68;
+const TEXTURE_SOFTEN: f32 = 1.0;
+const CLARITY_LOD: f32 = 6.0;
+const CLARITY_STRENGTH: f32 = 1.4;
+const CLARITY_LIFT: f32 = 1.15;
+const CLARITY_SHADE: vec2<f32> = vec2<f32>(0.35, 0.6);
+const CLARITY_OWN: vec2<f32> = vec2<f32>(0.45, 0.7);
+const CLARITY_LIFT_LOD: f32 = 7.0;
+const DEHAZE_STRENGTH: f32 = 1.4;
+const DEHAZE_POWER: f32 = 1.7;
+const DEHAZE_DARKEN: f32 = 0.2;
+const HAZE_DESATURATE: f32 = 0.65;
+const HAZE_VEIL: f32 = 0.085;
+const HAZE_POWER: f32 = 1.8;
+
 fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
     let p = params.presence;
     if (abs(p.x) + abs(p.y) + abs(p.z) < 1.0e-4) {
@@ -436,31 +474,60 @@ fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
         // A neutral airlight: taking its colour from the scene (a warm sun, say) would
         // shift every hue towards the complement. Capped so a blown sun does not set it.
         let airlight = vec3<f32>(clamp(brightest, 0.05, 1.0) * 0.95);
-        let base = work_at(uv, min(shown, 3.5));
-        var clear: vec3<f32>;
         if (p.z > 0.0) {
+            // Haze removal, strongest where the dark channel is high (bright, washed-out
+            // areas such as sky) and nearly nothing in darker, clear parts of the scene.
+            // Measured against Lightroom: darkening the darker areas as the plain model
+            // does is about three times too strong there.
+            let base = work_at(uv, min(shown, 3.5));
             let low = work_at(uv, 3.5);
             let dark = clamp(min(low.r / airlight.r, min(low.g / airlight.g, low.b / airlight.b)), 0.0, 1.0);
-            let t = max(1.0 - 0.85 * p.z * dark, 0.2);
-            clear = max((base - airlight) / t + airlight, vec3<f32>(0.0));
+            let t = max(1.0 - DEHAZE_STRENGTH * p.z * pow(dark, DEHAZE_POWER), 0.2);
+            let clear = max((base - airlight) / t + airlight, vec3<f32>(0.0));
+            // Each channel keeps at least a third of its value, so the sky beside the sun does
+            // not lose its blue entirely.
+            color *= clamp(clear / max(base, vec3<f32>(1.0e-4)), vec3<f32>(0.33), vec3<f32>(6.0));
+            // Lightroom also deepens the whole picture a little.
+            color *= exp2(-DEHAZE_DARKEN * p.z);
         } else {
-            clear = mix(base, airlight, -p.z * 0.4);
+            // Adding haze: an even veil of the airlight over the whole picture, which lifts
+            // the dark areas most, as Lightroom does.
+            let k = HAZE_VEIL * pow(-p.z, HAZE_POWER);
+            color = color * (1.0 - 0.5 * k) + airlight * k;
+            // ...and washes the colour out, most visibly in the sky.
+            let grey = dot(color, params.luma.xyz);
+            color = mix(color, vec3<f32>(grey), HAZE_DESATURATE * pow(-p.z, 0.8));
         }
-        color *= clamp(clear / max(base, vec3<f32>(1.0e-4)), vec3<f32>(0.0), vec3<f32>(6.0));
     }
 
+    // Positive Clarity also lifts everything that sits in darker surroundings, as
+    // Lightroom's does: on a backlit scene the foreground brightens a lot, the sky not at all.
+    if (p.y > 0.0) {
+        let surroundings = edge_aware_surroundings(uv, perceived(work_at(uv, 0.0)), CLARITY_LIFT_LOD);
+        // Both the surroundings and the pixel itself must be dark: sky next to a dark roof is
+        // not lifted, so no bright halo forms around silhouettes.
+        let own = perceived(color);
+        let shade = (1.0 - smoothstep(CLARITY_SHADE.x, CLARITY_SHADE.y, surroundings)) * (1.0 - smoothstep(CLARITY_OWN.x, CLARITY_OWN.y, own));
+        color *= exp2(CLARITY_LIFT * pow(p.y, 0.85) * shade);
+    }
     let lp = perceived(color);
     var target_lp = lp;
     // Clarity: medium-scale contrast, kept to the mid-tones so silhouettes do not glow.
     if (p.y != 0.0) {
-        let detail = perceived(work_at(uv, min(shown, 4.0))) - perceived(work_at(uv, 4.0));
+        // The base is edge-aware: across a strong edge (dark roof against the sky) the other side
+        // barely counts, so the dark side is not pushed into a black band.
+        let here = perceived(work_at(uv, min(shown, CLARITY_LOD)));
+        let detail = here - edge_aware_surroundings(uv, here, CLARITY_LOD - 1.0);
         let mid_tones = smoothstep(0.05, 0.25, lp) * (1.0 - smoothstep(0.75, 0.98, lp));
-        target_lp += 1.4 * p.y * detail * mid_tones;
+        target_lp += CLARITY_STRENGTH * p.y * detail * mid_tones;
     }
     // Texture: fine detail, softened where it is already strong (edges, noise spikes).
     if (p.x != 0.0) {
-        let detail = perceived(work_at(uv, min(shown, 1.5))) - perceived(work_at(uv, 1.5));
-        target_lp += 1.8 * p.x * detail / (1.0 + 6.0 * abs(detail));
+        // The band between mip levels 1 and 3: finer than Clarity, coarser than Sharpening.
+        let detail = perceived(work_at(uv, clamp(shown, TEXTURE_FINE, TEXTURE_LOD))) - perceived(work_at(uv, TEXTURE_LOD));
+        // Lightroom takes much of the detail out already at -50, so the negative side ramps up faster.
+        let amount = select(-TEXTURE_SOFTEN * pow(-p.x, 0.6), TEXTURE_STRENGTH * p.x, p.x > 0.0);
+        target_lp += amount * detail / (1.0 + 6.0 * abs(detail));
     }
     let gain = clamp(max(target_lp, 0.0) / max(lp, 1.0e-3), 0.0, 3.0);
     return color * gain * gain;
