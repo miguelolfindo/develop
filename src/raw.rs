@@ -40,6 +40,9 @@ pub struct DecodedImage {
     pub input_mode: u8,
     /// DNG BaselineExposure in stops, when the file gives one.
     pub baseline_exposure: Option<f32>,
+    /// Exposure (stops) to add for how the camera recorded this raw: Fujifilm underexposes
+    /// DR200 / DR400 shots by a further stop or two, which Lightroom brings back.
+    pub exposure_compensation: f32,
     /// Bits per sample in the file.
     pub bits: u8,
     /// Camera and lens, and the camera's own lens corrections (if the file has them), for lens correction.
@@ -61,6 +64,8 @@ struct Bayer {
     data: Vec<f32>,
     /// Colour (0 = R, 1 = G, 2 = B) at [row & 1][col & 1].
     cfa: [[u8; 2]; 2],
+    /// Fujifilm X-Trans: colour at [row % 6][col % 6] instead of `cfa`.
+    xtrans: Option<[[u8; 6]; 6]>,
     /// Visible area: x, y, width, height.
     crop: (usize, usize, usize, usize),
 }
@@ -219,7 +224,20 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
             *v = cfa_config.cfa.color_at(r, c) as u8;
         }
     }
-    if cfa.iter().flatten().any(|c| *c > 2) {
+    let xtrans = match (cfa_config.cfa.width, cfa_config.cfa.height) {
+        (2, 2) => None,
+        (6, 6) => {
+            let mut pattern = [[1u8; 6]; 6];
+            for (r, row) in pattern.iter_mut().enumerate() {
+                for (c, v) in row.iter_mut().enumerate() {
+                    *v = cfa_config.cfa.color_at(r, c) as u8;
+                }
+            }
+            Some(pattern)
+        }
+        _ => return Err("Unsupported colour filter array.".into()),
+    };
+    if cfa.iter().flatten().any(|c| *c > 2) || xtrans.is_some_and(|p| p.iter().flatten().any(|c| *c > 2)) {
         return Err("Unsupported colour filter array.".into());
     }
 
@@ -231,8 +249,10 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
         offset[i] = black[i];
         scale[i] = 1.0 / (white[i] - black[i]).max(1.0);
     }
+    // X-Trans files give one black level per pattern site, all the same in practice: use the first.
+    let uniform = xtrans.is_some();
     let norm = |y: usize, x: usize, v: f32| {
-        let i = (y & 1) * 2 + (x & 1);
+        let i = if uniform { 0 } else { (y & 1) * 2 + (x & 1) };
         ((v - offset[i]) * scale[i]).clamp(0.0, 1.0)
     };
 
@@ -254,7 +274,7 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
         }
     }
 
-    Ok((Pixels::Bayer(Bayer { width, height, data, cfa, crop }), meta))
+    Ok((Pixels::Bayer(Bayer { width, height, data, cfa, xtrans, crop }), meta))
 }
 
 /// Malvar-He-Cutler high-quality linear demosaic (5x5), parallel over rows.
@@ -317,6 +337,91 @@ fn demosaic(b: &Bayer) -> Vec<f32> {
             row[o] = r.max(0.0);
             row[o + 1] = g.max(0.0);
             row[o + 2] = bl.max(0.0);
+        }
+    });
+    out
+}
+
+/// Demosaic for Fujifilm X-Trans (6x6 pattern). Green first, from the green sites around
+/// each pixel (the 3x3 neighbourhood always has some, orthogonal ones weighted double); then
+/// red and blue as colour differences against that green, averaged over the sites of that
+/// colour in the 5x5 neighbourhood with inverse-distance weights. Returns interleaved RGB
+/// for the crop area.
+fn demosaic_xtrans(b: &Bayer) -> Vec<f32> {
+    let pattern = b.xtrans.expect("X-Trans pattern");
+    let (w, h) = (b.width, b.height);
+    let (cx, cy, cw, ch) = b.crop;
+    let colour = |y: usize, x: usize| pattern[y % 6][x % 6];
+    let src = &b.data;
+
+    // Pass 1: a full green plane.
+    let mut green = vec![0f32; w * h];
+    green.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            if colour(y, x) == 1 {
+                row[x] = src[y * w + x];
+                continue;
+            }
+            let (mut sum, mut weight) = (0.0f32, 0.0f32);
+            for radius in 1..=2isize {
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let (yy, xx) = (y as isize + dy, x as isize + dx);
+                        if (dy == 0 && dx == 0) || yy < 0 || xx < 0 || yy >= h as isize || xx >= w as isize {
+                            continue;
+                        }
+                        let (yy, xx) = (yy as usize, xx as usize);
+                        if colour(yy, xx) == 1 {
+                            let wgt = if dy == 0 || dx == 0 { 2.0 } else { 1.0 } / (dy * dy + dx * dx) as f32;
+                            sum += wgt * src[yy * w + xx];
+                            weight += wgt;
+                        }
+                    }
+                }
+                if weight > 0.0 {
+                    break;
+                }
+            }
+            row[x] = if weight > 0.0 { sum / weight } else { src[y * w + x] };
+        }
+    });
+
+    // Pass 2: red and blue as differences from green.
+    let mut out = vec![0f32; cw * ch * 3];
+    out.par_chunks_mut(cw * 3).enumerate().for_each(|(oy, row)| {
+        let y = oy + cy;
+        for ox in 0..cw {
+            let x = ox + cx;
+            let g = green[y * w + x];
+            let here = colour(y, x);
+            let mut rgb = [0f32; 3];
+            rgb[1] = g;
+            for c in [0u8, 2u8] {
+                if here == c {
+                    rgb[c as usize] = src[y * w + x];
+                    continue;
+                }
+                let (mut sum, mut weight) = (0.0f32, 0.0f32);
+                for dy in -2isize..=2 {
+                    for dx in -2isize..=2 {
+                        let (yy, xx) = (y as isize + dy, x as isize + dx);
+                        if yy < 0 || xx < 0 || yy >= h as isize || xx >= w as isize {
+                            continue;
+                        }
+                        let (yy, xx) = (yy as usize, xx as usize);
+                        if colour(yy, xx) == c {
+                            let wgt = 1.0 / (1 + dy * dy + dx * dx) as f32;
+                            sum += wgt * (src[yy * w + xx] - green[yy * w + xx]);
+                            weight += wgt;
+                        }
+                    }
+                }
+                rgb[c as usize] = g + if weight > 0.0 { sum / weight } else { 0.0 };
+            }
+            let o = ox * 3;
+            row[o] = rgb[0].max(0.0);
+            row[o + 1] = rgb[1].max(0.0);
+            row[o + 2] = rgb[2].max(0.0);
         }
     });
     out
@@ -502,6 +607,23 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
     let (mut denoised, mut denoise_note) = (false, None);
     let (mut rgb, full_w, full_h, meta, input_mode) = if crate::filmstrip::is_raw(path) {
         match decode(path)? {
+            (Pixels::Bayer(bayer), meta) if bayer.xtrans.is_some() => {
+                // X-Trans: demosaic first; the result is camera RGB like a linear DNG, so the
+                // linear denoise model applies (input mode 1).
+                let (_, _, w, h) = bayer.crop;
+                let mut rgb = demosaic_xtrans(&bayer);
+                if denoise {
+                    match denoised_linear(&rgb, w, h, &meta) {
+                        Ok((clean, note)) => {
+                            rgb = clean;
+                            denoised = true;
+                            denoise_note = Some(note);
+                        }
+                        Err(message) => denoise_note = Some(format!("AI denoise did not run: {message}")),
+                    }
+                }
+                (rgb, w, h, meta, 1u8)
+            }
             (Pixels::Bayer(bayer), meta) => {
                 let (_, _, w, h) = bayer.crop;
                 let mut rgb = demosaic(&bayer);
@@ -580,9 +702,14 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
             let tail = |v: &Vec<i32>| v.get(1..).map(|s| s.to_vec()).unwrap_or_default();
             crate::lens::Embedded::from_tags(&tail(&i.embedded_distortion), &tail(&i.embedded_ca), &tail(&i.embedded_vignetting))
         }),
-        exif: meta.exif,        baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
+        exposure_compensation: info.as_ref().and_then(|i| i.raw_exposure_bias).map_or(0.0, |bias| -(bias - FUJI_NORMAL_BIAS)).clamp(0.0, 3.0),
+        exif: meta.exif,
+        baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
     })
 }
+/// Fujifilm's RawExposureBias at DR100 (stops); anything below this is DR200 and up.
+const FUJI_NORMAL_BIAS: f32 = -0.72;
+
 /// Diagnostic (`app --dump-raw <file> <out.txt>`): what the decoder reports for a raw file.
 pub fn describe(path: &Path) -> String {
     use rawler::RawImageData;

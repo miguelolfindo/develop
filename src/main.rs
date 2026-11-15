@@ -178,6 +178,17 @@ const BASELINE_EXPOSURE: f32 = 0.35;
 /// Unsharp-mask strength per unit of the Amount slider, fitted to Lightroom exports.
 const SHARPEN_SCALE: f32 = 0.0295;
 
+/// Extra baseline exposure (stops) that Lightroom gives some cameras' raw files beyond the
+/// common one (Adobe keeps a per-model value). Measured on Lightroom exports of blank
+/// renders; models not listed get 0, which matched the Sony, Nikon, Canon and Fujifilm files
+/// tried so far.
+const MODEL_BASELINE: [(&str, &str, f32); 3] = [("panasonic", "dc-g9", 0.33), ("panasonic", "dc-gh6", -0.27), ("panasonic", "dc-s5", -0.3)];
+
+fn maker_baseline(make: &str, model: &str) -> f32 {
+    let (make, model) = (make.to_lowercase(), model.to_lowercase());
+    MODEL_BASELINE.iter().find(|(mk, md, _)| make.starts_with(mk) && model == *md).map_or(0.0, |&(_, _, ev)| ev)
+}
+
 /// Display levels assumed before a photo has been measured (Uniforms::scene).
 const SCENE_DEFAULT: [f32; 4] = [0.2, 0.9, 0.3, 0.0];
 
@@ -336,6 +347,8 @@ struct App {
     /// exposure in stops.
     input_mode: u8,
     file_baseline: Option<f32>,
+    /// Extra baseline exposure for the open photo's camera maker (see maker_baseline).
+    maker_baseline: f32,
     /// Side panels shown ([ and ] toggle them), the A/B split and where its divider is
     /// (0..1 across the canvas), the clipping warning, and the small app icon in the top bar.
     show_left: bool,
@@ -447,6 +460,7 @@ impl App {
             can_denoise: true,
             input_mode: 0,
             file_baseline: None,
+            maker_baseline: 0.0,
             show_left: true,
             show_right: true,
             ab_split: false,
@@ -546,7 +560,7 @@ impl App {
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
             .set_title("Open photo")
-            .add_filter("Photos", &["arw", "ARW", "nef", "NEF", "dng", "DNG", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "tif", "TIF", "tiff", "TIFF", "heic", "HEIC", "heif", "HEIF"])
+            .add_filter("Photos", &["arw", "ARW", "nef", "NEF", "cr2", "CR2", "cr3", "CR3", "rw2", "RW2", "raf", "RAF", "dng", "DNG", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "tif", "TIF", "tiff", "TIFF", "heic", "HEIC", "heif", "HEIF"])
             .add_filter("All files", &["*"])
             .pick_file();
         if let Some(path) = picked {
@@ -622,6 +636,7 @@ impl App {
                 self.lens_auto = self.lens_db.auto_match(&image.exif);
                 self.input_mode = image.input_mode;
                 self.file_baseline = image.baseline_exposure;
+                self.maker_baseline = maker_baseline(&image.exif.make, &image.exif.model) + image.exposure_compensation;
                 // Bayer raws use one RawNIND model, linear DNGs (phones) the other.
                 self.can_denoise = match image.input_mode {
                     0 => denoise::model_path(denoise::Model::Bayer).is_some(),
@@ -959,12 +974,12 @@ impl App {
             Profile::Dcp(_) => self.adjust.kelvin.round() as i32,
             _ => 0,
         };
-        let key = (self.profile, kelvin, self.baseline_exposure.to_bits());
+        let key = (self.profile, kelvin, (self.baseline_exposure + self.maker_baseline).to_bits());
         if self.render_key == Some(key) {
             return;
         }
         // A DNG states its own baseline exposure; other raws use the constant.
-        let baseline = self.file_baseline.unwrap_or(self.baseline_exposure);
+        let baseline = self.file_baseline.unwrap_or(self.baseline_exposure + self.maker_baseline);
         let mut render = match self.profile {
             Profile::Linear => profile::builtin(&loaded.color, false),
             Profile::Standard => profile::builtin(&loaded.color, true),
@@ -2150,7 +2165,7 @@ impl App {
                 .add_enabled_ui(can_switch, |ui| ui::toggle(ui, &mut on, "AI Denoise"))
                 .inner
                 .on_hover_text(hint)
-                .on_disabled_hover_text("Works on raw photos (ARW, NEF, DNG) when the model files are installed")
+                .on_disabled_hover_text("Works on raw photos (ARW, NEF, CR2, CR3, RW2, RAF, DNG) when the model files are installed")
                 .changed();
             if flipped {
                 self.denoise_override = Some(on);
@@ -2172,11 +2187,16 @@ impl App {
     }
 
     /// True when Lightroom would correct this lens's distortion even with profile corrections
-    /// off: Nikon Z lenses carry their correction in the raw file and Adobe always applies it.
-    /// The Lensfun profile stands in for that data (distortion only, no vignetting).
+    /// off: Nikon Z, Panasonic, Olympus / OM System and Fujifilm cameras carry the correction
+    /// in the raw file and Adobe always applies it. The Lensfun profile stands in for that data
+    /// (distortion only, no vignetting).
     fn builtin_distortion(&self, loaded: &Loaded) -> bool {
-        loaded.exif.make.to_lowercase().starts_with("nikon")
-            && self.lens_auto.is_some_and(|i| self.lens_db.lenses[i].mounts.iter().any(|m| m == "Nikon Z"))
+        let Some(lens) = self.lens_auto.map(|i| &self.lens_db.lenses[i]) else { return false };
+        let make = loaded.exif.make.to_lowercase();
+        if make.starts_with("nikon") {
+            return lens.mounts.iter().any(|m| m == "Nikon Z");
+        }
+        ["panasonic", "olympus", "om digital", "fujifilm"].iter().any(|m| make.starts_with(m))
     }
 
     /// Which lens correction applies to the open photo with these settings.
@@ -2348,7 +2368,7 @@ impl App {
         }
 
         if !self.lens.enabled && self.loaded.as_ref().is_some_and(|l| self.builtin_distortion(l)) {
-            ui.label(egui::RichText::new("Built-in distortion correction is applied, as Lightroom does for this lens").font(theme::font(11.5)).color(theme::FADED));
+            ui.label(egui::RichText::new("Built-in distortion correction is applied, as Lightroom does for this camera").font(theme::font(11.5)).color(theme::FADED));
         }
         let active = self.loaded.as_ref().map(|l| self.lens_active(&self.lens, l));
         if !matches!(active, None | Some(lens::Active::None)) {

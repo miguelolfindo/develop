@@ -324,6 +324,14 @@ pub fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
+/// True when two maker names refer to the same company ("NIKON", "Nikon Corporation"), or
+/// when the photo's maker is unknown.
+fn maker_agrees(photo: &str, profile: &str) -> bool {
+    let first = |s: &str| normalize(s.split(|c: char| !c.is_alphanumeric()).find(|w| !w.is_empty()).unwrap_or(""));
+    let (a, b) = (first(photo), first(profile));
+    a.is_empty() || b.is_empty() || a == b || a.contains(&b) || b.contains(&a)
+}
+
 /// `name` without a leading maker name: the whole maker or its first word, so "Nikon Z 6_2"
 /// by "Nikon Corporation" becomes "z62".
 fn strip_maker(name: &str, maker: &str) -> String {
@@ -503,6 +511,11 @@ impl Database {
                 if score <= 0 {
                     continue;
                 }
+                // A partial name match must come from the same maker ("EF 50mm f/1.8 II" by
+                // Canon is not the Pentacon 50mm f/1.8).
+                if score < 100 && !maker_agrees(maker, &lens.maker) {
+                    continue;
+                }
                 if let Some(camera) = camera {
                     if lens.mounts.iter().any(|m| m == &camera.mount) {
                         score += 10;
@@ -519,8 +532,14 @@ impl Database {
                 return best.map(|(_, i)| i);
             }
         }
-        // Fixed-lens cameras and phones: the lenses on the camera's own mount, by focal length.
+        // Fixed-lens cameras and phones: the lens on the camera's own mount, by focal length.
+        // Only when that mount has a single lens: on an interchangeable-lens body that did not
+        // record its lens, any guess would be wrong.
         let camera = camera?;
+        let on_mount = self.lenses.iter().filter(|l| l.mounts.iter().any(|m| m == &camera.mount)).count();
+        if on_mount != 1 {
+            return None;
+        }
         self.lenses
             .iter()
             .enumerate()

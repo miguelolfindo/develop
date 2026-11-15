@@ -413,7 +413,7 @@ impl Filmstrip {
                         }
                         // File type, top left of the card.
                         let badge = if item.ext == "jpeg" { "JPG" } else if item.ext == "tiff" { "TIF" } else { item.ext.as_str() };
-                        let badge_color = if matches!(item.ext.as_str(), "arw" | "nef") { theme::ACCENT } else { theme::TEAL };
+                        let badge_color = if item.ext != "dng" && RAW_EXTENSIONS.contains(&item.ext.as_str()) { theme::ACCENT } else { theme::TEAL };
                         let label = painter.layout_no_wrap(badge.to_uppercase(), theme::bold(9.0), badge_color);
                         let back = egui::Rect::from_min_size(card.min + egui::vec2(5.0, 5.0), label.size() + egui::vec2(8.0, 3.0));
                         painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(badge_color, 0.45)));
@@ -527,10 +527,11 @@ fn cached_thumbnail(file: &Path) -> Option<egui::ColorImage> {
 }
 
 /// File types the app opens, lower case.
-pub const EXTENSIONS: [&str; 10] = ["arw", "nef", "dng", "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
+pub const EXTENSIONS: [&str; 14] = ["arw", "nef", "cr2", "cr3", "rw2", "raf", "dng", "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
 
-/// Camera raw formats (Sony ARW, Nikon NEF, DNG), lower case.
-pub const RAW_EXTENSIONS: [&str; 3] = ["arw", "nef", "dng"];
+/// Camera raw formats (Sony ARW, Nikon NEF, Canon CR2 and CR3, Panasonic RW2, Fujifilm RAF,
+/// DNG), lower case.
+pub const RAW_EXTENSIONS: [&str; 7] = ["arw", "nef", "cr2", "cr3", "rw2", "raf", "dng"];
 
 pub fn extension_of(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
@@ -592,6 +593,9 @@ pub struct TiffInfo {
     pub date: Option<String>,
     /// DNG BaselineExposure, in stops.
     pub baseline_exposure: Option<f32>,
+    /// Fujifilm RAF RawExposureBias, in stops: how far the camera underexposed the raw
+    /// (about -0.72 normally, a stop more in DR200 and so on).
+    pub raw_exposure_bias: Option<f32>,
     /// DNG LinearizationTable: stored value -> linear value.
     pub linearization: Option<Vec<u16>>,
     /// Camera and lens, for lens-profile matching.
@@ -610,6 +614,12 @@ pub struct TiffInfo {
 
 /// Walk the directories of a TIFF structure that starts at `base` in `r`.
 fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
+    scan_tiff_as(r, base, false)
+}
+
+/// `scan_tiff`, treating the first directory as an EXIF directory when `root_is_exif` (Canon
+/// CR3 keeps the EXIF directory in a TIFF structure of its own).
+fn scan_tiff_as<R: Read + Seek>(r: &mut R, base: u64, root_is_exif: bool) -> Option<TiffInfo> {
     let mut head = [0u8; 8];
     r.seek(SeekFrom::Start(base)).ok()?;
     r.read_exact(&mut head).ok()?;
@@ -627,12 +637,13 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
             u32::from_be_bytes(four)
         }
     };
-    if u16_at(&head[2..]) != 42 {
+    // 42 for TIFF; Panasonic RW2 uses 0x55 with the same layout.
+    if !matches!(u16_at(&head[2..]), 42 | 0x55) {
         return None;
     }
     let mut info = TiffInfo { orientation: 1, ..Default::default() };
     // Directories still to read: (offset, is the EXIF directory).
-    let mut queue = vec![(u32_at(&head[4..]) as u64, false)];
+    let mut queue = vec![(u32_at(&head[4..]) as u64, root_is_exif)];
     let mut date_time = None;
     let mut visited = 0;
     while let Some((ifd, is_exif)) = queue.pop() {
@@ -665,6 +676,8 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
             };
             match tag {
                 0x0201 => jpeg_start = value,
+                // Panasonic RW2: the embedded full JPEG preview (JpgFromRaw).
+                0x002E if !is_exif && n > 1024 => info.jpegs.push((value, n as u64)),
                 0x0202 => jpeg_len = value,
                 0x0103 => compression = value,
                 0x0111 if n == 1 => strip_start = value,
@@ -748,11 +761,122 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
     Some(info)
 }
 
-/// Read a file's TIFF / EXIF information: directly for ARW, NEF, DNG and TIFF, from the EXIF
-/// block for JPEG. `None` for files without any (PNG, or a JPEG with no EXIF).
+/// Fill whatever `info` lacks from `other` (a second source of EXIF for the same photo).
+fn fill_missing(info: &mut TiffInfo, other: TiffInfo) {
+    info.date = info.date.take().or(other.date);
+    info.make = info.make.take().or(other.make);
+    info.model = info.model.take().or(other.model);
+    info.lens_make = info.lens_make.take().or(other.lens_make);
+    info.lens_model = info.lens_model.take().or(other.lens_model);
+    info.focal = info.focal.or(other.focal);
+    info.fnumber = info.fnumber.or(other.fnumber);
+    if info.orientation == 1 {
+        info.orientation = other.orientation;
+    }
+}
+
+/// The EXIF of a JPEG held in memory (its offsets are relative to the EXIF block).
+fn exif_of_jpeg(bytes: &[u8]) -> Option<TiffInfo> {
+    let at = bytes.windows(6).take(256 * 1024).position(|w| w == b"Exif\0\0")? + 6;
+    let mut info = scan_tiff(&mut std::io::Cursor::new(bytes), at as u64)?;
+    info.jpegs.clear();
+    Some(info)
+}
+
+/// Read `len` bytes of `file` at `offset`.
+fn read_range(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Fujifilm RAF: a fixed header points to an embedded JPEG, which carries the EXIF.
+fn raf_info(file: &mut File) -> Option<TiffInfo> {
+    let head = read_range(file, 0, 100)?;
+    if !head.starts_with(b"FUJIFILMCCD-RAW") {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]) as u64;
+    let (offset, len) = (be(84), be(88));
+    if len == 0 || len > (64 << 20) {
+        return None;
+    }
+    let jpeg = read_range(file, offset, len as usize)?;
+    let mut info = exif_of_jpeg(&jpeg).unwrap_or(TiffInfo { orientation: 1, ..Default::default() });
+    info.jpegs = vec![(offset, len)];
+    // The raw header directory: entries of (tag, size, data), big-endian.
+    let (dir_offset, dir_len) = (be(92), be(96));
+    if dir_len >= 4 && dir_len < (1 << 20) {
+        if let Some(dir) = read_range(file, dir_offset, dir_len as usize) {
+            let be16 = |i: usize| u16::from_be_bytes([dir[i], dir[i + 1]]);
+            let count = u32::from_be_bytes([dir[0], dir[1], dir[2], dir[3]]);
+            let mut p = 4usize;
+            for _ in 0..count.min(512) {
+                if p + 4 > dir.len() {
+                    break;
+                }
+                let (tag, size) = (be16(p), be16(p + 2) as usize);
+                if tag == 0x9650 && size >= 4 && p + 8 <= dir.len() {
+                    let (num, den) = (be16(p + 4) as i16 as f32, be16(p + 6) as f32);
+                    if den > 0.0 {
+                        info.raw_exposure_bias = Some(num / den);
+                    }
+                }
+                p += 4 + size;
+            }
+        }
+    }
+    Some(info)
+}
+
+/// Canon CR3 (an ISO media file): the CMT1 box holds IFD0 (camera, orientation), CMT2 the
+/// EXIF directory (date, lens, focal length), and the PRVW box a preview JPEG.
+fn cr3_info(file: &mut File) -> Option<TiffInfo> {
+    let mut head = vec![0u8; 4 << 20];
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let n = file.read(&mut head).ok()?;
+    head.truncate(n);
+    if head.get(4..8) != Some(b"ftyp") {
+        return None;
+    }
+    let find = |tag: &[u8]| head.windows(4).position(|w| w == tag).filter(|&p| p >= 4);
+    let box_end = |p: usize| p - 4 + u32::from_be_bytes([head[p - 4], head[p - 3], head[p - 2], head[p - 1]]) as usize;
+    let mut cursor = std::io::Cursor::new(&head);
+    let mut info = find(b"CMT1").and_then(|p| scan_tiff_as(&mut cursor, (p + 4) as u64, false)).unwrap_or(TiffInfo { orientation: 1, ..Default::default() });
+    info.jpegs.clear();
+    if let Some(exif) = find(b"CMT2").and_then(|p| scan_tiff_as(&mut cursor, (p + 4) as u64, true)) {
+        fill_missing(&mut info, exif);
+    }
+    if let Some(p) = find(b"PRVW") {
+        let end = box_end(p).min(head.len());
+        if let Some(soi) = head[p..end.min(p + 64)].windows(2).position(|w| w == [0xFF, 0xD8]) {
+            let start = p + soi;
+            info.jpegs.push((start as u64, (end - start) as u64));
+        }
+    }
+    Some(info)
+}
+
+/// Read a file's TIFF / EXIF information: directly for ARW, NEF, CR2, RW2, DNG and TIFF,
+/// from the embedded JPEG for RAF, from the metadata boxes for CR3, and from the EXIF block
+/// for JPEG. `None` for files without any (PNG, or a JPEG with no EXIF).
 pub fn tiff_info(path: &Path) -> Option<TiffInfo> {
     let mut file = File::open(path).ok()?;
     match extension_of(path).as_str() {
+        "raf" => raf_info(&mut file),
+        "cr3" => cr3_info(&mut file),
+        "rw2" => {
+            // Some of the EXIF (the lens, for one) is only in the embedded JPEG preview.
+            let mut info = scan_tiff(&mut file, 0)?;
+            if info.lens_model.is_none() {
+                let largest = info.jpegs.iter().copied().max_by_key(|&(_, len)| len);
+                if let Some(exif) = largest.and_then(|(o, l)| read_range(&mut file, o, l as usize)).and_then(|j| exif_of_jpeg(&j)) {
+                    fill_missing(&mut info, exif);
+                }
+            }
+            Some(info)
+        }
         "jpg" | "jpeg" => {
             let mut head = vec![0u8; 256 * 1024];
             let n = file.read(&mut head).ok()?;
