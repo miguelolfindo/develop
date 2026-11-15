@@ -118,6 +118,15 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
         }
         Err(_) => crate::export::PhotoMeta::default(),
     };
+    // The decoder leaves some of these out for some cameras (Nikon NEF: the lens); the
+    // file's own EXIF block has them.
+    let mut photo = photo;
+    if photo.lens_model.is_none() || photo.lens_make.is_none() {
+        if let Some(info) = crate::filmstrip::tiff_info(path) {
+            photo.lens_model = photo.lens_model.or(info.lens_model);
+            photo.lens_make = photo.lens_make.or(info.lens_make);
+        }
+    }
     let (width, height) = (raw.width, raw.height);
     if width < 8 || height < 8 {
         return Err("Raw image is too small.".into());
@@ -610,5 +619,17 @@ pub fn describe(path: &Path) -> String {
             crate::filmstrip::tiff_info(path).and_then(|i| i.linearization).map(|t| (t.len(), t.iter().step_by((t.len() / 8).max(1)).copied().collect::<Vec<u16>>(), t.last().copied())),
         ))
     };
-    run().unwrap_or_else(|e| format!("could not decode: {e}"))
+    let mut text = run().unwrap_or_else(|e| format!("could not decode: {e}"));
+    // What lens matching sees.
+    if let Ok((_, meta)) = decode(path) {
+        let e = &meta.exif;
+        let db = crate::lens::Database::load();
+        let camera = db.find_camera(&e.make, &e.model).map(|c| format!("{} {} ({}, crop {})", c.maker, c.model, c.mount, c.crop));
+        let lens = db.auto_match(e).map(|i| format!("{} {}", db.lenses[i].maker, db.lenses[i].model));
+        text += &format!(
+            "exif: make {:?}, model {:?}, lens make {:?}, lens model {:?}, focal {}, f/{}\nlensfun: {} files, camera {:?}, lens {:?}\n",
+            e.make, e.model, e.lens_make, e.lens_model, e.focal, e.fnumber, db.files, camera, lens
+        );
+    }
+    text
 }

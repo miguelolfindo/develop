@@ -64,6 +64,11 @@ struct Params {
     fringe: vec4<f32>,
     // The camera's embedded correction per knot: distortion, red CA, blue CA, vignetting falloff.
     knots: array<vec4<f32>, 16>,
+    // The photo's display levels with the tone sliders at zero: x = fraction above level 176,
+    // y = 98th percentile, z = median (0..1).
+    scene: vec4<f32>,
+    // x = 98th percentile of min(R, G, B) on screen (0..1).
+    scene2: vec4<f32>,
 };
 
 @group(0) @binding(0) var raw_texture: texture_2d<f32>;
@@ -235,6 +240,24 @@ fn local_ratio(uv: vec2<f32>, cam: vec3<f32>) -> f32 {
     acc += local_tap(uv + step * vec2<f32>(-0.7, -0.7), lod, 0.08, own);
     return acc.x / acc.y / own;
 }
+
+// Shadows strength from the photo's display levels (see fs_main).
+const SHADOW_BASE: f32 = 0.2;
+const SHADOW_PER_BRIGHT: f32 = 2.4;
+const SHADOW_PER_MEDIAN: f32 = 0.9;
+
+// Whites white-point gain (see fs_main): stops per stop the 98th and 99.7th percentiles sit
+// below white, its cap, and how steeply it grows along the slider.
+const WHITES_ROOM_P98: f32 = 3.4;
+const WHITES_ROOM_P997: f32 = 2.5;
+const WHITES_ROOM_MAX: f32 = 2.6;
+const WHITES_ROOM_POWER: f32 = 2.6;
+
+// How strongly Highlights adapts to the photo's 98th-percentile display level (see fs_main).
+const HIGHLIGHT_ADAPT: f32 = 2.2;
+const HL_STRENGTH_BASE: f32 = 2.6;
+const HL_STRENGTH_PER_MEDIAN: f32 = 6.0;
+const HL_STRENGTH_PER_BRIGHT: f32 = 2.5;
 
 // The Highlights slider as a tone curve: luminance in, luminance out. `h` is -1..+1 and
 // `x_max` the brightest value the file can hold after exposure. Shapes and strengths are
@@ -442,16 +465,20 @@ const TEXTURE_STRENGTH: f32 = 0.68;
 const TEXTURE_SOFTEN: f32 = 1.0;
 const CLARITY_LOD: f32 = 6.0;
 const CLARITY_STRENGTH: f32 = 1.4;
-const CLARITY_LIFT: f32 = 1.15;
+const CLARITY_LIFT: f32 = 0.6;
+const CLARITY_LIFT_MEDIAN: f32 = 0.21;
 const CLARITY_SHADE: vec2<f32> = vec2<f32>(0.35, 0.6);
 const CLARITY_OWN: vec2<f32> = vec2<f32>(0.45, 0.7);
 const CLARITY_LIFT_LOD: f32 = 7.0;
 const DEHAZE_STRENGTH: f32 = 1.4;
 const DEHAZE_POWER: f32 = 1.7;
 const DEHAZE_DARKEN: f32 = 0.2;
-const HAZE_DESATURATE: f32 = 0.65;
-const HAZE_VEIL: f32 = 0.085;
-const HAZE_POWER: f32 = 1.8;
+const HAZE_DESATURATE: f32 = 0.3;
+const HAZE_VEIL: f32 = 0.17;
+const HAZE_POWER: f32 = 1.3;
+const HAZE_PER_MEDIAN: f32 = 2.5;
+const DEHAZE_PER_DARK: f32 = 1.8;
+const DEHAZE_DARK_OFFSET: f32 = 0.45;
 
 fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
     let p = params.presence;
@@ -465,10 +492,15 @@ fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
     // a coarse grid at level 8, a dark channel from level 3.5, then J = (I - A) / t + A.
     if (p.z != 0.0) {
         var brightest = 0.0;
+        var brightest_colour = vec3<f32>(1.0);
         for (var j = 0; j < 4; j++) {
             for (var i = 0; i < 6; i++) {
                 let sample = work_at(vec2<f32>((f32(i) + 0.5) / 6.0, (f32(j) + 0.5) / 4.0), 8.0);
-                brightest = max(brightest, dot(sample, params.luma.xyz));
+                let l = dot(sample, params.luma.xyz);
+                if (l > brightest) {
+                    brightest = l;
+                    brightest_colour = sample;
+                }
             }
         }
         // A neutral airlight: taking its colour from the scene (a warm sun, say) would
@@ -482,18 +514,32 @@ fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
             let base = work_at(uv, min(shown, 3.5));
             let low = work_at(uv, 3.5);
             let dark = clamp(min(low.r / airlight.r, min(low.g / airlight.g, low.b / airlight.b)), 0.0, 1.0);
-            let t = max(1.0 - DEHAZE_STRENGTH * p.z * pow(dark, DEHAZE_POWER), 0.2);
+            // Lightroom removes more haze when the photo's brightest areas are near-neutral (high
+            // darkest channel on screen) and much less when they are strongly coloured.
+            let pz = p.z * clamp(DEHAZE_PER_DARK * params.scene2.x - DEHAZE_DARK_OFFSET, 0.25, 1.3);
+            let t = max(1.0 - DEHAZE_STRENGTH * pz * pow(dark, DEHAZE_POWER), 0.2);
             let clear = max((base - airlight) / t + airlight, vec3<f32>(0.0));
             // Each channel keeps at least a third of its value, so the sky beside the sun does
             // not lose its blue entirely.
             color *= clamp(clear / max(base, vec3<f32>(1.0e-4)), vec3<f32>(0.33), vec3<f32>(6.0));
             // Lightroom also deepens the whole picture a little.
-            color *= exp2(-DEHAZE_DARKEN * p.z);
+            color *= exp2(-DEHAZE_DARKEN * pz);
         } else {
             // Adding haze: an even veil of the airlight over the whole picture, which lifts
             // the dark areas most, as Lightroom does.
-            let k = HAZE_VEIL * pow(-p.z, HAZE_POWER);
-            color = color * (1.0 - 0.5 * k) + airlight * k;
+            // Measured against Lightroom, the veil adds a roughly even amount of display
+            // brightness to the darks and mid-tones (fading towards white), sized by how bright
+            // the photo's brightest near-neutral areas are: mixed in a perceptual (square-root)
+            // space towards a dark-channel airlight.
+            // Stronger on bright, high-key photos.
+            let k = HAZE_VEIL * pow(-p.z, HAZE_POWER) * (1.0 + HAZE_PER_MEDIAN * max(params.scene.z - 0.2, 0.0));
+            // Airlight from the blank render's darkest channel (98th percentile on screen).
+            let veil = pow(clamp(params.scene2.x, 0.05, 1.0), 1.1);
+            // The veil takes the colour of the photo's brightest area (a blue-lit scene gets a
+            // bluish veil, as in Lightroom).
+            let air_tint = clamp(brightest_colour / max(dot(brightest_colour, params.luma.xyz), 1.0e-5), vec3<f32>(0.3), vec3<f32>(3.0));
+            let mixed = sqrt(max(color, vec3<f32>(0.0))) * (1.0 - k) + veil * sqrt(air_tint) * k;
+            color = mixed * mixed;
             // ...and washes the colour out, most visibly in the sky.
             let grey = dot(color, params.luma.xyz);
             color = mix(color, vec3<f32>(grey), HAZE_DESATURATE * pow(-p.z, 0.8));
@@ -508,7 +554,9 @@ fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
         // not lifted, so no bright halo forms around silhouettes.
         let own = perceived(color);
         let shade = (1.0 - smoothstep(CLARITY_SHADE.x, CLARITY_SHADE.y, surroundings)) * (1.0 - smoothstep(CLARITY_OWN.x, CLARITY_OWN.y, own));
-        color *= exp2(CLARITY_LIFT * pow(p.y, 0.85) * shade);
+        // Only on low-key photos (dark median on screen); Lightroom leaves brighter ones alone.
+        let low_key = clamp((CLARITY_LIFT_MEDIAN - params.scene.z) / 0.08, 0.0, 1.0);
+        color *= exp2(CLARITY_LIFT * low_key * pow(p.y, 0.85) * shade);
     }
     let lp = perceived(color);
     var target_lp = lp;
@@ -647,19 +695,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let h = params.tone.y;
     let x_max = max(recovered_max * params.basic.x, 0.101);
     let base = luma * local_ratio(uv, cam);
-    let gain_local = highlight_tone(base, h, x_max) / max(base, 1e-6);
-    let gain_pixel = highlight_tone(luma, h, x_max) / max(luma, 1e-6);
+    // On a darker photo Lightroom treats the top of the photo's own range as its highlights:
+    // brightness is scaled up by how far the photo's 98th-percentile display level sits below
+    // white before the curve, so the slider reaches as far down as it does on a bright photo.
+    let hl_norm = pow(1.0 / clamp(params.scene.y, 0.2, 1.0), HIGHLIGHT_ADAPT);
+    let gain_local = highlight_tone(base * hl_norm, h, x_max * hl_norm) / max(base * hl_norm, 1e-6);
+    let gain_pixel = highlight_tone(luma * hl_norm, h, x_max * hl_norm) / max(luma * hl_norm, 1e-6);
     // Shadows, also local, fitted to Lightroom's slider at -100 / -50 / +50 / +100. Measured
     // there, the lift in stops grows steadily with how far the neighbourhood sits below a
     // reference level: about half a stop per stop at +100 (so the darkest areas come up four
     // stops or more), and about -0.7 stop per stop at -100. Bright areas are left alone.
-    let s = params.tone.z;
+    // Lightroom opens the shadows more the more bright area the photo has to balance them
+    // against, and less when the whole photo is already bright: strength from the photo's
+    // display levels, fitted per photo on nine Lightroom reference sets (1.0 on a backlit
+    // sunset, about 0.2 on flat indoor shots).
+    let shadow_strength = clamp(
+        SHADOW_BASE + SHADOW_PER_BRIGHT * params.scene.x - SHADOW_PER_MEDIAN * max(params.scene.z - 0.15, 0.0),
+        0.1,
+        1.0,
+    );
+    let s = params.tone.z * shadow_strength;
     let shadow_ref = select(0.23, 0.47, s >= 0.0);
     let below = max(log2(shadow_ref / max(base, 2e-4)), 0.0);
     // Eased in over the first half stop so there is no visible edge at the reference level.
     let depth = below * below / (below + 0.5);
     let shadow_gain = exp2(select(0.72, 0.52, s >= 0.0) * s * depth);
-    color *= mix(gain_pixel, gain_local, 0.9) * shadow_gain;
+    // How hard Lightroom pulls (or pushes) the highlights depends on the photo: about twice as
+    // hard on low-key photos (dark median on screen), about half as hard on bright ones, and
+    // less when much of the frame is bright. Applied as a power of the curve's gain.
+    let hl_strength = clamp(HL_STRENGTH_BASE - HL_STRENGTH_PER_MEDIAN * params.scene.z, 0.4, 2.2)
+        * clamp(1.0 - HL_STRENGTH_PER_BRIGHT * max(params.scene.x - 0.2, 0.0), 0.3, 1.0);
+    let hl_gain = pow(max(mix(gain_pixel, gain_local, 0.9), 1e-4), hl_strength);
+    color *= hl_gain * shadow_gain;
 
     // Whites, fitted to Lightroom's slider at -100 / -50 / +50 / +100. Positive values push
     // the bright end up by up to about 1.15 stops, growing quickly near the end of the slider
@@ -668,7 +735,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     luma = dot(color, LUMA);
     lp = luma * luma;
     let wh = params.tone.x;
-    let whites_up = 1.15 * pow(max(wh, 0.0), 1.7) * lp / (lp + 0.0484);
+    // Positive Whites also moves the white point: the further the photo's brightest areas (98th
+    // and 99.7th percentile display levels) sit below white, the more everything is brought up, by up to
+    // about 2.6 stops at +100 on a dark photo. Steep near the end of the slider, as measured.
+    let white_room = min(WHITES_ROOM_MAX, WHITES_ROOM_P98 * log2(1.0 / clamp(params.scene.y, 0.05, 1.0)) + WHITES_ROOM_P997 * log2(1.0 / clamp(params.scene.w, 0.05, 1.0)));
+    let white_point = pow(max(wh, 0.0), WHITES_ROOM_POWER) * white_room * luma / (luma + 0.002);
+    let whites_up = 1.15 * pow(max(wh, 0.0), 1.7) * lp / (lp + 0.0484) + white_point;
     let whites_down = -1.45 * pow(max(-wh, 0.0), 0.85) * min(luma, 0.9);
     color *= exp2(select(whites_down, whites_up, wh >= 0.0));
 

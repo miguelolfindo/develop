@@ -1,4 +1,4 @@
-﻿//! Colour science that runs on the CPU: Kelvin -> camera white-balance gains and the
+//! Colour science that runs on the CPU: Kelvin -> camera white-balance gains and the
 //! camera -> linear sRGB matrix. Both are tiny and are re-uploaded as uniforms when needed.
 
 pub type Mat3 = [[f32; 3]; 3];
@@ -45,6 +45,10 @@ pub fn invert(m: &Mat3) -> Option<Mat3> {
         [c(1, 0, 2, 1) * d, -c(0, 0, 2, 1) * d, c(0, 0, 1, 1) * d],
     ])
 }
+
+/// Tint slider units per unit of uv offset from the Planckian locus (the DNG SDK uses 3000;
+/// fitted to Lightroom exports).
+pub const TINT_UV_SCALE: f32 = 3000.0;
 
 /// CIE xy chromaticity of a black body at `kelvin` (Kim et al. cubic-spline approximation
 /// of the Planckian locus, valid 1667 K .. 25000 K).
@@ -137,5 +141,41 @@ impl CameraColor {
     pub fn wb_gains(&self, kelvin: f32) -> [f32; 3] {
         let g = self.locus_gains(kelvin);
         [g[0] * self.tint, 1.0, g[2] * self.tint]
+    }
+
+    /// `wb_gains` with the Tint slider applied as Adobe defines it (DNG specification): the
+    /// white point moves off the Planckian locus along its normal in CIE 1960 uv, by
+    /// `tint / TINT_UV_SCALE`. Positive tint = magenta. How the change splits between red and
+    /// blue therefore depends on the temperature, as in Lightroom.
+    pub fn wb_gains_tinted(&self, kelvin: f32, tint: f32) -> [f32; 3] {
+        let base = self.wb_gains(kelvin);
+        if tint == 0.0 {
+            return base;
+        }
+        let shifted = self.off_locus_gains(kelvin, tint / TINT_UV_SCALE);
+        let plain = self.off_locus_gains(kelvin, 0.0);
+        [base[0] * shifted[0] / plain[0], 1.0, base[2] * shifted[2] / plain[2]]
+    }
+
+    /// Gains that make neutral the colour `offset` (uv units) off the locus at `kelvin`.
+    fn off_locus_gains(&self, kelvin: f32, offset: f32) -> [f32; 3] {
+        let to_uv = |(x, y): (f32, f32)| {
+            let d = -2.0 * x + 12.0 * y + 3.0;
+            (4.0 * x / d, 6.0 * y / d)
+        };
+        let k = kelvin.clamp(1700.0, 24000.0);
+        let (u, v) = to_uv(planckian_xy(k));
+        let (u2, v2) = to_uv(planckian_xy(k + 50.0));
+        let len = ((u2 - u).powi(2) + (v2 - v).powi(2)).sqrt().max(1e-9);
+        // Normal to the locus; with temperature rising along it, (+du, -dv)... rotated is the
+        // green side, so subtracting moves towards magenta.
+        let (nu, nv) = (-(v2 - v) / len, (u2 - u) / len);
+        let (u, v) = (u - nu * offset, v - nv * offset);
+        let d = 2.0 * u - 8.0 * v + 4.0;
+        let (x, y) = (3.0 * u / d, 2.0 * v / d);
+        let xyz = [x / y, 1.0, (1.0 - x - y) / y];
+        let cam = mul_vec(&self.xyz_to_cam, xyz);
+        let safe = |v: f32| if v.is_finite() && v > 1e-4 { v } else { 1e-4 };
+        [safe(cam[1]) / safe(cam[0]), 1.0, safe(cam[1]) / safe(cam[2])]
     }
 }

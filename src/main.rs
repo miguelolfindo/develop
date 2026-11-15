@@ -159,7 +159,7 @@ impl Adjust {
 }
 
 /// The base rendering applied underneath the sliders.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Profile {
     /// Scene-linear straight to the display: flat and dark, nothing added.
     Linear,
@@ -175,11 +175,15 @@ enum Profile {
 /// profiles cancel with their -0.35 offset. `--baseline` overrides it for testing.
 const BASELINE_EXPOSURE: f32 = 0.35;
 
-/// How much one unit of Tint changes the green gain (natural log); fitted to Lightroom exports.
-const TINT_STRENGTH: f32 = 0.0034;
-
 /// Unsharp-mask strength per unit of the Amount slider, fitted to Lightroom exports.
 const SHARPEN_SCALE: f32 = 0.0295;
+
+/// Display levels assumed before a photo has been measured (Uniforms::scene).
+const SCENE_DEFAULT: [f32; 4] = [0.2, 0.9, 0.3, 0.0];
+
+/// Contrast slider units per doubling of the contrast factor: Lightroom's Contrast +100
+/// matches a factor of 2^0.5 (fitted to Lightroom exports of DLZ_5063.NEF).
+const CONTRAST_UNITS: f32 = 200.0;
 
 /// Contrast that turns Adobe Standard into an approximation of Lightroom's "Adobe Color":
 /// fitted to shadow and sky patches of Lightroom exports of the reference file.
@@ -289,6 +293,11 @@ struct CropDrag {
 type LoadResult = Result<(DecodedImage, PathBuf, f32), String>;
 
 struct App {
+    /// The open photo's display levels with the tone sliders at zero (`Uniforms::scene`), and
+    /// the settings they were measured for.
+    scene: std::cell::Cell<[f32; 4]>,
+    scene2: std::cell::Cell<[f32; 4]>,
+    scene_for: std::cell::RefCell<String>,
     render_state: egui_wgpu::RenderState,
     max_texture: u32,
     adjust: Adjust,
@@ -404,6 +413,9 @@ impl App {
         let max_texture = render_state.device.limits().max_texture_dimension_2d;
 
         let mut app = Self {
+            scene: std::cell::Cell::new(SCENE_DEFAULT),
+            scene2: std::cell::Cell::new([0.8, 0.0, 0.0, 0.0]),
+            scene_for: std::cell::RefCell::new(String::new()),
             render_state,
             max_texture,
             adjust: Adjust::default(),
@@ -496,13 +508,13 @@ impl App {
             }
         }
         // Test / scripting: `app first.ARW [--export-long 800 ...] --batch-export <folder> more.ARW ...`
-        // exports the first file and every further .ARW named after the folder, then quits.
+        // exports the first file and every further raw file named after the folder, then quits.
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         if let (Some(i), Some(first)) = (args.iter().position(|a| a == "--batch-export"), &initial) {
             if let Some(dir) = args.get(i + 1) {
                 let mut queue = std::collections::VecDeque::from([first.clone()]);
                 queue.extend(
-                    args[i + 2..].iter().map(PathBuf::from).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("arw"))),
+                    args[i + 2..].iter().map(PathBuf::from).filter(|p| filmstrip::is_raw(p)),
                 );
                 app.batch = Some(Batch {
                     total: queue.len(),
@@ -534,7 +546,7 @@ impl App {
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
             .set_title("Open photo")
-            .add_filter("Photos", &["arw", "ARW", "dng", "DNG", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "tif", "TIF", "tiff", "TIFF", "heic", "HEIC", "heif", "HEIF"])
+            .add_filter("Photos", &["arw", "ARW", "nef", "NEF", "dng", "DNG", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "tif", "TIF", "tiff", "TIFF", "heic", "HEIC", "heif", "HEIF"])
             .add_filter("All files", &["*"])
             .pick_file();
         if let Some(path) = picked {
@@ -696,6 +708,8 @@ impl App {
                         "--lens" => self.lens.enabled = value > 0.5,
                         "--lens-source" => self.lens.source = [lens::Source::Auto, lens::Source::Lensfun, lens::Source::Embedded][(value as usize).min(2)],
                         "--lens-distortion" => self.lens.distortion = value.clamp(-100.0, 100.0),
+                        "--lens-profile-distortion" => self.lens.profile_distortion = value.clamp(0.0, 200.0),
+                        "--lens-profile-vignetting" => self.lens.profile_vignetting = value.clamp(0.0, 200.0),
                         "--lens-constrain" => self.lens.constrain = value > 0.5,
                         "--lens-vignette" => self.lens.vignette = value.clamp(-100.0, 100.0),
                         "--red-cyan" => self.lens.red_cyan = value.clamp(-100.0, 100.0),
@@ -983,7 +997,44 @@ impl App {
     /// picture to draw (size and centre in image-UV units); the viewport and export differ
     /// only in that and in who applies the sRGB encoding.
     fn uniforms(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool) -> Uniforms {
+        self.measure_scene(loaded);
         self.uniforms_with(loaded, view, shader_encodes_srgb, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens)
+    }
+
+    /// Measure the photo's display levels (`Uniforms::scene`) when the photo or the settings
+    /// they depend on (exposure, white balance, profile, lens) have changed: a small render
+    /// with the tone and presence sliders at zero, read back from the GPU.
+    fn measure_scene(&self, loaded: &Loaded) {
+        let blank = Adjust { contrast: 1.0, saturation: 0.0, vibrance: 0.0, whites: 0.0, highlights: 0.0, shadows: 0.0, blacks: 0.0, ..self.adjust };
+        let key = format!(
+            "{}|{:?}|{}|{}|{}|{:?}|{:?}",
+            loaded.name, loaded.full_size, blank.exposure, blank.kelvin, self.tint, self.lens, self.profile
+        );
+        if *self.scene_for.borrow() == key {
+            return;
+        }
+        let (w, h) = if loaded.width >= loaded.height { (192, ((192.0 * loaded.height / loaded.width.max(1.0)) as u32).max(16)) } else { (((192.0 * loaded.width / loaded.height.max(1.0)) as u32).max(16), 192) };
+        let uniforms = self.uniforms_with(loaded, [1.0, 1.0, 0.5, 0.5], true, &blank, self.tint, [0.0, 1.0, 0.0, 0.0], [0.0; 3], &self.lens);
+        let rendered = {
+            let rs = &self.render_state;
+            let renderer = rs.renderer.read();
+            renderer.callback_resources.get::<ImageRenderer>().and_then(|res| res.render_full(&rs.device, &rs.queue, &uniforms, w, h, [0.0, 0.0, 1.0, 1.0]).ok())
+        };
+        let Some(rgb) = rendered else { return };
+        let mut levels: Vec<f32> = rgb.chunks_exact(3).map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 65535.0).collect();
+        let mut darkest: Vec<f32> = rgb.chunks_exact(3).map(|p| p[0].min(p[1]).min(p[2]) as f32 / 65535.0).collect();
+        darkest.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(&d) = darkest.get(darkest.len() * 98 / 100) {
+            self.scene2.set([d, 0.0, 0.0, 0.0]);
+        }
+        if levels.is_empty() {
+            return;
+        }
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = levels.len();
+        let bright = levels.iter().filter(|&&l| l > 176.0 / 255.0).count() as f32 / n as f32;
+        self.scene.set([bright, levels[(n * 98 / 100).min(n - 1)], levels[n / 2], levels[(n * 997 / 1000).min(n - 1)]]);
+        *self.scene_for.borrow_mut() = key;
     }
 
     /// The same picture with the photo's default sliders: the "before" of the A/B split.
@@ -997,11 +1048,18 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn uniforms_with(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool, a: &Adjust, tint: f32, sharpen: [f32; 4], presence: [f32; 3], lens_settings: &lens::LensSettings) -> Uniforms {
+        // Lenses whose distortion correction Lightroom always applies get it here too.
+        let builtin;
+        let lens_settings = if !lens_settings.enabled && self.builtin_distortion(loaded) {
+            builtin = lens::LensSettings { enabled: true, source: lens::Source::Lensfun, profile: String::new(), profile_distortion: 100.0, profile_vignetting: 0.0, ..lens_settings.clone() };
+            &builtin
+        } else {
+            lens_settings
+        };
         let active = self.lens_active(lens_settings, loaded);
         let lens_gpu = lens::Gpu::new(lens_settings, &active, &self.lens_db, &loaded.exif, loaded.embedded.as_ref(), loaded.width / loaded.height.max(1.0));
-        let mut gains = loaded.color.wb_gains(a.kelvin);
-        // Tint: green against magenta. Positive (magenta) lowers the green gain.
-        gains[1] *= (-TINT_STRENGTH * tint).exp();
+        // Tint: off the Planckian locus, as Lightroom does it (see CameraColor::wb_gains_tinted).
+        let gains = loaded.color.wb_gains_tinted(a.kelvin, tint);
         let min_gain = gains[0].min(gains[1]).min(gains[2]);
         let fallback;
         let render = match &self.render {
@@ -1064,6 +1122,8 @@ impl App {
             vig2: lens_gpu.vig2,
             fringe: lens_gpu.fringe,
             knots: lens_gpu.knots,
+            scene: self.scene.get(),
+            scene2: self.scene2.get(),
             sharpen: {
                 let [amount, radius, detail, masking] = sharpen;
                 [
@@ -2012,7 +2072,12 @@ impl App {
         ui::section(ui, "Tone", true, "", |ui| {
             let a = &mut self.adjust;
             ui::pro_slider(ui, "Exposure", &mut a.exposure, -5.0..=5.0, 0.0, " EV", amber);
-            ui::pro_slider(ui, "Contrast", &mut a.contrast, 0.5..=2.0, 1.0, "", amber);
+            // Shown on Lightroom's -100..100 scale; stored as a factor (Lightroom's +-100 measured
+            // as 2^(+-0.5) on reference exports).
+            let mut contrast = (CONTRAST_UNITS * a.contrast.max(0.01).log2()).clamp(-100.0, 100.0);
+            if ui::pro_slider(ui, "Contrast", &mut contrast, -100.0..=100.0, 0.0, "", amber) {
+                a.contrast = (contrast / CONTRAST_UNITS).exp2();
+            }
             ui::pro_slider(ui, "Highlights", &mut a.highlights, -100.0..=100.0, 0.0, "", amber);
             ui::pro_slider(ui, "Shadows", &mut a.shadows, -100.0..=100.0, 0.0, "", amber);
             ui::pro_slider(ui, "Whites", &mut a.whites, -100.0..=100.0, 0.0, "", amber);
@@ -2085,7 +2150,7 @@ impl App {
                 .add_enabled_ui(can_switch, |ui| ui::toggle(ui, &mut on, "AI Denoise"))
                 .inner
                 .on_hover_text(hint)
-                .on_disabled_hover_text("Works on raw photos (ARW, DNG) when the model files are installed")
+                .on_disabled_hover_text("Works on raw photos (ARW, NEF, DNG) when the model files are installed")
                 .changed();
             if flipped {
                 self.denoise_override = Some(on);
@@ -2104,6 +2169,14 @@ impl App {
         });
 
         ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));
+    }
+
+    /// True when Lightroom would correct this lens's distortion even with profile corrections
+    /// off: Nikon Z lenses carry their correction in the raw file and Adobe always applies it.
+    /// The Lensfun profile stands in for that data (distortion only, no vignetting).
+    fn builtin_distortion(&self, loaded: &Loaded) -> bool {
+        loaded.exif.make.to_lowercase().starts_with("nikon")
+            && self.lens_auto.is_some_and(|i| self.lens_db.lenses[i].mounts.iter().any(|m| m == "Nikon Z"))
     }
 
     /// Which lens correction applies to the open photo with these settings.
@@ -2274,6 +2347,9 @@ impl App {
                 .on_hover_text(self.lens_db.problems.join("\n"));
         }
 
+        if !self.lens.enabled && self.loaded.as_ref().is_some_and(|l| self.builtin_distortion(l)) {
+            ui.label(egui::RichText::new("Built-in distortion correction is applied, as Lightroom does for this lens").font(theme::font(11.5)).color(theme::FADED));
+        }
         let active = self.loaded.as_ref().map(|l| self.lens_active(&self.lens, l));
         if !matches!(active, None | Some(lens::Active::None)) {
             ui.add_space(6.0);

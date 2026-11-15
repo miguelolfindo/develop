@@ -43,6 +43,14 @@ pub struct Uniforms {
     pub vig2: [f32; 4],
     pub fringe: [f32; 4],
     pub knots: [[f32; 4]; 16],
+    /// The photo's own display levels, from a small render with the tone sliders at zero:
+    /// x = fraction of the frame above display level 176, y = 98th-percentile display
+    /// level, z = median display level, w = 99.7th-percentile display level (0..1). The
+    /// adaptive tone sliders read these.
+    pub scene: [f32; 4],
+    /// More of the same: x = 98th percentile of the darkest channel (min of R, G, B) on
+    /// screen, the brightness of the photo's brightest near-neutral areas; yzw unused.
+    pub scene2: [f32; 4],
 }
 
 /// Export renders into half floats and converts on the CPU, so 16-bit output is real 16-bit.

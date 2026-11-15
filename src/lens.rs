@@ -324,11 +324,12 @@ pub fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
-/// `name` without a leading maker name.
+/// `name` without a leading maker name: the whole maker or its first word, so "Nikon Z 6_2"
+/// by "Nikon Corporation" becomes "z62".
 fn strip_maker(name: &str, maker: &str) -> String {
     let (n, m) = (normalize(name), normalize(maker));
-    let first = m.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
-    for prefix in [m.as_str(), first] {
+    let first = normalize(maker.split(|c: char| !c.is_alphanumeric()).find(|w| !w.is_empty()).unwrap_or(""));
+    for prefix in [m.as_str(), first.as_str()] {
         if !prefix.is_empty() && n.len() > prefix.len() && n.starts_with(prefix) {
             return n[prefix.len()..].to_owned();
         }

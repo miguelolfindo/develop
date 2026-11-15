@@ -1,6 +1,6 @@
 //! Filmstrip: thumbnails of the raw files in the open file's folder.
 //!
-//! Thumbnails come from the preview JPEG every ARW carries, so nothing is demosaiced here.
+//! Thumbnails come from the preview JPEG every raw file (ARW, NEF, DNG) carries, so nothing is demosaiced here.
 //! They are decoded on a few background threads, and only for the items scrolled into view.
 
 use std::fs::File;
@@ -413,7 +413,7 @@ impl Filmstrip {
                         }
                         // File type, top left of the card.
                         let badge = if item.ext == "jpeg" { "JPG" } else if item.ext == "tiff" { "TIF" } else { item.ext.as_str() };
-                        let badge_color = if item.ext == "arw" { theme::ACCENT } else { theme::TEAL };
+                        let badge_color = if matches!(item.ext.as_str(), "arw" | "nef") { theme::ACCENT } else { theme::TEAL };
                         let label = painter.layout_no_wrap(badge.to_uppercase(), theme::bold(9.0), badge_color);
                         let back = egui::Rect::from_min_size(card.min + egui::vec2(5.0, 5.0), label.size() + egui::vec2(8.0, 3.0));
                         painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(badge_color, 0.45)));
@@ -527,7 +527,10 @@ fn cached_thumbnail(file: &Path) -> Option<egui::ColorImage> {
 }
 
 /// File types the app opens, lower case.
-pub const EXTENSIONS: [&str; 9] = ["arw", "dng", "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
+pub const EXTENSIONS: [&str; 10] = ["arw", "nef", "dng", "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
+
+/// Camera raw formats (Sony ARW, Nikon NEF, DNG), lower case.
+pub const RAW_EXTENSIONS: [&str; 3] = ["arw", "nef", "dng"];
 
 pub fn extension_of(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
@@ -539,7 +542,7 @@ pub fn is_supported(path: &Path) -> bool {
 
 /// True for the camera raw formats (as opposed to finished pictures such as JPEG).
 pub fn is_raw(path: &Path) -> bool {
-    matches!(extension_of(path).as_str(), "arw" | "dng")
+    RAW_EXTENSIONS.contains(&extension_of(path).as_str())
 }
 
 /// Compare names the way people read them: "IMG_9" before "IMG_10".
@@ -577,7 +580,7 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     (a.len() - i).cmp(&(b.len() - j))
 }
 
-/// What a TIFF-structured file (ARW, DNG, TIFF, or the EXIF block of a JPEG) says about
+/// What a TIFF-structured file (ARW, NEF, DNG, TIFF, or the EXIF block of a JPEG) says about
 /// itself, as far as the app needs.
 #[derive(Default)]
 pub struct TiffInfo {
@@ -745,7 +748,7 @@ fn scan_tiff<R: Read + Seek>(r: &mut R, base: u64) -> Option<TiffInfo> {
     Some(info)
 }
 
-/// Read a file's TIFF / EXIF information: directly for ARW, DNG and TIFF, from the EXIF
+/// Read a file's TIFF / EXIF information: directly for ARW, NEF, DNG and TIFF, from the EXIF
 /// block for JPEG. `None` for files without any (PNG, or a JPEG with no EXIF).
 pub fn tiff_info(path: &Path) -> Option<TiffInfo> {
     let mut file = File::open(path).ok()?;
