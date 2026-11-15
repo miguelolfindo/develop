@@ -1,5 +1,9 @@
-# Builds the installers when a version tag (v1.2.3) is pushed and attaches them to the
-# GitHub release: a Windows x64 NSIS installer (.exe) and an Apple Silicon disk image (.dmg).
+# Builds the installers when a version tag (v1.2.3) is pushed and publishes them as a GitHub
+# release: a Windows x64 NSIS installer (.exe) and an Apple Silicon disk image (.dmg).
+#
+# The release is created as a hidden draft, both installers are uploaded to it, and only then
+# is it published. Develop's update check therefore never sees a release whose installer for
+# its system is still being built; if a build fails, the release stays a draft.
 name: Release
 
 on:
@@ -19,7 +23,21 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "13.4"
 
 jobs:
+  draft:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" --draft --verify-tag             --title "Develop ${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+
   package:
+    needs: draft
+    # Also runs when started by hand (no tag, so no draft release).
+    if: ${{ always() && (needs.draft.result == 'success' || needs.draft.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -69,17 +87,25 @@ jobs:
       - name: Build and package
         run: cargo packager --release --formats ${{ matrix.format }}
 
-      - name: Attach to the release
-        uses: softprops/action-gh-release@v2
+      - name: Upload to the draft release
         if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: ${{ matrix.artifact }}
-          name: Develop ${{ github.ref_name }}
-          # The release text comes from RELEASE_NOTES.md in the tagged commit.
-          body_path: RELEASE_NOTES.md
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" ${{ matrix.artifact }} --clobber
 
       - name: Keep the installer as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: develop-${{ matrix.target }}
           path: ${{ matrix.artifact }}
+
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release (both installers are attached)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false --latest

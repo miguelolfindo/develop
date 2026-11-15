@@ -36,8 +36,6 @@ pub struct Release {
     pub asset_name: String,
     pub asset_url: String,
     pub asset_size: u64,
-    /// The release page, for when there is no installer for this system.
-    pub page: String,
 }
 
 /// Download progress, sent from the download thread.
@@ -97,13 +95,17 @@ pub fn check() -> Result<Option<Release>, String> {
         return Ok(None);
     }
     let asset = json["assets"].as_array().and_then(|assets| assets.iter().find(|a| a["name"].as_str().is_some_and(pick_asset)));
+    // Only offer an update that can be installed with one click: while a release is still
+    // being built (or has no installer for this system) say nothing and check next time.
+    if asset.and_then(|a| a["browser_download_url"].as_str()).map_or(true, str::is_empty) {
+        return Ok(None);
+    }
     Ok(Some(Release {
         version: tag.trim_start_matches(['v', 'V']).to_owned(),
         notes: json["body"].as_str().unwrap_or_default().replace("\r\n", "\n"),
         asset_name: asset.and_then(|a| a["name"].as_str()).unwrap_or_default().to_owned(),
         asset_url: asset.and_then(|a| a["browser_download_url"].as_str()).unwrap_or_default().to_owned(),
         asset_size: asset.and_then(|a| a["size"].as_u64()).unwrap_or(0),
-        page: json["html_url"].as_str().unwrap_or_default().to_owned(),
     }))
 }
 

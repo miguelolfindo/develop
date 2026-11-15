@@ -745,11 +745,7 @@ impl App {
                     ui.add(bar.text(format!("Downloading {}...", release.asset_name)));
                 } else {
                     ui.horizontal(|ui| {
-                        if release.asset_url.is_empty() {
-                            if ui::button(ui, "Open the release page", egui::vec2(0.0, 30.0), ui::Look::primary(), theme::bold(13.0), None).clicked() {
-                                ctx.open_url(egui::OpenUrl::new_tab(&release.page));
-                            }
-                        } else if ui::button(ui, "Download and install", egui::vec2(0.0, 30.0), ui::Look::primary(), theme::bold(13.0), None)
+                        if ui::button(ui, "Download and install", egui::vec2(0.0, 30.0), ui::Look::primary(), theme::bold(13.0), None)
                             .on_hover_text("Downloads the installer, then closes Develop to install it")
                             .clicked()
                         {
