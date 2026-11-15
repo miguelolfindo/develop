@@ -1,46 +1,33 @@
-## Develop 0.3.0
+## Develop 0.3.1
 
-### Automatic updates
-- When it starts, Develop checks whether a newer version is out. If there is one, a dialog
-  shows **what's new** and offers to **download and install** it, or to remind you later
-  or skip that version.
-  - **Windows:** the installer downloads and runs, and Develop closes so it can update.
-  - **macOS:** the new version replaces Develop in Applications and opens by itself.
-- From this version on, you won't need to come back here for updates.
+### Many more cameras
+- Develop now opens every raw format its decoder reads: around 825 camera models, adding
+  Olympus / OM System, Pentax, Leica, Samsung, Hasselblad, Phase One, Sigma, Kodak, Minolta,
+  older Canon and Nikon formats and more.
+- **Calibrated against Lightroom:** Sony, Nikon, Canon, Panasonic and Fujifilm. Other cameras
+  open and edit normally, with colour from the camera's own data, but have not been compared
+  with Lightroom yet, so a slider may look a little different. See the README's Cameras
+  section.
 
-### Undo and redo, per photo
-- **Undo** and **Redo** buttons beside **Reset All**, and the usual shortcuts:
-  **Ctrl+Z** / **Ctrl+Shift+Z** or **Ctrl+Y** on Windows, **Cmd+Z** / **Shift+Cmd+Z** on macOS.
-- Every photo keeps its own history while Develop is open, so undoing on one photo never
-  touches another.
-- One slider drag is one step; sliders, crop, straighten, rotation, profile, lens
-  corrections and Reset All can all be undone.
+### Convert to DNG
+- Save the original raw data in Adobe's open **DNG** format, losslessly compressed:
+  right-click photos and choose **Convert to DNG…**, or pick **DNG (original raw)** as the
+  format in the Export dialog. Works on one photo or a whole selection, with a progress bar.
+- Optionally **embed the original raw file** inside the DNG.
+- The DNG keeps the camera and lens details (all of the original's EXIF), opens at the same
+  brightness as the original, and for cameras whose distortion Lightroom always corrects
+  (Nikon Z, Panasonic, Olympus / OM System, Fujifilm) carries that correction in a standard
+  form other apps apply too.
+- Your Develop edits come along in a `.dvlp` file beside each DNG, so Develop reopens it as
+  you left it. Other apps open the DNG unedited.
 
-### Easier exporting
-- **Right-click a photo** in the filmstrip (or the picture itself) and choose **Export…**.
-  With several photos selected it becomes **Export N photos…** and exports them all, each
-  with its own edits.
-- A **progress window** shows which photo is being exported and how far along it is, with a
-  Cancel button.
-- When it is done, an **Export complete** window says so, with **Show in folder** to go
-  straight to the files. If any photo failed, it says which.
-
-### Also
-- The README now explains how Develop compares with Lightroom: free and open source, what
-  it does well, and what it does not have.
-- The AI noise reduction models are now part of the source code, with their origin and
-  license in `models/README.md`.
-
-### Upgrading from 0.1.x?
-Version 0.2.0 added Nikon, Canon, Panasonic and Fujifilm raw files (including X-Trans) and
-sliders that match Lightroom much more closely; 0.2.1 added network browsing. See the
-[0.2.0](https://github.com/miguelolfindo/develop/releases/tag/v0.2.0) and
-[0.2.1](https://github.com/miguelolfindo/develop/releases/tag/v0.2.1) release notes.
+### Fixes
+- Fujifilm X-Trans DNGs opened with wrong colours; they now look right.
 
 ### Installing
-- **Windows:** run `develop_0.3.0_x64-setup.exe`. It installs over an earlier version and
+- **Windows:** run `develop_0.3.1_x64-setup.exe`. It installs over an earlier version and
   keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.0_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.1_aarch64.dmg`, see below.
 
 #### macOS
 
@@ -79,7 +66,8 @@ codesign --force --deep --sign - /Applications/Develop.app
 ```
 
 ### Known limitations
-- The automatic update needs this version or later: if you have 0.2.1 or older, install
-  0.3.0 by hand once.
-- Undo history is kept while Develop is open; it starts fresh the next time.
-- Dehaze remains the slider furthest from Lightroom.
+- DNG lens corrections come from Lensfun lens profiles, so they are close to, not identical
+  with, Adobe's built-in corrections.
+- Cameras outside the five calibrated brands may differ slightly from Lightroom.
+- Copies of Develop older than 0.3.0 cannot update automatically: install this version by
+  hand once.
