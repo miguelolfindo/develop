@@ -432,6 +432,21 @@ impl Session {
         let _ = std::fs::write(file, format!("folder\t{}\nphoto\t{}\n", show(&self.folder), show(&self.photo)));
     }
 }
+/// The release the user chose to skip in the update dialog, kept in `update-skip.txt`.
+pub fn skipped_update() -> Option<String> {
+    let file = store_file()?.parent()?.join("update-skip.txt");
+    std::fs::read_to_string(file).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+pub fn skip_update(version: &str) {
+    if let Some(file) = store_file().and_then(|f| Some(f.parent()?.join("update-skip.txt"))) {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, version);
+    }
+}
+
 /// Network computers and shares the user added or opened photos from, kept in
 /// `network.tsv` (one address per line, such as `\\Olfindo` or `\\Olfindo\photos`).
 pub struct NetworkPlaces {

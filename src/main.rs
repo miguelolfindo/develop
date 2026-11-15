@@ -23,8 +23,9 @@ mod scopes;
 mod settings;
 mod theme;
 mod ui;
+mod update;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
@@ -218,6 +219,26 @@ fn maker_baseline(make: &str, model: &str) -> f32 {
     MODEL_BASELINE.iter().find(|(mk, md, _)| make.starts_with(mk) && model == *md).map_or(0.0, |&(_, _, ev)| ev)
 }
 
+/// Open the system file browser at `path`: the file selected, or the folder itself.
+fn reveal_in_folder(path: &Path) {
+    let result = if cfg!(windows) {
+        if path.is_file() {
+            std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
+        } else {
+            std::process::Command::new("explorer").arg(path).spawn()
+        }
+    } else if cfg!(target_os = "macos") {
+        if path.is_file() {
+            std::process::Command::new("open").arg("-R").arg(path).spawn()
+        } else {
+            std::process::Command::new("open").arg(path).spawn()
+        }
+    } else {
+        std::process::Command::new("xdg-open").arg(path.parent().filter(|_| path.is_file()).unwrap_or(path)).spawn()
+    };
+    let _ = result;
+}
+
 /// Display levels assumed before a photo has been measured (Uniforms::scene).
 const SCENE_DEFAULT: [f32; 4] = [0.2, 0.9, 0.3, 0.0];
 
@@ -332,7 +353,27 @@ struct CropDrag {
 
 type LoadResult = Result<(DecodedImage, PathBuf, f32), String>;
 
+/// One photo's edit history: the settings before each change (undo), the ones undone
+/// (redo), and the settings last recorded.
+#[derive(Default)]
+struct History {
+    undo: Vec<settings::Saved>,
+    redo: Vec<settings::Saved>,
+    committed: Option<settings::Saved>,
+}
+
+/// Steps of undo kept per photo.
+const HISTORY_STEPS: usize = 200;
+
 struct App {
+    /// Undo / redo, per photo, for as long as the app is open.
+    history: std::collections::HashMap<PathBuf, History>,
+    /// Update check on launch, the newer release offered, and its download.
+    update_check: Option<Receiver<Result<Option<update::Release>, String>>>,
+    update_offer: Option<update::Release>,
+    update_download: Option<Receiver<update::Progress>>,
+    update_fraction: f32,
+    update_status: Option<String>,
     /// The open photo's display levels with the tone sliders at zero (`Uniforms::scene`), and
     /// the settings they were measured for.
     scene: std::cell::Cell<[f32; 4]>,
@@ -438,6 +479,10 @@ struct App {
     /// `--export <file>`: export as soon as the picture is ready, then quit.
     pending_export: Option<PathBuf>,
     quit_after_export: bool,
+    /// Show the "Export complete" window for the export that just finished, and the file or
+    /// folder it went to.
+    export_popup: bool,
+    export_last: Option<PathBuf>,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
 }
@@ -455,6 +500,12 @@ impl App {
         let max_texture = render_state.device.limits().max_texture_dimension_2d;
 
         let mut app = Self {
+            history: std::collections::HashMap::new(),
+            update_check: None,
+            update_offer: None,
+            update_download: None,
+            update_fraction: 0.0,
+            update_status: None,
             scene: std::cell::Cell::new(SCENE_DEFAULT),
             scene2: std::cell::Cell::new([0.8, 0.0, 0.0, 0.0]),
             scene_for: std::cell::RefCell::new(String::new()),
@@ -538,6 +589,8 @@ impl App {
                 args.iter().position(|a| a == "--export").and_then(|i| args.get(i + 1)).map(PathBuf::from)
             },
             quit_after_export: false,
+            export_popup: false,
+            export_last: None,
             overrides: {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
@@ -583,7 +636,123 @@ impl App {
                 app.filmstrip.set_folder(Some(&folder));
             }
         }
+        // Look for a newer release in the background, except in scripted runs
+        // (`app file.ARW --export ...`) and when DEVELOP_NO_UPDATE_CHECK is set.
+        let scripted = std::env::args().skip(1).any(|a| a.starts_with("--"));
+        if !scripted && std::env::var_os("DEVELOP_NO_UPDATE_CHECK").is_none() {
+            let (tx, rx) = mpsc::channel();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(update::check());
+                ctx.request_repaint();
+            });
+            app.update_check = Some(rx);
+        }
         app
+    }
+
+    /// The "Update available" dialog: the new version's release notes, and downloading and
+    /// installing it.
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.update_check {
+            if let Ok(result) = rx.try_recv() {
+                self.update_check = None;
+                if let Ok(Some(release)) = result {
+                    if settings::skipped_update().as_deref() != Some(release.version.as_str()) {
+                        self.update_offer = Some(release);
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.update_download {
+            let mut finished = None;
+            while let Ok(progress) = rx.try_recv() {
+                match progress {
+                    update::Progress::Downloading(fraction) => self.update_fraction = fraction,
+                    other => finished = Some(other),
+                }
+            }
+            match finished {
+                Some(update::Progress::Ready(path)) => {
+                    self.update_download = None;
+                    match update::install(&path) {
+                        // The installer (Windows) or the swap script (macOS) takes over once
+                        // Develop has closed.
+                        Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(message) => self.update_status = Some(message),
+                    }
+                }
+                Some(update::Progress::Failed(message)) => {
+                    self.update_download = None;
+                    self.update_status = Some(message);
+                }
+                _ => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
+        let Some(release) = self.update_offer.clone() else { return };
+        let (mut start, mut later, mut skip) = (false, false, false);
+        egui::Window::new("Update available")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(format!("Develop {} is available", release.version)).font(theme::bold(16.0)).color(theme::TEXT));
+                ui.label(egui::RichText::new(format!("You have version {}. What's new:", update::current())).font(theme::font(12.5)).color(theme::FADED));
+                ui.add_space(6.0);
+                ui::hairline(ui);
+                egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.add_space(4.0);
+                    update::show_notes(ui, &release.notes);
+                });
+                ui::hairline(ui);
+                ui.add_space(8.0);
+                if let Some(status) = &self.update_status {
+                    ui.label(egui::RichText::new(status).font(theme::font(12.0)).color(ui.visuals().error_fg_color));
+                    ui.add_space(4.0);
+                }
+                if self.update_download.is_some() {
+                    let bar = if self.update_fraction >= 0.0 { egui::ProgressBar::new(self.update_fraction).show_percentage() } else { egui::ProgressBar::new(0.0).animate(true) };
+                    ui.add(bar.text(format!("Downloading {}...", release.asset_name)));
+                } else {
+                    ui.horizontal(|ui| {
+                        if release.asset_url.is_empty() {
+                            if ui::button(ui, "Open the release page", egui::vec2(0.0, 30.0), ui::Look::primary(), theme::bold(13.0), None).clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(&release.page));
+                            }
+                        } else if ui::button(ui, "Download and install", egui::vec2(0.0, 30.0), ui::Look::primary(), theme::bold(13.0), None)
+                            .on_hover_text("Downloads the installer, then closes Develop to install it")
+                            .clicked()
+                        {
+                            start = true;
+                        }
+                        if ui::button(ui, "Later", egui::vec2(0.0, 30.0), ui::Look::ghost(), theme::font(13.0), None).clicked() {
+                            later = true;
+                        }
+                        if ui::button(ui, "Skip this version", egui::vec2(0.0, 30.0), ui::Look::ghost(), theme::font(13.0), None).clicked() {
+                            skip = true;
+                        }
+                    });
+                }
+            });
+        if start {
+            self.update_status = None;
+            self.update_fraction = 0.0;
+            let (tx, rx) = mpsc::channel();
+            let (job, repaint) = (release.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                update::download(&job, &tx);
+                repaint.request_repaint();
+            });
+            self.update_download = Some(rx);
+        }
+        if skip {
+            settings::skip_update(&release.version);
+        }
+        if later || skip {
+            self.update_offer = None;
+            self.update_status = None;
+        }
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
@@ -935,6 +1104,13 @@ impl App {
         let open = self.loaded.as_ref().map(|l| l.path.clone());
         match action {
             Action::Open(path) => self.start_loading(path, ctx),
+            Action::Export(targets) => {
+                if targets.len() == 1 && open.as_ref() == Some(&targets[0]) {
+                    self.export_dialog_for(targets, ctx);
+                } else if !targets.is_empty() {
+                    self.start_batch(targets);
+                }
+            }
             Action::Copy(path) => {
                 self.clipboard = if open.as_ref() == Some(&path) {
                     Some(self.storable(self.snapshot()))
@@ -1550,6 +1726,7 @@ impl App {
 
         let settings = self.export.clone();
         let meta = loaded.photo.clone();
+        let path_for_reveal = path.clone();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -1569,6 +1746,9 @@ impl App {
         });
         self.export_status = None;
         self.export_job = Some(rx);
+        if self.batch.is_none() {
+            self.export_last = Some(path_for_reveal);
+        }
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
@@ -1580,6 +1760,9 @@ impl App {
         };
         self.export_job = None;
         self.export_status = Some(result);
+        if self.batch.is_none() && !self.quit_after_export {
+            self.export_popup = true;
+        }
         if self.quit_after_export {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1643,6 +1826,10 @@ impl App {
                         message.push_str(&format!("\nFailed: {}", batch.failed.join(", ")));
                     }
                     self.export_status = Some(if batch.failed.is_empty() { Ok(message) } else { Err(message) });
+                    if !batch.quit {
+                        self.export_last = Some(batch.dir.clone());
+                        self.export_popup = true;
+                    }
                     if batch.quit {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     } else if let Some(back) = batch.return_to.filter(|p| open.as_ref() != Some(p)) {
@@ -1684,6 +1871,11 @@ impl App {
     /// Ask where to save, then export with the current settings.
     fn export_dialog(&mut self, ctx: &egui::Context) {
         let targets = self.export_targets();
+        self.export_dialog_for(targets, ctx);
+    }
+
+    /// Export `targets`: one open photo through a save dialog, several into a folder.
+    fn export_dialog_for(&mut self, targets: Vec<PathBuf>, ctx: &egui::Context) {
         if targets.len() > 1 {
             self.start_batch(targets);
             return;
@@ -1916,6 +2108,153 @@ impl App {
         }
     }
 
+    /// The open photo's settings as the edit history records them (the AI denoise switch is
+    /// left out: changing it reopens the photo).
+    fn history_snapshot(&self) -> settings::Saved {
+        settings::Saved { denoise: false, ..self.snapshot() }
+    }
+
+    /// Record a change in the open photo's history once it is finished: not while a slider
+    /// is being dragged or a number typed, so one drag is one undo step.
+    fn track_history(&mut self, ctx: &egui::Context) {
+        if self.loading.is_some() {
+            return;
+        }
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        let now = self.history_snapshot();
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        let history = self.history.entry(path).or_default();
+        match &history.committed {
+            None => history.committed = Some(now),
+            Some(before) if *before != now && !busy => {
+                history.undo.push(before.clone());
+                if history.undo.len() > HISTORY_STEPS {
+                    history.undo.remove(0);
+                }
+                history.redo.clear();
+                history.committed = Some(now);
+            }
+            _ => {}
+        }
+    }
+
+    /// Put a recorded state back on the open photo.
+    fn restore_snapshot(&mut self, saved: &settings::Saved) {
+        self.apply_saved(saved);
+        self.quarter_turns = saved.quarter_turns % 4;
+        self.crop = saved.crop;
+        self.crop_wish = saved.crop;
+        self.angle = saved.angle;
+        self.render_key = None;
+    }
+
+    fn can_undo(&self) -> bool {
+        self.loaded.as_ref().and_then(|l| self.history.get(&l.path)).is_some_and(|h| !h.undo.is_empty())
+    }
+
+    fn can_redo(&self) -> bool {
+        self.loaded.as_ref().and_then(|l| self.history.get(&l.path)).is_some_and(|h| !h.redo.is_empty())
+    }
+
+    /// Step the open photo back (`back`) or forward through its history.
+    fn step_history(&mut self, back: bool) {
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        let current = self.history_snapshot();
+        let Some(history) = self.history.get_mut(&path) else { return };
+        let target = if back { history.undo.pop() } else { history.redo.pop() };
+        let Some(target) = target else { return };
+        let here = history.committed.clone().unwrap_or(current);
+        if back {
+            history.redo.push(here);
+        } else {
+            history.undo.push(here);
+        }
+        history.committed = Some(target.clone());
+        self.restore_snapshot(&target);
+    }
+
+    /// Export progress (a bar with the percentage done) while exporting, then a window saying
+    /// it is complete, with the way to the exported files.
+    fn export_windows(&mut self, ctx: &egui::Context) {
+        let window = |title: &str| egui::Window::new(title.to_owned()).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).default_width(380.0);
+        let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(batch) = self.batch.as_ref().filter(|b| !b.quit) {
+            let finished = batch.done + batch.failed.len();
+            let fraction = finished as f32 / batch.total.max(1) as f32;
+            let current = batch.current.as_deref().map(name_of).unwrap_or_default();
+            let mut cancel = false;
+            window("Exporting").show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new(format!("Exporting photo {} of {}", (finished + 1).min(batch.total), batch.total)).font(theme::bold(14.0)).color(theme::TEXT));
+                ui.label(egui::RichText::new(current).font(theme::font(12.0)).color(theme::FADED));
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(fraction).show_percentage().desired_width(360.0));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("To {}", batch.dir.display())).font(theme::font(11.5)).color(theme::FADED));
+                ui.add_space(4.0);
+                if ui::button(ui, "Cancel", egui::vec2(0.0, 26.0), ui::Look::bordered(), theme::font(12.5), None).on_hover_text("Stop after the photo being exported").clicked() {
+                    cancel = true;
+                }
+            });
+            if cancel {
+                if let Some(batch) = &mut self.batch {
+                    batch.queue.clear();
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        if self.export_job.is_some() && !self.quit_after_export {
+            let file = self.export_last.as_deref().map(name_of).unwrap_or_default();
+            window("Exporting").show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new("Exporting").font(theme::bold(14.0)).color(theme::TEXT));
+                ui.label(egui::RichText::new(file).font(theme::font(12.0)).color(theme::FADED));
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(360.0).text("Saving…"));
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        if !self.export_popup {
+            return;
+        }
+        let Some(status) = self.export_status.clone() else {
+            self.export_popup = false;
+            return;
+        };
+        let (title, message, ok) = match status {
+            Ok(message) => ("Export complete", message, true),
+            Err(message) => ("Export finished with problems", message, false),
+        };
+        let mut close = false;
+        window(title).show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.horizontal(|ui| {
+                let (mark, color) = if ok { ("✔", theme::TEAL) } else { ("⚠", ui.visuals().error_fg_color) };
+                ui.label(egui::RichText::new(mark).font(theme::bold(18.0)).color(color));
+                ui.label(egui::RichText::new(title).font(theme::bold(14.0)).color(theme::TEXT));
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(message).font(theme::font(12.0)).color(theme::TEXT));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui::button(ui, "OK", egui::vec2(72.0, 28.0), ui::Look::primary(), theme::bold(13.0), None).clicked() {
+                    close = true;
+                }
+                if let Some(target) = self.export_last.clone() {
+                    if ui::button(ui, "Show in folder", egui::vec2(0.0, 28.0), ui::Look::bordered(), theme::font(12.5), None).clicked() {
+                        reveal_in_folder(&target);
+                        close = true;
+                    }
+                }
+            });
+        });
+        if close {
+            self.export_popup = false;
+        }
+    }
+
     fn reset_all(&mut self) {
         // White balance goes back to what the camera recorded for this file (5500 K with no file).
         let kelvin = self.loaded.as_ref().map_or(KELVIN_DEFAULT, |l| l.color.as_shot_kelvin);
@@ -2001,6 +2340,21 @@ impl App {
                     .clicked()
                 {
                     self.reset_all();
+                }
+                let (redo_key, undo_key) = if cfg!(target_os = "macos") { ("Shift+Cmd+Z", "Cmd+Z") } else { ("Ctrl+Shift+Z or Ctrl+Y", "Ctrl+Z") };
+                let can_redo = self.can_redo();
+                if ui.add_enabled_ui(can_redo, |ui| ui::button(ui, "Redo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
+                    .on_hover_text(format!("Redo the last change undone on this photo ({redo_key})"))
+                    .clicked()
+                {
+                    self.step_history(false);
+                }
+                let can_undo = self.can_undo();
+                if ui.add_enabled_ui(can_undo, |ui| ui::button(ui, "Undo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
+                    .on_hover_text(format!("Undo the last change on this photo ({undo_key})"))
+                    .clicked()
+                {
+                    self.step_history(true);
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if let Some((name, _)) = &self.loading {
@@ -2607,6 +2961,10 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_loader();
+        self.update_dialog(ctx);
+        self.export_windows(ctx);
+        // Record finished edits in the open photo's undo history.
+        self.track_history(ctx);
 
         let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
         if let Some(path) = dropped {
@@ -2615,6 +2973,17 @@ impl eframe::App for App {
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         if ctx.input_mut(|i| i.consume_shortcut(&open)) && self.loading.is_none() {
             self.open_dialog(ctx);
+        }
+        // Undo / redo on the open photo (text fields keep their own while typing).
+        if !ctx.wants_keyboard_input() && self.loading.is_none() {
+            let redo_shift = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z);
+            let redo_y = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y);
+            let undo = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+            if ctx.input_mut(|i| i.consume_shortcut(&redo_shift) || i.consume_shortcut(&redo_y)) {
+                self.step_history(false);
+            } else if ctx.input_mut(|i| i.consume_shortcut(&undo)) {
+                self.step_history(true);
+            }
         }
 
         // Filmstrip: the open file's folder. Click a thumbnail, or use the left / right arrow

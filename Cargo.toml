@@ -19,6 +19,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 tiff = "0.11"     # TIFF written directly, for resolution and text tags
 crc32fast = "1"   # checksum for the PNG resolution chunk
 roxmltree = "0.20" # Lensfun lens-profile XML files
+# Update check: the latest release from GitHub, and downloading its installer.
+ureq = "3"
+serde_json = "1"
 # AI denoise: ONNX Runtime (prebuilt, fetched at build time). The GPU backend is chosen per
 # platform below.
 ort = "=2.0.0-rc.15"

@@ -488,6 +488,8 @@ pub enum Action {
     Paste(Vec<PathBuf>),
     /// Give these photos this many stars (0 removes the rating).
     Rate(Vec<PathBuf>, u8),
+    /// Export these photos, each with its own settings.
+    Export(Vec<PathBuf>),
 }
 
 pub fn stars(count: u8) -> String {
@@ -497,6 +499,12 @@ pub fn stars(count: u8) -> String {
 /// The right-click menu shared by the filmstrip and the main picture.
 pub fn edit_menu(ui: &mut egui::Ui, photo: &Path, targets: &[PathBuf], can_copy: bool, can_paste: bool) -> Option<Action> {
     let mut action = None;
+    let export = if targets.len() > 1 { format!("Export {} photos…", targets.len()) } else { "Export…".to_owned() };
+    if ui.button(export).clicked() {
+        action = Some(Action::Export(targets.to_vec()));
+        ui.close_menu();
+    }
+    ui.separator();
     if ui.add_enabled(can_copy, egui::Button::new("Copy settings")).on_disabled_hover_text("This photo has no edits to copy").clicked() {
         action = Some(Action::Copy(photo.to_path_buf()));
         ui.close_menu();
