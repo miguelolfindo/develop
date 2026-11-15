@@ -76,14 +76,29 @@ reference JPEG, then one JPEG per slider value (for example `DSC05615-cla+050.jp
 using a Lightroom export preset. Add it in Lightroom with **File › Plug-in Manager ›
 Add**, then run **Library › Plug-in Extras › Export Reference JPEGs…**.
 
-## Credits and licenses
+## License
 
-- Develop is licensed under the **GNU General Public License v3.0 or later**.
-- Raw decoding: [rawler](https://github.com/dnglab/dnglab).
+Copyright (C) 2026 Miguel Olfindo
+
+Develop is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version. It is distributed in the
+hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the
+full text.
+
+## Credits
+
+- Raw decoding: [rawler](https://github.com/dnglab/dnglab) (LGPL-2.1).
+- Sony embedded lens corrections are read the way
+  [darktable](https://github.com/darktable-org/darktable) reads them.
+- `patches/objc2` and `patches/objc2-0.3`: modified copies of
+  [objc2](https://github.com/madsmtm/objc2), MIT license (see the `LICENSE-MIT` file in
+  each).
 - Lens profiles: the [Lensfun](https://github.com/lensfun/lensfun) database, CC BY-SA
   3.0 (see `lensfun/README.md`).
-- AI noise reduction model: RawNIND, as packaged by
-  [darktable](https://github.com/darktable-org/darktable-ai).
+- AI noise reduction model: RawNIND (Brummer & De Vleeschouwer), GPL-3.0, as packaged
+  by [darktable-ai](https://github.com/darktable-org/darktable-ai).
 - User interface: [egui / eframe](https://github.com/emilk/egui); GPU:
   [wgpu](https://github.com/gfx-rs/wgpu); ONNX inference:
   [ort](https://github.com/pykeio/ort).

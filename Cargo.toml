@@ -4,6 +4,7 @@ version = "0.1.2"
 edition = "2021"
 description = "Develop: a GPU raw photo processor"
 license = "GPL-3.0-or-later"
+authors = ["Miguel Olfindo"]
 
 [dependencies]
 # wgpu is used through eframe's re-export (eframe::wgpu) so the versions can never drift apart.
