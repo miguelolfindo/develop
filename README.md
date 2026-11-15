@@ -118,12 +118,9 @@ cargo build --release
 
 The program is `target/release/develop` (`develop.exe` on Windows).
 
-**AI noise reduction** needs the RawNIND model files, which are not kept in the
-repository. Download `rawdenoise-nind.dtmodel` from the
-[darktable-ai releases](https://github.com/darktable-org/darktable-ai/releases) (it is a
-zip file), extract `model_bayer.onnx` and `model_linear.onnx`, and save them as
-`models/rawnind_bayer.onnx` and `models/rawnind_linear.onnx`. Without them the app works
-normally; only the AI denoise switch is unavailable.
+**AI noise reduction** uses the two RawNIND model files in `models/`, which come with the
+repository, so a fresh clone has AI denoise for every supported format. See
+[models/README.md](models/README.md) for where they come from and their license.
 
 **Installers** are built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager):
 
