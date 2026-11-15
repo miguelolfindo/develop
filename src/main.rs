@@ -15,6 +15,7 @@ mod export;
 mod filmstrip;
 mod heic;
 mod lens;
+mod network;
 mod pipeline;
 mod profile;
 mod raw;
@@ -46,6 +47,34 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Diagnostic: `app --dump-network <out.txt>` lists what the folder tree's Network entry
+    // finds: mapped drives, computers and each computer's shares.
+    if args.len() >= 3 && args[1] == "--dump-network" {
+        let saved = settings::NetworkPlaces::load().list;
+        let mut text = String::new();
+        for letter in 'A'..='Z' {
+            let drive = PathBuf::from(format!("{letter}:\\"));
+            if let Some(share) = network::drive_share(&drive) {
+                text += &format!("drive {letter}: -> {share}\n");
+            }
+        }
+        for computer in network::computers(&saved) {
+            text += &format!("computer {} ({})\n", computer.label, computer.path.display());
+            if let Some(host) = network::host_of_entry(&computer.path) {
+                match network::shares(&host, &saved) {
+                    Ok(shares) => {
+                        for share in shares {
+                            let folders = std::fs::read_dir(&share.path).map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count());
+                            text += &format!("    share {} ({}) -> {}\n", share.label, share.path.display(), folders.map_or_else(|e| format!("not readable: {e}"), |n| format!("{n} folders")));
+                        }
+                    }
+                    Err(e) => text += &format!("    {e}\n"),
+                }
+            }
+        }
+        let _ = std::fs::write(&args[2], text);
+        return Ok(());
+    }
     if args.len() >= 4 && args[1] == "--dump-raw" {
         let _ = std::fs::write(&args[3], raw::describe(std::path::Path::new(&args[2])));
         return Ok(());

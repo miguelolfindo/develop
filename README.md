@@ -25,6 +25,11 @@ moving a slider in Develop looks much like moving the same slider in Lightroom.
   or Camera Raw when they are present, including an approximation of Adobe Color.
 - **Filmstrip** with ratings, **histogram and scopes**, **before/after split**, and
   clipping warnings.
+- **Network browsing:** the folder tree has a **Network** entry listing the computers and
+  NAS boxes on your network and the folders they share; add one by address
+  (`\\computer\share` on Windows, `smb://computer/share` on macOS). Windows asks for a
+  password when a computer needs one; on macOS, shares are mounted through Finder and
+  your Keychain.
 - **Non-destructive:** edits are saved in a small `.dvlp` sidecar file next to each photo;
   the original is never changed.
 - **Export** to JPEG, PNG or TIFF, with resizing and metadata options, one photo or a

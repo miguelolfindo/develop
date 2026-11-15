@@ -1,41 +1,100 @@
 //! Folder tree on the left of the window. Clicking a folder shows its photos in the
 //! filmstrip. Folders are listed only when their parent is opened.
+//!
+//! Besides the drives (and on macOS the mounted volumes) there is a "Network" entry: the
+//! computers on the network, the folders each one shares, and the folders inside those.
+//! Anything on the network is read in the background so a slow or sleeping computer never
+//! freezes the window.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui;
 
+use crate::network::{self, Entry};
+use crate::settings::NetworkPlaces;
 use crate::theme;
 use crate::ui::{self, Icon};
 
 const ROW: f32 = 22.0;
 const INDENT: f32 = 12.0;
 
-pub struct Explorer {
-    roots: Vec<PathBuf>,
-    /// Sub-folders of each folder opened so far.
-    children: HashMap<PathBuf, Vec<PathBuf>>,
-    /// Folders shown expanded.
-    open: HashSet<PathBuf>,
-    /// The selection the tree was last opened up to.
-    revealed: Option<PathBuf>,
+/// What a background read produced.
+struct Loaded {
+    entries: Result<Vec<Entry>, String>,
+    /// macOS: where a share was mounted.
+    mounted: Option<PathBuf>,
 }
 
-fn roots() -> Vec<PathBuf> {
-    if cfg!(windows) {
-        ('A'..='Z').map(|letter| PathBuf::from(format!("{letter}:\\"))).filter(|drive| drive.exists()).collect()
+pub struct Explorer {
+    roots: Vec<PathBuf>,
+    /// Sub-entries of each entry opened so far.
+    children: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Names to show instead of the last path component (drives, computers, shares).
+    labels: HashMap<PathBuf, String>,
+    /// Entries shown expanded (see `key`).
+    open: HashSet<String>,
+    /// The selection the tree was last opened up to.
+    revealed: Option<PathBuf>,
+    /// Network reads still running, and the ones that failed.
+    pending: HashMap<PathBuf, Receiver<Loaded>>,
+    errors: HashMap<PathBuf, String>,
+    /// macOS shares mounted so far: `smb://host/share` -> folder under /Volumes.
+    mounted: HashMap<PathBuf, PathBuf>,
+    /// A share clicked before it was mounted: select it once it is.
+    click_when_mounted: Option<PathBuf>,
+    places: NetworkPlaces,
+    /// The "add a computer or share" field.
+    address: String,
+}
+
+/// Comparison key for paths: case-insensitive on Windows and macOS, without a trailing
+/// separator, so `\\OLFINDO\docker\` and `\\Olfindo\docker` are the same entry.
+fn key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    let trimmed = if trimmed.is_empty() || trimmed.ends_with(':') { text.as_ref() } else { trimmed };
+    if cfg!(any(windows, target_os = "macos")) {
+        trimmed.to_lowercase()
     } else {
-        let mut roots = vec![PathBuf::from("/")];
-        roots.extend(std::env::var_os("HOME").map(PathBuf::from));
-        roots
+        trimmed.to_owned()
     }
+}
+
+/// Top-level entries, with display names for the ones that need them.
+fn roots() -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut roots = Vec::new();
+    let mut labels = Vec::new();
+    if cfg!(windows) {
+        for letter in 'A'..='Z' {
+            let drive = PathBuf::from(format!("{letter}:\\"));
+            if drive.exists() {
+                if let Some(share) = network::drive_share(&drive) {
+                    labels.push((drive.clone(), format!("{letter}:  {share}")));
+                }
+                roots.push(drive);
+            }
+        }
+    } else {
+        roots.push(PathBuf::from("/"));
+        roots.extend(std::env::var_os("HOME").map(PathBuf::from));
+        let volumes = PathBuf::from("/Volumes");
+        if cfg!(target_os = "macos") && volumes.is_dir() {
+            labels.push((volumes.clone(), "Volumes".to_owned()));
+            roots.push(volumes);
+        }
+    }
+    labels.push((network::root(), "Network".to_owned()));
+    roots.push(network::root());
+    (roots, labels)
 }
 
 /// Folders nobody browses photos in: hidden and system ones, and a few by name.
 fn is_clutter(entry: &std::fs::DirEntry, name: &str) -> bool {
     const NAMES: [&str; 6] = ["Config.Msi", "msdownld.tmp", "WindowsApps", "System Volume Information", "Recovery", "PerfLogs"];
-    if name.starts_with('.') || name.starts_with('$') || NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+    // NAS system folders too: Synology and QNAP keep "#recycle", "#snapshot", "@eaDir"...
+    if name.starts_with('.') || name.starts_with('$') || name.starts_with('#') || name.starts_with('@') || NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         return true;
     }
     #[cfg(windows)]
@@ -68,22 +127,157 @@ fn subfolders(dir: &Path) -> Vec<PathBuf> {
     folders
 }
 
+fn as_entries(folders: Vec<PathBuf>) -> Vec<Entry> {
+    folders
+        .into_iter()
+        .map(|path| Entry { label: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string()), path })
+        .collect()
+}
+
+/// The background read for a network entry.
+fn load_remote(path: PathBuf, saved: Vec<String>) -> Loaded {
+    if network::is_root(&path) {
+        return Loaded { entries: Ok(network::computers(&saved)), mounted: None };
+    }
+    if let Some(host) = network::host_of_entry(&path) {
+        return Loaded { entries: network::shares(&host, &saved), mounted: None };
+    }
+    if network::is_unmounted_share(&path) {
+        return match network::mount(&path) {
+            Ok(point) => Loaded { entries: Ok(as_entries(subfolders(&point))), mounted: Some(point) },
+            Err(e) => Loaded { entries: Err(e), mounted: None },
+        };
+    }
+    network::ensure_access(&path);
+    if std::fs::read_dir(&path).is_err() {
+        return Loaded { entries: Err("Could not open this folder (no access, or the computer is not answering).".into()), mounted: None };
+    }
+    Loaded { entries: Ok(as_entries(subfolders(&path))), mounted: None }
+}
+
 impl Explorer {
     pub fn new() -> Self {
-        Self { roots: roots(), children: HashMap::new(), open: HashSet::new(), revealed: None }
+        let (roots, labels) = roots();
+        Self {
+            roots,
+            children: HashMap::new(),
+            labels: labels.into_iter().collect(),
+            open: HashSet::new(),
+            revealed: None,
+            pending: HashMap::new(),
+            errors: HashMap::new(),
+            mounted: HashMap::new(),
+            click_when_mounted: None,
+            places: NetworkPlaces::load(),
+            address: String::new(),
+        }
+    }
+
+    fn is_open(&self, path: &Path) -> bool {
+        self.open.contains(&key(path))
+    }
+
+    fn set_open(&mut self, path: &Path, open: bool) {
+        if open {
+            self.open.insert(key(path));
+        } else {
+            self.open.remove(&key(path));
+        }
+    }
+
+    /// Read `path` again next time it is shown.
+    fn forget(&mut self, path: &Path) {
+        self.children.remove(path);
+        self.errors.remove(path);
+    }
+
+    /// Start a background read of `path` unless one is running.
+    fn start_load(&mut self, path: &Path) {
+        if self.pending.contains_key(path) {
+            return;
+        }
+        self.errors.remove(path);
+        let (tx, rx) = mpsc::channel();
+        let (job, saved) = (path.to_path_buf(), self.places.list.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(load_remote(job, saved));
+        });
+        self.pending.insert(path.to_path_buf(), rx);
+    }
+
+    /// Take in finished background reads. Returns a share that was clicked before macOS had
+    /// mounted it, once it has been.
+    fn poll(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+        let mut clicked = None;
+        let done: Vec<(PathBuf, Loaded)> = self
+            .pending
+            .iter()
+            .filter_map(|(path, rx)| match rx.try_recv() {
+                Ok(loaded) => Some((path.clone(), loaded)),
+                Err(mpsc::TryRecvError::Disconnected) => Some((path.clone(), Loaded { entries: Err("The lookup stopped.".into()), mounted: None })),
+                Err(mpsc::TryRecvError::Empty) => None,
+            })
+            .collect();
+        for (path, loaded) in done {
+            self.pending.remove(&path);
+            if let Some(point) = loaded.mounted {
+                if self.click_when_mounted.as_deref() == Some(path.as_path()) {
+                    self.click_when_mounted = None;
+                    clicked = Some(point.clone());
+                }
+                self.mounted.insert(path.clone(), point);
+            }
+            match loaded.entries {
+                Ok(entries) => {
+                    let paths = entries.iter().map(|e| e.path.clone()).collect();
+                    for e in entries {
+                        self.labels.insert(e.path, e.label);
+                    }
+                    self.children.insert(path, paths);
+                }
+                Err(message) => {
+                    if self.click_when_mounted.as_deref() == Some(path.as_path()) {
+                        self.click_when_mounted = None;
+                    }
+                    self.errors.insert(path, message);
+                }
+            }
+        }
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        clicked
+    }
+
+    /// A photo opened from `\\HOST\share\...`: remember the computer and open the tree to it.
+    fn reveal_network(&mut self, selected: &Path) {
+        let Some(host) = network::host_of(selected) else { return };
+        let text = selected.to_string_lossy();
+        if !(text.starts_with("\\\\") || text.starts_with("smb://")) {
+            return;
+        }
+        if self.places.add(&format!("\\\\{host}")) {
+            self.forget(&network::root());
+        }
+        self.set_open(&network::root(), true);
+        self.set_open(&network::host_path(&host), true);
     }
 
     /// Draw the tree with `selected` highlighted. Returns the folder the user clicked.
     pub fn show(&mut self, ui: &mut egui::Ui, selected: Option<&Path>) -> Option<PathBuf> {
+        let mut clicked = self.poll(ui.ctx());
         ui.horizontal(|ui| {
             ui.set_height(24.0);
             let galley = ui.painter().layout_no_wrap("FOLDERS".to_owned(), theme::bold(11.5), theme::TEXT_HEADER);
             let (rect, _) = ui.allocate_exact_size(galley.size() + egui::vec2(4.0, 0.0), egui::Sense::hover());
             ui.painter().galley(rect.min + egui::vec2(4.0, 0.0), galley, theme::TEXT_HEADER);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui::icon_button(ui, Icon::Refresh, 22.0, ui::Look::ghost()).on_hover_text("Read the drives and folders again").clicked() {
-                    self.roots = roots();
+                if ui::icon_button(ui, Icon::Refresh, 22.0, ui::Look::ghost()).on_hover_text("Read the drives, network and folders again").clicked() {
+                    let (roots, labels) = roots();
+                    self.roots = roots;
+                    self.labels.extend(labels);
                     self.children.clear();
+                    self.errors.clear();
                 }
             });
         });
@@ -95,12 +289,14 @@ impl Explorer {
         let reveal = selected != self.revealed.as_deref();
         if reveal {
             if let Some(selected) = selected {
-                self.open.extend(selected.ancestors().skip(1).map(Path::to_path_buf));
+                for ancestor in selected.ancestors().skip(1) {
+                    self.open.insert(key(ancestor));
+                }
+                self.reveal_network(selected);
             }
             self.revealed = selected.map(Path::to_path_buf);
         }
 
-        let mut clicked = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for root in self.roots.clone() {
@@ -110,13 +306,62 @@ impl Explorer {
         clicked
     }
 
+    /// One-line message under an entry (searching, an error), with an optional button.
+    fn note(ui: &mut egui::Ui, depth: usize, text: &str, color: egui::Color32, button: Option<&str>) -> bool {
+        let mut pressed = false;
+        ui.horizontal(|ui| {
+            ui.set_height(ROW);
+            ui.add_space(4.0 + depth as f32 * INDENT + 20.0);
+            ui.label(egui::RichText::new(text).font(theme::font(11.5)).color(color));
+            if let Some(label) = button {
+                pressed = ui.small_button(label).clicked();
+            }
+        });
+        pressed
+    }
+
+    /// The field for adding a computer or share by address, shown under "Network".
+    fn address_row(&mut self, ui: &mut egui::Ui, depth: usize) {
+        let hint = if cfg!(windows) { "\\\\computer or \\\\computer\\share" } else { "computer or smb://computer/share" };
+        ui.horizontal(|ui| {
+            ui.set_height(ROW + 2.0);
+            ui.add_space(4.0 + depth as f32 * INDENT + 20.0);
+            let field = ui.add(egui::TextEdit::singleline(&mut self.address).hint_text(hint).desired_width((ui.available_width() - 44.0).max(60.0)));
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.small_button("Add").on_hover_text("Add this computer or shared folder to Network").clicked() || entered) && !self.address.trim().is_empty() {
+                if let Some((host, share)) = network::parse_address(&self.address) {
+                    let address = match (&share, cfg!(windows)) {
+                        (Some(s), true) => format!("\\\\{host}\\{s}"),
+                        (None, true) => format!("\\\\{host}"),
+                        (Some(s), false) => format!("smb://{host}/{s}"),
+                        (None, false) => format!("smb://{host}"),
+                    };
+                    self.places.add(&address);
+                    let computer = network::host_path(&host);
+                    self.forget(&network::root());
+                    self.forget(&computer);
+                    self.set_open(&computer, true);
+                    self.address.clear();
+                }
+            }
+        });
+    }
+
     fn node(&mut self, ui: &mut egui::Ui, path: &Path, depth: usize, selected: Option<&Path>, reveal: bool, clicked: &mut Option<PathBuf>) {
-        let label = match path.file_name() {
-            Some(name) => name.to_string_lossy().into_owned(),
-            None => path.display().to_string(), // a drive
+        let label = match self.labels.get(path) {
+            Some(label) => label.clone(),
+            None => match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => path.display().to_string(), // a drive
+            },
         };
-        let is_selected = selected == Some(path);
-        let is_open = self.open.contains(path);
+        let is_network = network::is_root(path);
+        let computer = network::host_of_entry(path);
+        // Entries that are places to open, not folders to show: Network and the computers.
+        let container_only = is_network || computer.is_some();
+        let real = self.mounted.get(path).cloned();
+        let is_selected = selected.is_some_and(|s| key(s) == key(path) || real.as_deref().is_some_and(|r| key(r) == key(s)));
+        let is_open = self.is_open(path);
 
         // One full-width row: chevron, folder icon, name.
         let (row, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), egui::Sense::click());
@@ -124,17 +369,45 @@ impl Explorer {
         let chevron = egui::Rect::from_center_size(egui::pos2(x + 5.0, row.center().y), egui::Vec2::splat(7.0));
         let on_chevron = response.interact_pointer_pos().is_some_and(|p| p.x < x + 14.0);
         if response.clicked() {
-            if on_chevron {
-                if !self.open.remove(path) {
-                    self.open.insert(path.to_path_buf());
+            if on_chevron || container_only {
+                self.set_open(path, !is_open);
+            } else if network::is_unmounted_share(path) {
+                match real.clone() {
+                    Some(point) => *clicked = Some(point),
+                    None => self.click_when_mounted = Some(path.to_path_buf()),
                 }
+                self.set_open(path, true);
             } else {
                 *clicked = Some(path.to_path_buf());
-                self.open.insert(path.to_path_buf());
+                self.set_open(path, true);
             }
         }
-        if response.double_clicked() && !on_chevron && is_open {
-            self.open.remove(path);
+        if response.double_clicked() && !on_chevron && is_open && !container_only {
+            self.set_open(path, false);
+        }
+        if is_network || computer.is_some() || network::is_remote(path) {
+            let saved_host = computer.as_ref().filter(|h| self.places.list.iter().any(|l| network::parse_address(l).is_some_and(|(x, _)| x.eq_ignore_ascii_case(h))));
+            let mut forget = false;
+            let mut remove = None;
+            response.context_menu(|ui| {
+                if ui.button("Read again").clicked() {
+                    forget = true;
+                    ui.close_menu();
+                }
+                if let Some(host) = saved_host {
+                    if ui.button("Remove from Network").clicked() {
+                        remove = Some(host.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
+            if forget {
+                self.forget(path);
+            }
+            if let Some(host) = remove {
+                self.places.remove_host(&host);
+                self.forget(&network::root());
+            }
         }
         if is_selected && reveal {
             response.scroll_to_me(Some(egui::Align::Center));
@@ -152,7 +425,7 @@ impl Explorer {
             };
             ui::draw_icon(painter, if is_open { Icon::ChevronDown } else { Icon::ChevronRight }, chevron, theme::FADED);
             let icon = egui::Rect::from_center_size(egui::pos2(x + 22.0, row.center().y), egui::vec2(13.0, 12.0));
-            ui::draw_icon(painter, Icon::Folder, icon, if is_selected { theme::ACCENT } else { theme::TEXT_HEADER });
+            ui::draw_icon(painter, Icon::Folder, icon, if is_selected { theme::ACCENT } else if container_only { theme::TEAL } else { theme::TEXT_HEADER });
             // Name, cut with an ellipsis at the edge of the row.
             let mut job = egui::text::LayoutJob::single_section(label, egui::TextFormat { font_id: theme::font(12.5), color, ..Default::default() });
             job.wrap = egui::text::TextWrapping { max_width: (row.right() - 6.0 - (x + 34.0)).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
@@ -160,11 +433,42 @@ impl Explorer {
             painter.galley(egui::pos2(x + 34.0, row.center().y - galley.size().y * 0.5), galley, color);
         }
 
-        if self.open.contains(path) {
-            let folders = self.children.entry(path.to_path_buf()).or_insert_with(|| subfolders(path)).clone();
-            for folder in folders {
-                self.node(ui, &folder, depth + 1, selected, reveal, clicked);
+        if !self.is_open(path) {
+            return;
+        }
+        if is_network {
+            self.address_row(ui, depth + 1);
+        }
+        let entries = match self.children.get(path) {
+            Some(list) => list.clone(),
+            None if network::is_remote(path) || container_only => {
+                if let Some(message) = self.errors.get(path).cloned() {
+                    let action = if computer.is_some() && cfg!(target_os = "macos") { "Connect…" } else { "Retry" };
+                    if Self::note(ui, depth + 1, &message, ui.visuals().error_fg_color, Some(action)) {
+                        if let (Some(host), true) = (&computer, cfg!(target_os = "macos")) {
+                            network::connect_dialog(host);
+                        }
+                        self.start_load(path);
+                    }
+                } else {
+                    self.start_load(path);
+                    let text = if is_network { "Looking for computers…" } else if computer.is_some() { "Asking for its shared folders…" } else { "Reading…" };
+                    Self::note(ui, depth + 1, text, theme::FADED, None);
+                }
+                return;
             }
+            None => {
+                let folders = subfolders(path);
+                self.children.insert(path.to_path_buf(), folders.clone());
+                folders
+            }
+        };
+        if entries.is_empty() && container_only {
+            let text = if is_network { "No computers found yet. Add one by address above." } else { "No shared folders." };
+            Self::note(ui, depth + 1, text, theme::FADED, None);
+        }
+        for entry in entries {
+            self.node(ui, &entry, depth + 1, selected, reveal, clicked);
         }
     }
 }

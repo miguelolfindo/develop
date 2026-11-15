@@ -30,8 +30,9 @@ embed-resource = "3"
 # DirectML runs on any DirectX 12 GPU (NVIDIA, AMD, Intel); CoreML is the Apple Silicon path.
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["directml"] }
-# HEIC pictures are decoded by Windows' own codec (Windows Imaging Component).
-windows = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com"] }
+# HEIC pictures are decoded by Windows' own codec (Windows Imaging Component); WNet lists
+# the computers and shares on the network.
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_NetworkManagement_WNet"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["coreml"] }

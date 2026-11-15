@@ -432,6 +432,47 @@ impl Session {
         let _ = std::fs::write(file, format!("folder\t{}\nphoto\t{}\n", show(&self.folder), show(&self.photo)));
     }
 }
+/// Network computers and shares the user added or opened photos from, kept in
+/// `network.tsv` (one address per line, such as `\\Olfindo` or `\\Olfindo\photos`).
+pub struct NetworkPlaces {
+    file: Option<PathBuf>,
+    pub list: Vec<String>,
+}
+
+impl NetworkPlaces {
+    pub fn load() -> Self {
+        let file = store_file().and_then(|f| Some(f.parent()?.join("network.tsv")));
+        let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        let list = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        Self { file, list }
+    }
+
+    fn save(&self) {
+        let Some(file) = &self.file else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, self.list.iter().map(|l| format!("{l}\n")).collect::<String>());
+    }
+
+    /// Add an address (ignoring case for duplicates). Returns true when it was new.
+    pub fn add(&mut self, address: &str) -> bool {
+        let address = address.trim();
+        if address.is_empty() || self.list.iter().any(|l| l.eq_ignore_ascii_case(address)) {
+            return false;
+        }
+        self.list.push(address.to_owned());
+        self.save();
+        true
+    }
+
+    /// Forget every address for `host`.
+    pub fn remove_host(&mut self, host: &str) {
+        self.list.retain(|l| crate::network::parse_address(l).map_or(true, |(h, _)| !h.eq_ignore_ascii_case(host)));
+        self.save();
+    }
+}
+
 /// Crop ratios the user saved, kept in `crop-presets.tsv` (name, width, height per line).
 pub struct CropPresets {
     file: Option<PathBuf>,
