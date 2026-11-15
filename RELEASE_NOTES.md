@@ -1,39 +1,46 @@
-## Develop 0.2.1
+## Develop 0.3.0
 
-### Browse your network
-The folder tree now has a **Network** entry at the bottom, for photos kept on a NAS or
-another computer.
+### Automatic updates
+- When it starts, Develop checks whether a newer version is out. If there is one, a dialog
+  shows **what's new** and offers to **download and install** it, or to remind you later
+  or skip that version.
+  - **Windows:** the installer downloads and runs, and Develop closes so it can update.
+  - **macOS:** the new version replaces Develop in Applications and opens by itself.
+- From this version on, you won't need to come back here for updates.
 
-- **Computers and NAS boxes** on your network are listed under Network:
-  - **Windows:** the servers behind your mapped drives, computers you added or opened
-    photos from, and whatever Windows network discovery reports.
-  - **macOS:** computers that advertise file sharing (Bonjour), and shares you already
-    have mounted.
-- Open a computer to see its **shared folders**, then the folders inside them, just like
-  a local drive.
-- **Add a computer or share by address** with the field under Network:
-  `\\computer` or `\\computer\share` on Windows, `computer` or `smb://computer/share` on
-  macOS (an IP address works too). Develop remembers it. Right-click a computer for
-  **Read again** or **Remove from Network**.
-- **Signing in:**
-  - **Windows** shows its own sign-in dialog when a computer needs a password.
-  - **macOS:** clicking a share asks Finder to mount it (using your Keychain, or asking
-    for a password). Once it is mounted, Develop opens it. If a computer will not list its
-    shares without signing in, use **Connect…**.
-- **Mapped drives** now show which share they are, for example `W:  \\server\photos`.
-- Network lookups run in the background, so a slow or sleeping NAS never freezes the
-  window.
-- NAS system folders such as `#recycle`, `#snapshot` and `@eaDir` are hidden from the tree.
+### Undo and redo, per photo
+- **Undo** and **Redo** buttons beside **Reset All**, and the usual shortcuts:
+  **Ctrl+Z** / **Ctrl+Shift+Z** or **Ctrl+Y** on Windows, **Cmd+Z** / **Shift+Cmd+Z** on macOS.
+- Every photo keeps its own history while Develop is open, so undoing on one photo never
+  touches another.
+- One slider drag is one step; sliders, crop, straighten, rotation, profile, lens
+  corrections and Reset All can all be undone.
+
+### Easier exporting
+- **Right-click a photo** in the filmstrip (or the picture itself) and choose **Export…**.
+  With several photos selected it becomes **Export N photos…** and exports them all, each
+  with its own edits.
+- A **progress window** shows which photo is being exported and how far along it is, with a
+  Cancel button.
+- When it is done, an **Export complete** window says so, with **Show in folder** to go
+  straight to the files. If any photo failed, it says which.
+
+### Also
+- The README now explains how Develop compares with Lightroom: free and open source, what
+  it does well, and what it does not have.
+- The AI noise reduction models are now part of the source code, with their origin and
+  license in `models/README.md`.
 
 ### Upgrading from 0.1.x?
-Version 0.2.0 added Nikon, Canon, Panasonic and Fujifilm raw files (including X-Trans),
-sliders that match Lightroom much more closely, and a built-in lens profile database. See
-the [0.2.0 release notes](https://github.com/miguelolfindo/develop/releases/tag/v0.2.0).
+Version 0.2.0 added Nikon, Canon, Panasonic and Fujifilm raw files (including X-Trans) and
+sliders that match Lightroom much more closely; 0.2.1 added network browsing. See the
+[0.2.0](https://github.com/miguelolfindo/develop/releases/tag/v0.2.0) and
+[0.2.1](https://github.com/miguelolfindo/develop/releases/tag/v0.2.1) release notes.
 
 ### Installing
-- **Windows:** run `develop_0.2.1_x64-setup.exe`. It installs over an earlier version and
+- **Windows:** run `develop_0.3.0_x64-setup.exe`. It installs over an earlier version and
   keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.2.1_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.0_aarch64.dmg`, see below.
 
 #### macOS
 
@@ -72,8 +79,7 @@ codesign --force --deep --sign - /Applications/Develop.app
 ```
 
 ### Known limitations
-- Windows network discovery only finds computers that announce themselves the old way;
-  many NAS boxes do not. Add those once by address, or map a drive to them.
-- On macOS, finding computers relies on Bonjour; computers that do not advertise file
-  sharing need adding by address.
+- The automatic update needs this version or later: if you have 0.2.1 or older, install
+  0.3.0 by hand once.
+- Undo history is kept while Develop is open; it starts fresh the next time.
 - Dehaze remains the slider furthest from Lightroom.
