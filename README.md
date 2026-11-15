@@ -2,22 +2,25 @@
 
 A fast raw photo editor for Windows and macOS. Every adjustment runs on the GPU, so sliders
 respond instantly, even on 61-megapixel files. The sliders are tuned against Lightroom
-Classic exports, so moving a slider in Develop looks much like moving the same slider in
-Lightroom.
+Classic exports of photos from Sony, Nikon, Canon, Panasonic and Fujifilm cameras, so
+moving a slider in Develop looks much like moving the same slider in Lightroom.
 
 ## Features
 
-- **Raw files:** Sony ARW, Nikon NEF and DNG, plus JPEG, PNG, TIFF and HEIC.
+- **Raw files:** Sony ARW, Nikon NEF, Canon CR2 and CR3, Panasonic RW2, Fujifilm RAF
+  (including X-Trans sensors) and DNG, plus JPEG, PNG, TIFF and HEIC.
 - **Edit panel:** Crop, Tone, Presence, Color, Detail and Lens Correction.
-  - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks. Highlights, Shadows
-    and Whites adapt to each photo's brightness, as Lightroom's do.
-  - **Presence:** Texture, Clarity, Dehaze.
+  - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks, on Lightroom's
+    scales. Highlights, Shadows and Whites adapt to each photo's own brightness, as
+    Lightroom's do.
+  - **Presence:** Texture, Clarity, Dehaze, also adapting to the photo.
   - **Color:** white balance (temperature and tint), Vibrance, Saturation.
   - **Detail:** sharpening and **AI noise reduction** (RawNIND model, runs on the GPU
-    through DirectML on Windows).
+    through DirectML on Windows; works on Bayer raws, X-Trans raws and linear DNGs).
   - **Lens correction:** Lensfun lens profiles (database included), the camera's own
-    correction data for Sony lenses, Nikon Z distortion correction applied automatically,
-    plus manual distortion, defringe and vignette.
+    correction data for Sony lenses, plus manual distortion, defringe and vignette.
+    Distortion correction is applied automatically for Nikon Z, Panasonic, Olympus / OM
+    System and Fujifilm cameras, as Lightroom does.
 - **Camera profiles:** uses the Adobe camera profiles (`.dcp`) installed with Lightroom
   or Camera Raw when they are present, including an approximation of Adobe Color.
 - **Filmstrip** with ratings, **histogram and scopes**, **before/after split**, and

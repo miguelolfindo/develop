@@ -74,6 +74,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: ${{ matrix.artifact }}
+          name: Develop ${{ github.ref_name }}
+          # The release text comes from RELEASE_NOTES.md in the tagged commit.
+          body_path: RELEASE_NOTES.md
 
       - name: Keep the installer as a build artifact
         uses: actions/upload-artifact@v4
