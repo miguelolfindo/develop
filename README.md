@@ -42,9 +42,44 @@ Download the installer for your system from the
 
 - **Windows:** `develop_x.y.z_x64-setup.exe`. Run it; it installs for your user account
   only, so no administrator rights are needed.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_x.y.z_aarch64.dmg`. Open it and
-  drag Develop to Applications. The app is not notarized, so the first time, right-click
-  (or Control-click) Develop in Applications and choose **Open**, then **Open** again.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_x.y.z_aarch64.dmg`. See
+  [Installing on macOS](#installing-on-macos) below.
+
+### Installing on macOS
+
+**1. Install**
+
+1. Double-click the `.dmg`. A window opens showing Develop.
+2. Drag Develop into the Applications folder.
+3. Eject the disk image (the eject icon next to it in Finder's sidebar).
+
+**2. First launch (the app is unsigned)**
+
+Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
+
+1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
+   it can't verify the developer.
+2. Click **Done** or **Cancel**.
+3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
+   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
+4. Double-click Develop again and click **Open** in the dialog.
+
+From then on it opens normally.
+
+**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
+flag, not real damage. Open Terminal and run:
+
+```bash
+xattr -cr /Applications/Develop.app
+```
+
+Then open the app again.
+
+**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
+
+```bash
+codesign --force --deep --sign - /Applications/Develop.app
+```
 
 ## Building from source
 
