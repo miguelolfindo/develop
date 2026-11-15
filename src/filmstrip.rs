@@ -413,7 +413,7 @@ impl Filmstrip {
                         }
                         // File type, top left of the card.
                         let badge = if item.ext == "jpeg" { "JPG" } else if item.ext == "tiff" { "TIF" } else { item.ext.as_str() };
-                        let badge_color = if item.ext != "dng" && RAW_EXTENSIONS.contains(&item.ext.as_str()) { theme::ACCENT } else { theme::TEAL };
+                        let badge_color = if item.ext != "dng" && is_raw(&item.path) { theme::ACCENT } else { theme::TEAL };
                         let label = painter.layout_no_wrap(badge.to_uppercase(), theme::bold(9.0), badge_color);
                         let back = egui::Rect::from_min_size(card.min + egui::vec2(5.0, 5.0), label.size() + egui::vec2(8.0, 3.0));
                         painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(badge_color, 0.45)));
@@ -490,6 +490,8 @@ pub enum Action {
     Rate(Vec<PathBuf>, u8),
     /// Export these photos, each with its own settings.
     Export(Vec<PathBuf>),
+    /// Convert these raw photos to DNG; `true` also embeds the original raw file.
+    ToDng(Vec<PathBuf>, bool),
 }
 
 pub fn stars(count: u8) -> String {
@@ -502,6 +504,26 @@ pub fn edit_menu(ui: &mut egui::Ui, photo: &Path, targets: &[PathBuf], can_copy:
     let export = if targets.len() > 1 { format!("Export {} photos…", targets.len()) } else { "Export…".to_owned() };
     if ui.button(export).clicked() {
         action = Some(Action::Export(targets.to_vec()));
+        ui.close_menu();
+    }
+    let any_raw = targets.iter().any(|p| is_raw(p) && extension_of(p) != "dng");
+    let to_dng = if targets.len() > 1 { format!("Convert {} photos to DNG…", targets.len()) } else { "Convert to DNG…".to_owned() };
+    if ui
+        .add_enabled(any_raw, egui::Button::new(to_dng))
+        .on_hover_text("The original raw data in Adobe's open raw format, losslessly compressed. Develop's edits come along in a .dvlp file beside it.")
+        .on_disabled_hover_text("Only camera raw files can be converted")
+        .clicked()
+    {
+        action = Some(Action::ToDng(targets.to_vec(), false));
+        ui.close_menu();
+    }
+    if ui
+        .add_enabled(any_raw, egui::Button::new("Convert to DNG, embedding the original…"))
+        .on_hover_text("As Convert to DNG, with the original raw file stored inside the DNG so it can be extracted again (larger files)")
+        .on_disabled_hover_text("Only camera raw files can be converted")
+        .clicked()
+    {
+        action = Some(Action::ToDng(targets.to_vec(), true));
         ui.close_menu();
     }
     ui.separator();
@@ -535,23 +557,38 @@ fn cached_thumbnail(file: &Path) -> Option<egui::ColorImage> {
 }
 
 /// File types the app opens, lower case.
-pub const EXTENSIONS: [&str; 14] = ["arw", "nef", "cr2", "cr3", "rw2", "raf", "dng", "jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
+/// Finished pictures the app opens, lower case (raw formats come from the decoder: see
+/// `raw_extensions`).
+pub const PICTURE_EXTENSIONS: [&str; 7] = ["jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"];
 
-/// Camera raw formats (Sony ARW, Nikon NEF, Canon CR2 and CR3, Panasonic RW2, Fujifilm RAF,
-/// DNG), lower case.
-pub const RAW_EXTENSIONS: [&str; 7] = ["arw", "nef", "cr2", "cr3", "rw2", "raf", "dng"];
+/// Every camera raw format the decoder (rawler) reads, lower case, plus DNG.
+pub fn raw_extensions() -> Vec<String> {
+    let mut list: Vec<String> = rawler::decoders::supported_extensions().iter().map(|e| e.to_lowercase()).collect();
+    if !list.iter().any(|e| e == "dng") {
+        list.push("dng".to_owned());
+    }
+    list
+}
+
+/// Everything the app opens: raw formats and finished pictures, lower case.
+pub fn all_extensions() -> Vec<String> {
+    let mut list = raw_extensions();
+    list.extend(PICTURE_EXTENSIONS.iter().map(|e| e.to_string()));
+    list
+}
 
 pub fn extension_of(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
 }
 
 pub fn is_supported(path: &Path) -> bool {
-    EXTENSIONS.contains(&extension_of(path).as_str())
+    is_raw(path) || PICTURE_EXTENSIONS.contains(&extension_of(path).as_str())
 }
 
 /// True for the camera raw formats (as opposed to finished pictures such as JPEG).
 pub fn is_raw(path: &Path) -> bool {
-    RAW_EXTENSIONS.contains(&extension_of(path).as_str())
+    let ext = extension_of(path);
+    ext == "dng" || rawler::decoders::supported_extensions().iter().any(|e| e.eq_ignore_ascii_case(&ext))
 }
 
 /// Compare names the way people read them: "IMG_9" before "IMG_10".
@@ -645,8 +682,8 @@ fn scan_tiff_as<R: Read + Seek>(r: &mut R, base: u64, root_is_exif: bool) -> Opt
             u32::from_be_bytes(four)
         }
     };
-    // 42 for TIFF; Panasonic RW2 uses 0x55 with the same layout.
-    if !matches!(u16_at(&head[2..]), 42 | 0x55) {
+    // 42 for TIFF; Panasonic RW2 uses 0x55 and Olympus ORF "RO" / "RS" with the same layout.
+    if !matches!(u16_at(&head[2..]), 42 | 0x55 | 0x4F52 | 0x5352) {
         return None;
     }
     let mut info = TiffInfo { orientation: 1, ..Default::default() };
@@ -960,5 +997,19 @@ fn thumbnail(path: &Path) -> Option<egui::ColorImage> {
             return Some(finish(decoded));
         }
     }
-    None
+    // Formats without a TIFF-style preview (Minolta MRW, Sigma X3F, old Canon CRW...): ask
+    // the decoder for the preview it knows how to find.
+    decoder_preview(path).map(finish)
+}
+
+/// The embedded preview of a raw file, as the decoder finds it.
+fn decoder_preview(path: &Path) -> Option<image::DynamicImage> {
+    let source = rawler::rawsource::RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    decoder
+        .preview_image(&source, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.thumbnail_image(&source, &params).ok().flatten())
 }

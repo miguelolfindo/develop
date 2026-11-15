@@ -556,6 +556,34 @@ impl Database {
 // Interpolation
 // ---------------------------------------------------------------------------------------
 
+/// Solve a 4x4 linear system (Gaussian elimination with partial pivoting).
+fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
+    for col in 0..4 {
+        let pivot = (col..4).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[pivot][col].abs() < 1.0e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        for row in col + 1..4 {
+            let f = a[row][col] / a[col][col];
+            for k in col..4 {
+                a[row][k] -= f * a[col][k];
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    let mut x = [0.0f64; 4];
+    for row in (0..4).rev() {
+        let mut v = b[row];
+        for k in row + 1..4 {
+            v -= a[row][k] * x[k];
+        }
+        x[row] = v / a[row][row];
+    }
+    Some(x)
+}
+
 /// A calibration evaluated at one focal length and aperture.
 #[derive(Clone, Debug, Default)]
 pub struct Calibration {
@@ -686,7 +714,69 @@ pub enum Active {
     Embedded,
 }
 
+/// True when Lightroom corrects this lens's distortion even with profile corrections off:
+/// Nikon Z, Panasonic, Olympus / OM System and Fujifilm cameras carry the correction in the
+/// raw file and Adobe always applies it. The Lensfun profile stands in for that data.
+pub fn builtin_distortion(make: &str, lens: &Lens) -> bool {
+    let make = make.to_lowercase();
+    if make.starts_with("nikon") {
+        return lens.mounts.iter().any(|m| m == "Nikon Z");
+    }
+    ["panasonic", "olympus", "om digital", "fujifilm"].iter().any(|m| make.starts_with(m))
+}
+
 impl Gpu {
+    /// The lens correction as a DNG WarpRectilinear opcode: for the red, green and blue planes,
+    /// radial coefficients kr0..kr3 (tangential kt0, kt1 left at 0) of
+    /// `source = centre + (dest - centre) * (kr0 + kr1 r^2 + kr2 r^4 + kr3 r^6)`, with r = 1 at
+    /// the corners, fitted to `warp` (enlargement included). Also the worst fit error, as a
+    /// fraction of the half diagonal. `None` when there is nothing to correct.
+    pub fn dng_warp(&self, aspect: f32) -> Option<([[f64; 6]; 3], f64)> {
+        let zoom = self.geo[3];
+        let samples: Vec<(f64, [f64; 3])> = (1..=48)
+            .map(|i| {
+                let t = i as f32 / 48.0;
+                let c = [0.5 * t, 0.5 * t];
+                let len = (c[0] * aspect).hypot(c[1]);
+                let w = self.warp(c, aspect, zoom);
+                let ratio = |p: [f32; 2]| ((p[0] * aspect).hypot(p[1]) / len) as f64;
+                (t as f64, [ratio(w[1]), ratio(w[0]), ratio(w[2])])
+            })
+            .collect();
+        if samples.iter().all(|(_, r)| r.iter().all(|v| (v - 1.0).abs() < 1.0e-6)) {
+            return None;
+        }
+        let mut planes = [[0.0f64; 6]; 3];
+        let mut worst = 0.0f64;
+        for (plane, coefficients) in planes.iter_mut().enumerate() {
+            // Least squares on the basis 1, r^2, r^4, r^6.
+            let mut ata = [[0.0f64; 4]; 4];
+            let mut atb = [0.0f64; 4];
+            for (r, ratios) in &samples {
+                let basis = [1.0, r * r, r.powi(4), r.powi(6)];
+                for i in 0..4 {
+                    atb[i] += basis[i] * ratios[plane];
+                    for j in 0..4 {
+                        ata[i][j] += basis[i] * basis[j];
+                    }
+                }
+            }
+            let k = solve4(ata, atb)?;
+            for (r, ratios) in &samples {
+                let fit = k[0] + k[1] * r * r + k[2] * r.powi(4) + k[3] * r.powi(6);
+                worst = worst.max(((fit - ratios[plane]) * r).abs());
+            }
+            coefficients[..4].copy_from_slice(&k);
+        }
+        // Pull every plane in by the fit error so no edge samples just outside the picture.
+        for plane in planes.iter_mut() {
+            for k in plane[..4].iter_mut() {
+                *k *= 1.0 - worst;
+            }
+        }
+        Some((planes, worst))
+    }
+
     /// Build the shader parameters. `profile` is the Lensfun lens in use (with the crop
     /// factor of the camera, when known), `embedded` the photo's own tables; `aspect` is the
     /// stored picture's width / height.
@@ -751,7 +841,7 @@ impl Gpu {
 
     /// Where an output point (centred texture coordinates, before enlargement) is sampled
     /// from, for green, red and blue. Mirrors `lens_coords` in shader.wgsl.
-    fn warp(&self, c: [f32; 2], aspect: f32, zoom: f32) -> [[f32; 2]; 3] {
+    pub fn warp(&self, c: [f32; 2], aspect: f32, zoom: f32) -> [[f32; 2]; 3] {
         let (cx, cy) = (c[0] / zoom, c[1] / zoom);
         let len = (cx * aspect).hypot(cy);
         let half_diag = aspect.hypot(1.0);

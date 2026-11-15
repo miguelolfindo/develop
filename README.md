@@ -34,8 +34,11 @@ AI is used for one thing only: noise reduction, running on your own computer.
 
 ## Features
 
-- **Raw files:** Sony ARW, Nikon NEF, Canon CR2 and CR3, Panasonic RW2, Fujifilm RAF
-  (including X-Trans sensors) and DNG, plus JPEG, PNG, TIFF and HEIC.
+- **Raw files:** every format the [rawler](https://github.com/dnglab/dnglab) decoder reads,
+  around 825 camera models: ARW, CR2, CR3, CRW, CRM, NEF, NRW, RW2, RWL, RAF (including
+  X-Trans), ORF, ORI, PEF, SRW, IIQ, 3FR, FFF, DCR, DCS, KDC, MEF, MOS, MRW, ERF, X3F, ARI,
+  QTK, RAW and DNG, plus JPEG, PNG, TIFF and HEIC. See [Cameras](#cameras) for which ones
+  are calibrated against Lightroom.
 - **Edit panel:** Crop, Tone, Presence, Color, Detail and Lens Correction.
   - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks, on Lightroom's
     scales. Highlights, Shadows and Whites adapt to each photo's own brightness, as
@@ -60,7 +63,34 @@ AI is used for one thing only: noise reduction, running on your own computer.
 - **Non-destructive:** edits are saved in a small `.dvlp` sidecar file next to each photo;
   the original is never changed.
 - **Export** to JPEG, PNG or TIFF, with resizing and metadata options, one photo or a
-  batch.
+  batch (right-click a photo, or select several), with a progress bar.
+- **Convert to DNG:** choose **DNG (original raw)** as the format in the Export dialog, or
+  right-click raw photos and choose **Convert to DNG…**, to save the
+  original raw data in Adobe's open DNG format, losslessly compressed (optionally with the
+  original raw file embedded inside it). Develop writes the DNG itself, with the camera and
+  lens details, the camera's baseline exposure (including Fujifilm DR200 / DR400
+  compensation), and, for cameras whose distortion Lightroom always corrects (Nikon Z,
+  Panasonic, Olympus / OM System, Fujifilm), that distortion and colour-fringe correction as a
+  standard DNG lens-correction instruction, so other DNG readers correct it too. The correction
+  comes from the Lensfun lens profile rather than the camera maker's own data, so it is close
+  to, not identical with, Adobe's. Develop's edits come along in a `.dvlp` file beside each
+  DNG, so Develop reopens it as you left it; other applications open the DNG unedited.
+
+## Cameras
+
+**Calibrated against Lightroom:** Sony, Nikon, Canon, Panasonic and Fujifilm. Develop's
+sliders, white balance and Lightroom's per-camera adjustments (built-in lens corrections,
+exposure offsets) were measured on reference photos from these brands' cameras.
+
+**Supported, not yet calibrated:** every other camera the decoder reads, including
+Olympus / OM System, Pentax, Leica, Samsung, Hasselblad, Phase One, Sigma, Kodak, Minolta,
+Epson and DNG files from phones and other software. These open and edit normally, with
+colour from the camera's own colour data (and Adobe's camera profile when Lightroom or
+Camera Raw is installed), but they have not been compared with Lightroom yet: the same
+slider value may look a little different, and the starting exposure may differ slightly.
+
+To help calibrate a camera, export reference JPEGs from Lightroom Classic with the plugin
+in `lightroom/` and share them.
 
 ## Install
 

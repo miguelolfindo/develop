@@ -22,6 +22,7 @@ mod raw;
 mod scopes;
 mod settings;
 mod theme;
+mod todng;
 mod ui;
 mod update;
 
@@ -48,6 +49,20 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // `app --to-dng <folder> [--embed] <raw files...>`: convert to DNG and quit (scripted use
+    // and tests). Prints one line per file.
+    if args.len() >= 4 && args[1] == "--to-dng" {
+        let dir = PathBuf::from(&args[2]);
+        let embed = args.iter().any(|a| a == "--embed");
+        for file in args[3..].iter().filter(|a| *a != "--embed") {
+            match todng::convert_one(std::path::Path::new(file), &dir, embed, None) {
+                Ok(out) => println!("{file} -> {}
+    {}", out.display(), todng::describe(std::path::Path::new(file))),
+                Err(e) => println!("{file}: {e}"),
+            }
+        }
+        return Ok(());
+    }
     // Diagnostic: `app --dump-network <out.txt>` lists what the folder tree's Network entry
     // finds: mapped drives, computers and each computer's shares.
     if args.len() >= 3 && args[1] == "--dump-network" {
@@ -483,6 +498,15 @@ struct App {
     /// folder it went to.
     export_popup: bool,
     export_last: Option<PathBuf>,
+    /// A Convert to DNG run: its events, how far it is (done, total, current file), and the
+    /// switch that stops it.
+    dng_job: Option<Receiver<todng::Event>>,
+    dng_progress: (usize, usize, String),
+    dng_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The export dialog's DNG choice (original raw data instead of a rendered picture), and
+    /// whether to embed the original raw file in it.
+    export_dng: bool,
+    export_dng_embed: bool,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
 }
@@ -591,6 +615,11 @@ impl App {
             quit_after_export: false,
             export_popup: false,
             export_last: None,
+            dng_job: None,
+            dng_progress: (0, 0, String::new()),
+            dng_cancel: None,
+            export_dng: false,
+            export_dng_embed: false,
             overrides: {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
@@ -758,7 +787,7 @@ impl App {
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let picked = rfd::FileDialog::new()
             .set_title("Open photo")
-            .add_filter("Photos", &["arw", "ARW", "nef", "NEF", "cr2", "CR2", "cr3", "CR3", "rw2", "RW2", "raf", "RAF", "dng", "DNG", "jpg", "JPG", "jpeg", "JPEG", "png", "PNG", "tif", "TIF", "tiff", "TIFF", "heic", "HEIC", "heif", "HEIF"])
+            .add_filter("Photos", &filmstrip::all_extensions().iter().flat_map(|e| [e.clone(), e.to_uppercase()]).collect::<Vec<String>>())
             .add_filter("All files", &["*"])
             .pick_file();
         if let Some(path) = picked {
@@ -940,6 +969,8 @@ impl App {
                         "--crop-mode" => self.crop_mode = value > 0.5,
                         // Canvas HUD toggles, for testing.
                         "--clipping" => self.clipping = value > 0.5,
+                        "--export-panel" => self.export_open = value > 0.5,
+                        "--export-dng" => self.export_dng = value > 0.5,
                         "--ab" => {
                             self.ab_split = value > 0.0;
                             self.ab_pos = value.clamp(0.02, 0.98);
@@ -1104,6 +1135,7 @@ impl App {
         let open = self.loaded.as_ref().map(|l| l.path.clone());
         match action {
             Action::Open(path) => self.start_loading(path, ctx),
+            Action::ToDng(targets, embed) => self.start_dng(targets, embed, ctx),
             Action::Export(targets) => {
                 if targets.len() == 1 && open.as_ref() == Some(&targets[0]) {
                     self.export_dialog_for(targets, ctx);
@@ -1917,7 +1949,7 @@ impl App {
         };
         let (width, height) = self.output_size(loaded);
         let has_location = loaded.photo.gps.is_some();
-        let busy = self.export_job.is_some() || self.batch.is_some();
+        let busy = self.export_job.is_some() || self.batch.is_some() || self.dng_job.is_some();
         let count = self.export_targets().len();
         let progress = self.batch.as_ref().map(|b| ((b.done + b.failed.len() + 1).min(b.total), b.total));
         let mut cancel = false;
@@ -1959,12 +1991,38 @@ impl App {
             let s = &mut self.export;
             egui::Grid::new("export_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Format");
-                egui::ComboBox::from_id_source("export_format").selected_text(s.format.label()).show_ui(ui, |ui| {
+                let dng = &mut self.export_dng;
+                let shown = if *dng { "DNG (original raw)".to_owned() } else { s.format.label().to_owned() };
+                egui::ComboBox::from_id_source("export_format").selected_text(shown).show_ui(ui, |ui| {
                     for f in export::Format::ALL {
-                        ui.selectable_value(&mut s.format, f, f.label());
+                        if ui.selectable_label(!*dng && s.format == f, f.label()).clicked() {
+                            s.format = f;
+                            *dng = false;
+                        }
+                    }
+                    if ui
+                        .selectable_label(*dng, "DNG (original raw)")
+                        .on_hover_text("The original raw data in Adobe's open raw format, losslessly compressed, for editing elsewhere")
+                        .clicked()
+                    {
+                        *dng = true;
                     }
                 });
                 ui.end_row();
+
+                if *dng {
+                    ui.label("Contents");
+                    ui.label("Original raw data, lossless.\nDevelop's edits are saved beside it (.dvlp);\nother apps open it unedited.");
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut self.export_dng_embed, "Embed the original raw file")
+                        .on_hover_text("Stores the original raw file inside the DNG so it can be extracted again (about twice the size)");
+                    ui.end_row();
+                    ui.label("Artist");
+                    ui.add(egui::TextEdit::singleline(&mut s.artist).desired_width(200.0));
+                    ui.end_row();
+                    return;
+                }
 
                 if s.format == export::Format::Jpeg {
                     ui.label("Quality");
@@ -2104,7 +2162,16 @@ impl App {
             }
         }
         if export_now {
-            self.export_dialog(ctx);
+            if self.export_dng {
+                let targets = self.export_targets();
+                if targets.len() > 1 {
+                    self.start_dng(targets, self.export_dng_embed, ctx);
+                } else {
+                    self.export_dng_file(ctx);
+                }
+            } else {
+                self.export_dialog(ctx);
+            }
         }
     }
 
@@ -2173,9 +2240,111 @@ impl App {
         self.restore_snapshot(&target);
     }
 
+    /// Convert the open photo to a DNG file chosen with a save dialog, in the background.
+    fn export_dng_file(&mut self, ctx: &egui::Context) {
+        let Some(photo) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        if self.dng_job.is_some() {
+            return;
+        }
+        let stem = photo.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "photo".to_owned());
+        let mut dialog = rfd::FileDialog::new().set_title("Export as DNG").set_file_name(format!("{stem}.dng")).add_filter("DNG", &["dng"]);
+        if let Some(dir) = self.presets.last_dir.as_deref().or(photo.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut target) = dialog.save_file() else { return };
+        if target.extension().map_or(true, |e| !e.eq_ignore_ascii_case("dng")) {
+            target.set_extension("dng");
+        }
+        self.presets.last_dir = target.parent().map(PathBuf::from);
+        self.store.flush(true);
+        let (embed, artist) = (self.export_dng_embed, Some(self.export.artist.clone()).filter(|a| !a.is_empty()));
+        let (tx, rx) = mpsc::channel();
+        let (job_target, repaint, name) = (target.clone(), ctx.clone(), photo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        std::thread::spawn(move || {
+            let _ = tx.send(todng::Event::Progress { done: 0, total: 1, name });
+            let started = Instant::now();
+            let result = todng::convert_to(&photo, &job_target, embed, artist).map(|out| {
+                let size = std::fs::metadata(&out).map_or(0, |m| m.len());
+                format!("Saved DNG, {:.1} MB in {:.1} s\n{}", size as f64 / 1.0e6, started.elapsed().as_secs_f32(), out.display())
+            });
+            let _ = tx.send(todng::Event::Finished(result));
+            repaint.request_repaint();
+        });
+        self.dng_progress = (0, 1, String::new());
+        self.dng_cancel = None;
+        self.dng_job = Some(rx);
+        self.export_last = Some(target);
+    }
+
+    /// Ask for a folder, then convert `targets` to DNG there in the background.
+    fn start_dng(&mut self, targets: Vec<PathBuf>, embed: bool, ctx: &egui::Context) {
+        if self.dng_job.is_some() || targets.is_empty() {
+            return;
+        }
+        let title = if targets.len() > 1 { format!("Convert {} photos to DNG in folder", targets.len()) } else { "Convert to DNG in folder".to_owned() };
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some(dir) = targets[0].parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(dir) = dialog.pick_folder() else { return };
+        // The edits on show must be in their sidecars before those are copied.
+        self.store.flush(true);
+        let artist = Some(self.export.artist.clone()).filter(|a| !a.is_empty());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (stop, repaint, folder) = (cancel.clone(), ctx.clone(), dir.clone());
+        std::thread::spawn(move || {
+            todng::convert_all(targets, folder, embed, artist, tx, stop);
+            repaint.request_repaint();
+        });
+        self.dng_progress = (0, 0, String::new());
+        self.dng_cancel = Some(cancel);
+        self.dng_job = Some(rx);
+        self.export_last = Some(dir);
+    }
+
     /// Export progress (a bar with the percentage done) while exporting, then a window saying
     /// it is complete, with the way to the exported files.
     fn export_windows(&mut self, ctx: &egui::Context) {
+        // Convert to DNG: take in its progress; when it is done, the completion window below
+        // shows the result.
+        if let Some(rx) = &self.dng_job {
+            let mut finished = None;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    todng::Event::Progress { done, total, name } => self.dng_progress = (done, total, name),
+                    todng::Event::Finished(result) => finished = Some(result),
+                }
+            }
+            if let Some(result) = finished {
+                self.dng_job = None;
+                self.dng_cancel = None;
+                self.export_status = Some(result);
+                self.export_popup = true;
+            }
+        }
+        if self.dng_job.is_some() {
+            let (done, total, name) = self.dng_progress.clone();
+            let mut cancel = false;
+            egui::Window::new("Converting to DNG").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new(format!("Converting photo {} of {}", (done + 1).min(total.max(1)), total.max(1))).font(theme::bold(14.0)).color(theme::TEXT));
+                ui.label(egui::RichText::new(name).font(theme::font(12.0)).color(theme::FADED));
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).show_percentage().desired_width(360.0));
+                ui.add_space(6.0);
+                if ui::button(ui, "Cancel", egui::vec2(0.0, 26.0), ui::Look::bordered(), theme::font(12.5), None).on_hover_text("Stop after the photo being converted").clicked() {
+                    cancel = true;
+                }
+            });
+            if cancel {
+                if let Some(flag) = &self.dng_cancel {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
         let window = |title: &str| egui::Window::new(title.to_owned()).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).default_width(380.0);
         let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if let Some(batch) = self.batch.as_ref().filter(|b| !b.quit) {
@@ -2548,7 +2717,7 @@ impl App {
                 .add_enabled_ui(can_switch, |ui| ui::toggle(ui, &mut on, "AI Denoise"))
                 .inner
                 .on_hover_text(hint)
-                .on_disabled_hover_text("Works on raw photos (ARW, NEF, CR2, CR3, RW2, RAF, DNG) when the model files are installed")
+                .on_disabled_hover_text("Works on raw photos when the model files are installed")
                 .changed();
             if flipped {
                 self.denoise_override = Some(on);
@@ -2574,12 +2743,7 @@ impl App {
     /// in the raw file and Adobe always applies it. The Lensfun profile stands in for that data
     /// (distortion only, no vignetting).
     fn builtin_distortion(&self, loaded: &Loaded) -> bool {
-        let Some(lens) = self.lens_auto.map(|i| &self.lens_db.lenses[i]) else { return false };
-        let make = loaded.exif.make.to_lowercase();
-        if make.starts_with("nikon") {
-            return lens.mounts.iter().any(|m| m == "Nikon Z");
-        }
-        ["panasonic", "olympus", "om digital", "fujifilm"].iter().any(|m| make.starts_with(m))
+        self.lens_auto.is_some_and(|i| lens::builtin_distortion(&loaded.exif.make, &self.lens_db.lenses[i]))
     }
 
     /// Which lens correction applies to the open photo with these settings.

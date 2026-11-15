@@ -227,10 +227,18 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
     let xtrans = match (cfa_config.cfa.width, cfa_config.cfa.height) {
         (2, 2) => None,
         (6, 6) => {
+            // rawler's DNG reader turns the DNG pattern (stored relative to the active area,
+            // as the DNG specification says) the wrong way: it shifts it forward by the active
+            // area's offset instead of back, which leaves a 6x6 X-Trans pattern off by twice
+            // that offset (a 2x2 Bayer pattern is not affected). Undo that for DNG files.
+            let (dy, dx) = match (crate::filmstrip::extension_of(path) == "dng", raw.active_area) {
+                (true, Some(area)) => ((6 - (2 * area.p.y) % 6) % 6, (6 - (2 * area.p.x) % 6) % 6),
+                _ => (0, 0),
+            };
             let mut pattern = [[1u8; 6]; 6];
             for (r, row) in pattern.iter_mut().enumerate() {
                 for (c, v) in row.iter_mut().enumerate() {
-                    *v = cfa_config.cfa.color_at(r, c) as u8;
+                    *v = cfa_config.cfa.color_at(r + dy, c + dx) as u8;
                 }
             }
             Some(pattern)
@@ -702,13 +710,19 @@ pub fn load(path: &Path, max_dim: u32, denoise: bool) -> Result<DecodedImage, St
             let tail = |v: &Vec<i32>| v.get(1..).map(|s| s.to_vec()).unwrap_or_default();
             crate::lens::Embedded::from_tags(&tail(&i.embedded_distortion), &tail(&i.embedded_ca), &tail(&i.embedded_vignetting))
         }),
-        exposure_compensation: info.as_ref().and_then(|i| i.raw_exposure_bias).map_or(0.0, |bias| -(bias - FUJI_NORMAL_BIAS)).clamp(0.0, 3.0),
+        exposure_compensation: exposure_compensation_of(info.as_ref()),
         exif: meta.exif,
         baseline_exposure: if crate::filmstrip::extension_of(path) == "dng" { info.and_then(|i| i.baseline_exposure) } else { None },
     })
 }
 /// Fujifilm's RawExposureBias at DR100 (stops); anything below this is DR200 and up.
 const FUJI_NORMAL_BIAS: f32 = -0.72;
+
+/// Exposure (stops) to add for how the camera recorded the raw: Fujifilm DR200 / DR400 shots
+/// are underexposed by a further stop or two, which Lightroom brings back.
+pub fn exposure_compensation_of(info: Option<&crate::filmstrip::TiffInfo>) -> f32 {
+    info.and_then(|i| i.raw_exposure_bias).map_or(0.0, |bias| -(bias - FUJI_NORMAL_BIAS)).clamp(0.0, 3.0)
+}
 
 /// Diagnostic (`app --dump-raw <file> <out.txt>`): what the decoder reports for a raw file.
 pub fn describe(path: &Path) -> String {
