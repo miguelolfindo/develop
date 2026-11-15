@@ -5,6 +5,33 @@ respond instantly, even on 61-megapixel files. The sliders are tuned against Lig
 Classic exports of photos from Sony, Nikon, Canon, Panasonic and Fujifilm cameras, so
 moving a slider in Develop looks much like moving the same slider in Lightroom.
 
+## Develop and Lightroom
+
+Develop is **free and open-source software** (GNU GPL v3). There is nothing to buy, no
+subscription, no account and no cloud. It is an independent project, not affiliated with or
+endorsed by Adobe.
+
+**What it is:** a develop-only raw editor. You browse folders on your drives or your network
+and edit photos directly; each photo's edits are saved in a small `.dvlp` file beside it, and
+the original is never changed. The global sliders are tuned against Lightroom Classic exports,
+so a given slider value looks much like it does in Lightroom: on 18 reference photos from
+Sony, Nikon, Canon, Panasonic and Fujifilm cameras, a slider lands within about 4 levels (out
+of 255) of Lightroom on average.
+
+**What it does well:** fast global editing (every adjustment runs on the GPU), Lightroom-style
+Tone, Presence and Color sliders, AI noise reduction, lens corrections, crop and straighten,
+undo and redo, copying settings between photos, ratings and filters, and exporting one photo
+or a whole selection to JPEG, PNG or TIFF.
+
+**What it does not have (Lightroom does):**
+- A catalog: no keywords, collections, face recognition, map or search across your library.
+- Local adjustments: no masks, brushes, gradients, or AI subject and sky selection.
+- Healing and cloning, and removing objects.
+- A tone curve, a colour mixer (HSL) or colour grading panel, and develop presets.
+- HDR and panorama merge, printing, mobile apps and cloud sync.
+
+AI is used for one thing only: noise reduction, running on your own computer.
+
 ## Features
 
 - **Raw files:** Sony ARW, Nikon NEF, Canon CR2 and CR3, Panasonic RW2, Fujifilm RAF
