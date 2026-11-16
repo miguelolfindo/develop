@@ -1,33 +1,45 @@
-## Develop 0.3.1
+## Develop 0.3.2
 
-### Many more cameras
-- Develop now opens every raw format its decoder reads: around 825 camera models, adding
-  Olympus / OM System, Pentax, Leica, Samsung, Hasselblad, Phase One, Sigma, Kodak, Minolta,
-  older Canon and Nikon formats and more.
-- **Calibrated against Lightroom:** Sony, Nikon, Canon, Panasonic and Fujifilm. Other cameras
-  open and edit normally, with colour from the camera's own data, but have not been compared
-  with Lightroom yet, so a slider may look a little different. See the README's Cameras
-  section.
+### Retouch: heal and clone
+- New **Retouch** section (press **Q**): click a dust spot or blemish to remove it, or
+  **paint over** a longer one, such as a wire, a branch or a scratch. Develop picks a nearby
+  area to copy from.
+- **Heal** blends the copied area into its surroundings, even across wide painted patches;
+  **Clone** copies it exactly.
+- Spots are layered in order: clone out an awkward edge first, then heal over it, and the
+  heal works from the cloned result.
+- Drag either outline to move it. `[` `]` change the brush size, Shift+`[` `]` the feather,
+  and each spot has its own opacity. Space+drag pans, Delete removes the selected spot, H
+  hides the outlines, Esc finishes.
+- Spots are saved with the photo, can be undone, and are copied with Copy / Paste settings
+  (handy for sensor dust across a series).
 
-### Convert to DNG
-- Save the original raw data in Adobe's open **DNG** format, losslessly compressed:
-  right-click photos and choose **Convert to DNG…**, or pick **DNG (original raw)** as the
-  format in the Export dialog. Works on one photo or a whole selection, with a progress bar.
-- Optionally **embed the original raw file** inside the DNG.
-- The DNG keeps the camera and lens details (all of the original's EXIF), opens at the same
-  brightness as the original, and for cameras whose distortion Lightroom always corrects
-  (Nikon Z, Panasonic, Olympus / OM System, Fujifilm) carries that correction in a standard
-  form other apps apply too.
-- Your Develop edits come along in a `.dvlp` file beside each DNG, so Develop reopens it as
-  you left it. Other apps open the DNG unedited.
+### Tone Curve and Color Mixer
+- **Tone Curve:** a point curve you edit on the graph (click to add a point, drag it,
+  double-click to remove it) and Lightroom's four regions: Highlights, Lights, Darks and
+  Shadows. Fitted to Lightroom's own exports: a curve lands within about 1 to 2 levels of
+  Lightroom's.
+- **Color Mixer:** hue, saturation and luminance for eight colours, fitted to Lightroom's
+  exports (close, not yet exact; purple and magenta are not calibrated yet).
+
+### White balance eyedropper
+- Click **Pick** in White Balance (or press **W**), then click something on the photo that
+  should be neutral grey or white.
+
+### A tidier edit panel
+- The sections now follow the order most photos are edited in: Profile, Crop, White
+  Balance, Tone, Presence, Tone Curve, Color Mixer, Detail, Lens Correction, Retouch.
+- Vibrance and Saturation moved into Presence, as in Lightroom.
 
 ### Fixes
-- Fujifilm X-Trans DNGs opened with wrong colours; they now look right.
+- **AI Denoise** no longer turns phone DNGs (such as Samsung Galaxy S24 Ultra Expert RAW)
+  reddish, and no longer draws red fringes around bright edges.
+- **AI Denoise** on Fujifilm X-Trans raws gave badly wrong colours; it now works properly.
 
 ### Installing
-- **Windows:** run `develop_0.3.1_x64-setup.exe`. It installs over an earlier version and
+- **Windows:** run `develop_0.3.2_x64-setup.exe`. It installs over an earlier version and
   keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.1_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.2_aarch64.dmg`, see below.
 
 #### macOS
 
@@ -66,8 +78,9 @@ codesign --force --deep --sign - /Applications/Develop.app
 ```
 
 ### Known limitations
+- The Color Mixer is calibrated on one photo so far; purple and magenta are approximate.
+- Heal brings in the colour of whatever surrounds the spot; next to busy detail, clone the
+  edge first and heal over it.
 - DNG lens corrections come from Lensfun lens profiles, so they are close to, not identical
   with, Adobe's built-in corrections.
 - Cameras outside the five calibrated brands may differ slightly from Lightroom.
-- Copies of Develop older than 0.3.0 cannot update automatically: install this version by
-  hand once.
