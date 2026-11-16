@@ -157,6 +157,41 @@ impl CameraColor {
         [base[0] * shifted[0] / plain[0], 1.0, base[2] * shifted[2] / plain[2]]
     }
 
+    /// The temperature and tint (as `wb_gains_tinted` takes them) that make `sample` (camera
+    /// RGB, before white balance) neutral: what the white balance eyedropper sets. `None`
+    /// for a sample too dark or clipped to judge.
+    pub fn neutral_for(&self, sample: [f32; 3]) -> Option<(f32, f32)> {
+        if sample.iter().any(|&v| !(v > 1e-5) || v >= 0.98) {
+            return None;
+        }
+        let error = |kelvin: f32, tint: f32| {
+            let g = self.wb_gains_tinted(kelvin, tint);
+            let [r, gg, b] = [(g[0] * sample[0]).ln(), (g[1] * sample[1]).ln(), (g[2] * sample[2]).ln()];
+            (r - gg).powi(2) + (b - gg).powi(2)
+        };
+        // A coarse search over log temperature and tint, then three finer ones around the best.
+        let (mut lo_k, mut hi_k, mut lo_t, mut hi_t) = (KELVIN_MIN.ln(), KELVIN_MAX.ln(), -150.0f32, 150.0f32);
+        let mut best = (f32::MAX, KELVIN_MIN, 0.0);
+        for _ in 0..4 {
+            for i in 0..=24 {
+                for j in 0..=24 {
+                    let kelvin = (lo_k + (hi_k - lo_k) * i as f32 / 24.0).exp();
+                    let tint = lo_t + (hi_t - lo_t) * j as f32 / 24.0;
+                    let e = error(kelvin, tint);
+                    if e < best.0 {
+                        best = (e, kelvin, tint);
+                    }
+                }
+            }
+            let (dk, dt) = ((hi_k - lo_k) / 12.0, (hi_t - lo_t) / 12.0);
+            lo_k = (best.1.ln() - dk).max(KELVIN_MIN.ln());
+            hi_k = (best.1.ln() + dk).min(KELVIN_MAX.ln());
+            lo_t = (best.2 - dt).max(-150.0);
+            hi_t = (best.2 + dt).min(150.0);
+        }
+        Some((best.1.round(), best.2.round()))
+    }
+
     /// Gains that make neutral the colour `offset` (uv units) off the locus at `kelvin`.
     fn off_locus_gains(&self, kelvin: f32, offset: f32) -> [f32; 3] {
         let to_uv = |(x, y): (f32, f32)| {

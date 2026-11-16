@@ -69,7 +69,33 @@ struct Params {
     scene: vec4<f32>,
     // x = 98th percentile of min(R, G, B) on screen (0..1).
     scene2: vec4<f32>,
+    // Spot removal: x = number of spots. Per spot, a = target xy, source zw (texture uv);
+    // b = radius (fraction of texture height), feather, opacity, 1 = clone / 0 = heal.
+    spot_info: vec4<f32>,
+    spot_a: array<vec4<f32>, 64>,
+    spot_b: array<vec4<f32>, 64>,
+    // Per spot: first point in spot_pts and number of points (1 = circle); target bounding box.
+    spot_c: array<vec4<f32>, 64>,
+    spot_box: array<vec4<f32>, 64>,
+    // Stroke points, two per entry (xy, zw).
+    spot_pts: array<vec4<f32>, 512>,
+    // Per Heal spot with worked-out gains (spot_c.z = 1): grid origin and 1 / spacing, then its
+    // atlas slot (uv of node 0, last node index across and down).
+    spot_g: array<vec4<f32>, 64>,
+    spot_t: array<vec4<f32>, 64>,
+    // Tone curve table (256 entries, four per vec4); curve_info.x = 1 when it changes anything.
+    curve_lut: array<vec4<f32>, 64>,
+    curve_info: vec4<f32>,
+    // Color Mixer: rows 0-1 hue, 2-3 saturation, 4-5 luminance, eight colours (-1..1).
+    hsl: array<vec4<f32>, 6>,
+    hsl_info: vec4<f32>,
+    srgb_to_work_0: vec4<f32>,
+    srgb_to_work_1: vec4<f32>,
+    srgb_to_work_2: vec4<f32>,
 };
+
+// The gamma the tone curve's 0..1 scale is on (measured on Lightroom's point curves).
+const CURVE_GAMMA: f32 = 2.2;
 
 @group(0) @binding(0) var raw_texture: texture_2d<f32>;
 @group(0) @binding(1) var texture_sampler: sampler;
@@ -79,6 +105,8 @@ struct Params {
 @group(0) @binding(5) var curve_table: texture_2d<f32>;
 // Wraps around in hue, clamps in saturation and value.
 @group(0) @binding(6) var table_sampler: sampler;
+// Healing gains (log, per colour), a 128 x 128 slot per spot.
+@group(0) @binding(7) var heal_atlas: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -134,6 +162,115 @@ fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
     let k = fract(vec3<f32>(hsv.x / 6.0) + vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0;
     let ramp = clamp(abs(k - vec3<f32>(3.0)) - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0));
     return hsv.z * mix(vec3<f32>(1.0), ramp, hsv.y);
+}
+
+// Tone curve table entry `i` (0..255), and the curve at `x` (0..1), interpolated.
+fn curve_entry(i: i32) -> f32 {
+    return params.curve_lut[i / 4][i % 4];
+}
+
+fn tone_curve(x: f32) -> f32 {
+    let f = clamp(x, 0.0, 1.0) * 255.0;
+    let i = min(i32(floor(f)), 254);
+    return mix(curve_entry(i), curve_entry(i + 1), f - f32(i));
+}
+
+// The Color Mixer's colour centres in on-screen hue (sRGB, degrees), fitted to Lightroom's
+// references: red, orange, yellow, green, aqua, blue, purple, magenta, then red again.
+// (Purple and magenta could not be measured on the reference photo; they sit between blue
+// and red.)
+fn mixer_centre(k: i32) -> f32 {
+    var centres = array<f32, 9>(-8.0, 21.0, 49.0, 100.0, 155.0, 210.0, 280.0, 320.0, 352.0);
+    return centres[k];
+}
+
+fn mixer_value(kind: i32, k: i32) -> f32 {
+    let i = k % 8;
+    return params.hsl[kind * 2 + i / 4][i % 4];
+}
+
+// Color Mixer (HSL), fitted to Lightroom's references (photo DSC05736, every colour's hue,
+// saturation and luminance at -100 and +100). It works on the picture as displayed (after
+// the profile's tone curve), so the colours are the ones seen on screen:
+// - A colour's on-screen hue sets how much of each of its two nearest colours applies,
+//   blended smoothly between their centres; greys are left alone.
+// - Hue moves a colour towards the neighbouring colour's centre (90% of the way at 100),
+//   keeping most of its brightness.
+// - Saturation moves it towards or away from a grey of the same luminance: -100 is grey,
+//   +100 roughly doubles a muted colour and stops short of the gamut edge.
+// - Luminance brightens or darkens it without changing its hue, more for saturated colours
+//   (about 0.75 stop up and 1.1 stops down at 100).
+fn color_mixer(work: vec3<f32>) -> vec3<f32> {
+    let srgb_raw = vec3<f32>(
+        dot(params.work_to_srgb_0.xyz, work),
+        dot(params.work_to_srgb_1.xyz, work),
+        dot(params.work_to_srgb_2.xyz, work),
+    );
+    let lin = clamp(srgb_raw, vec3<f32>(0.0), vec3<f32>(1.0));
+    let enc = srgb_encode(lin);
+    let hsv = rgb_to_hsv(enc);
+    var deg = hsv.x * 60.0;
+    if (deg >= mixer_centre(8)) {
+        deg -= 360.0;
+    }
+    var k = 0;
+    for (var j = 1; j < 8; j++) {
+        if (deg >= mixer_centre(j)) {
+            k = j;
+        }
+    }
+    let span = mixer_centre(k + 1) - mixer_centre(k);
+    let t = smoothstep(0.0, 1.0, (deg - mixer_centre(k)) / span);
+    let colourful = smoothstep(0.02, 0.15, hsv.y);
+    let lum = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let y0 = dot(lin, lum);
+    var out = lin;
+    // Hue: each of the two colours pulls towards its own neighbour.
+    var shift = 0.0;
+    for (var n = 0; n < 2; n++) {
+        let band = k + n;
+        let w = select(1.0 - t, t, n == 1);
+        let a = mixer_value(0, band);
+        let to_next = mixer_centre(band % 8 + 1) - mixer_centre(band % 8);
+        let prev = (band + 7) % 8;
+        let to_prev = mixer_centre(prev + 1) - mixer_centre(prev);
+        shift += w * a * select(to_prev, to_next, a > 0.0);
+    }
+    if (abs(shift) > 1e-4) {
+        var h = hsv.x * 60.0 + 0.9 * shift * colourful;
+        h = h - 360.0 * floor(h / 360.0);
+        let moved = srgb_decode3(hsv_to_rgb(vec3<f32>(h / 60.0, hsv.y, hsv.z)));
+        let y1 = max(dot(moved, lum), 1e-6);
+        out = moved * pow(max(y0, 1e-6) / y1, 0.4);
+    }
+    // Saturation, towards or away from grey of the same luminance.
+    let sat = mix(mixer_value(1, k), mixer_value(1, k + 1), t) * colourful;
+    if (abs(sat) > 1e-4) {
+        let y = dot(out, lum);
+        var f = 1.0 + sat;
+        if (sat > 0.0) {
+            let kk = 1.9 * sat;
+            f = (1.0 + kk) / (1.0 + kk * hsv.y);
+        }
+        out = max(vec3<f32>(y) + (out - vec3<f32>(y)) * f, vec3<f32>(0.0));
+    }
+    // Luminance.
+    let l = mix(mixer_value(2, k), mixer_value(2, k + 1), t);
+    if (abs(l) > 1e-4) {
+        let strength = pow(clamp(hsv.y / 0.45, 0.0, 1.0), 0.6) * colourful;
+        out *= exp2(l * select(1.1, 0.75, l > 0.0) * strength);
+    }
+    // Back to the working space, keeping anything the clamp above cut off.
+    let back = out + (srgb_raw - lin);
+    return vec3<f32>(
+        dot(params.srgb_to_work_0.xyz, back),
+        dot(params.srgb_to_work_1.xyz, back),
+        dot(params.srgb_to_work_2.xyz, back),
+    );
+}
+
+fn srgb_decode3(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(srgb_decode1(c.r), srgb_decode1(c.g), srgb_decode1(c.b));
 }
 
 // Texture coordinate of a colour in a hue/sat/value table (see profile.rs for the layout).
@@ -204,6 +341,165 @@ fn to_work(balanced: vec3<f32>) -> vec3<f32> {
     ), vec3<f32>(0.0));
 }
 
+// Point `k` of the spot strokes (two are packed in each entry).
+fn spot_point(k: i32) -> vec2<f32> {
+    let v = params.spot_pts[k / 2];
+    return select(v.xy, v.zw, (k & 1) == 1);
+}
+
+// Distance from `p` (texture coordinates) to spot `i`'s centre line (a single point for a
+// circle), in picture heights.
+fn spot_distance(i: i32, p: vec2<f32>, aspect: f32) -> f32 {
+    let c = params.spot_c[i];
+    let start = i32(c.x);
+    let n = i32(c.y);
+    var a = spot_point(start);
+    var pa = vec2<f32>((p.x - a.x) * aspect, p.y - a.y);
+    var best = length(pa);
+    for (var k = 1; k < n; k++) {
+        let b = spot_point(start + k);
+        let ba = vec2<f32>((b.x - a.x) * aspect, b.y - a.y);
+        let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-12), 0.0, 1.0);
+        best = min(best, length(pa - ba * h));
+        a = b;
+        pa = vec2<f32>((p.x - a.x) * aspect, p.y - a.y);
+    }
+    return best;
+}
+
+// The stored picture at `uv` with the Clone spots before spot `upto` applied: what a later
+// spot copies from and, when it heals, measures its surroundings on. So cloning out an
+// awkward edge first and healing over it afterwards works as in Lightroom: the heal sees
+// the cloned edge, not the original. (Earlier Heal spots are not seen by later spots.)
+fn cloned_at(uv: vec2<f32>, lod: f32, upto: i32, aspect: f32) -> vec3<f32> {
+    var c = textureSampleLevel(raw_texture, texture_sampler, uv, lod).rgb;
+    for (var j = 0; j < upto; j++) {
+        let b = params.spot_b[j];
+        let box = params.spot_box[j];
+        if (b.w < 0.5 || uv.x < box.x || uv.y < box.y || uv.x > box.z || uv.y > box.w) {
+            continue;
+        }
+        let dist = spot_distance(j, uv, aspect) / b.x;
+        if (dist >= 1.0) {
+            continue;
+        }
+        let a = params.spot_a[j];
+        let mask = (1.0 - smoothstep(1.0 - max(b.y, 0.02), 1.0, dist)) * b.z;
+        c = mix(c, textureSampleLevel(raw_texture, texture_sampler, uv + a.zw - a.xy, lod).rgb, mask);
+    }
+    return c;
+}
+
+// Healing, as a stand-in until the processor has worked out the spot's gains across its
+// whole shape (spots::HealGrid, normally ready by the next frame): how much brighter (per
+// colour) the target's surroundings are than the source's, seen from `uv`. Eight directions are read at 1.35 brush radii, at a level of detail that
+// averages over a fair part of the band; directions that land on the spot itself (its
+// blemish) count less the deeper they are in, and where most of them do (inside a wide
+// painted patch) a second ring further out takes over. The ratios are blended in log space,
+// then blended again with readings far from that first blend turned down, so a branch or
+// an edge next to the spot does not darken or tint the whole patch. As `uv` moves, the
+// readings move with it, so a gradient across the spot is carried smoothly through it.
+fn heal_gain(i: i32, uv: vec2<f32>, off: vec2<f32>, r: f32, aspect: f32, height: f32) -> vec3<f32> {
+    let lod = max(log2(r * height * 0.5), 0.0);
+    var logs: array<vec3<f32>, 16>;
+    var ws: array<f32, 16>;
+    var count = 0;
+    var near = 0.0;
+    for (var ring = 0; ring < 2; ring++) {
+        // The outer ring only matters where the inner one found little outside the spot.
+        let share = select(1.0, clamp(1.0 - near / 2.0, 0.0, 1.0), ring == 1);
+        if (share <= 0.0) {
+            break;
+        }
+        let reach = select(1.35, 2.7, ring == 1) * r;
+        for (var k = 0; k < 8; k++) {
+            let angle = (f32(k) + 0.5 * f32(ring)) * 0.7853982;
+            let q = uv + vec2<f32>(cos(angle) / aspect, sin(angle)) * reach;
+            let w = share * smoothstep(1.05, 1.3, spot_distance(i, q, aspect) / r);
+            if (w <= 0.0) {
+                continue;
+            }
+            let t = cloned_at(q, lod, i, aspect);
+            let s = cloned_at(q + off, lod, i, aspect);
+            let ratio = clamp((t + vec3<f32>(0.002)) / (s + vec3<f32>(0.002)), vec3<f32>(0.25), vec3<f32>(4.0));
+            logs[count] = log(ratio);
+            ws[count] = w;
+            count++;
+            if (ring == 0) {
+                near += w;
+            }
+        }
+    }
+    var sum = vec3<f32>(0.0);
+    var weights = 0.0;
+    for (var k = 0; k < count; k++) {
+        sum += ws[k] * logs[k];
+        weights += ws[k];
+    }
+    if (weights < 1e-3) {
+        return vec3<f32>(1.0);
+    }
+    // Two rounds of turning down the readings that disagree with the blend.
+    for (var round = 0; round < 2; round++) {
+        let centre = sum / weights;
+        sum = vec3<f32>(0.0);
+        weights = 0.0;
+        for (var k = 0; k < count; k++) {
+            let d = logs[k] - centre;
+            let w = ws[k] * exp(-dot(d, d) / 0.02);
+            sum += w * logs[k];
+            weights += w;
+        }
+        if (weights < 1e-4) {
+            return exp(centre);
+        }
+    }
+    return exp(sum / weights);
+}
+
+// The stored picture at `uv`, with the spots healed or cloned in. Everything that reads the
+// picture goes through this, so later adjustments (sharpening, clarity, dehaze) see the
+// healed picture, not the original underneath.
+fn raw_at(uv: vec2<f32>, lod: f32) -> vec3<f32> {
+    var c = textureSampleLevel(raw_texture, texture_sampler, uv, lod).rgb;
+    let n = i32(params.spot_info.x);
+    if (n == 0) {
+        return c;
+    }
+    let size = vec2<f32>(textureDimensions(raw_texture, 0));
+    let aspect = size.x / size.y;
+    for (var i = 0; i < n; i++) {
+        let box = params.spot_box[i];
+        if (uv.x < box.x || uv.y < box.y || uv.x > box.z || uv.y > box.w) {
+            continue;
+        }
+        let a = params.spot_a[i];
+        let b = params.spot_b[i];
+        let dist = spot_distance(i, uv, aspect) / b.x;
+        if (dist >= 1.0) {
+            continue;
+        }
+        let soft = max(b.y, 0.02);
+        let mask = (1.0 - smoothstep(1.0 - soft, 1.0, dist)) * b.z;
+        let off = a.zw - a.xy;
+        var s = cloned_at(uv + off, lod, i, aspect);
+        if (b.w < 0.5) {
+            if (params.spot_c[i].z > 0.5) {
+                // Worked out across the whole shape on the processor (spots::HealGrid).
+                let g = params.spot_g[i];
+                let t = params.spot_t[i];
+                let node = clamp((uv - g.xy) * g.zw, vec2<f32>(0.0), t.zw);
+                let atlas = vec2<f32>(textureDimensions(heal_atlas, 0));
+                s *= exp(textureSampleLevel(heal_atlas, texture_sampler, t.xy + node / atlas, 0.0).rgb);
+            } else {
+                s *= heal_gain(i, uv, off, b.x, aspect, size.y);
+            }
+        }
+        c = mix(c, s, mask);
+    }
+    return c;
+}
+
 // Quick brightness of a camera-space sample, good enough to compare neighbours.
 fn rough_luma(cam: vec3<f32>) -> f32 {
     return max(dot(balance(cam), vec3<f32>(0.25, 0.5, 0.25)), 1e-5);
@@ -213,7 +509,7 @@ fn rough_luma(cam: vec3<f32>) -> f32 {
 // the further the sample's brightness is from the pixel's own (about one stop wide), so a
 // dark roof next to bright sky does not drag the sky's average down, and vice versa.
 fn local_tap(uv: vec2<f32>, lod: f32, weight: f32, own: f32) -> vec2<f32> {
-    let l = rough_luma(textureSampleLevel(raw_texture, texture_sampler, uv, lod).rgb);
+    let l = rough_luma(raw_at(uv, lod));
     let stops = log2(l / own);
     let w = weight * exp(-0.5 * stops * stops);
     return vec2<f32>(w * l, w);
@@ -408,10 +704,10 @@ fn axial_defringe(color: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<
     }
     let lod = max(log2(max(footprint, 1.0)), 0.0);
     let step = vec2<f32>(1.5 * max(footprint, 1.0)) / texels;
-    let e = sqrt(rough_luma(textureSampleLevel(raw_texture, texture_sampler, uv + vec2<f32>(step.x, 0.0), lod).rgb));
-    let w = sqrt(rough_luma(textureSampleLevel(raw_texture, texture_sampler, uv - vec2<f32>(step.x, 0.0), lod).rgb));
-    let n = sqrt(rough_luma(textureSampleLevel(raw_texture, texture_sampler, uv - vec2<f32>(0.0, step.y), lod).rgb));
-    let s = sqrt(rough_luma(textureSampleLevel(raw_texture, texture_sampler, uv + vec2<f32>(0.0, step.y), lod).rgb));
+    let e = sqrt(rough_luma(raw_at(uv + vec2<f32>(step.x, 0.0), lod)));
+    let w = sqrt(rough_luma(raw_at(uv - vec2<f32>(step.x, 0.0), lod)));
+    let n = sqrt(rough_luma(raw_at(uv - vec2<f32>(0.0, step.y), lod)));
+    let s = sqrt(rough_luma(raw_at(uv + vec2<f32>(0.0, step.y), lod)));
     let edge = smoothstep(0.03, 0.12, max(abs(e - w), abs(n - s)));
     let hsv = rgb_to_hsv(color);
     let purple = params.fringe.x * hue_match(hsv.x, mix(4.3, 5.6, params.fringe.y));
@@ -427,7 +723,7 @@ fn axial_defringe(color: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<
 
 // The picture near `uv` at mip level `lod`, white-balanced and exposed like the main path.
 fn work_at(uv: vec2<f32>, lod: f32) -> vec3<f32> {
-    let cam = textureSampleLevel(raw_texture, texture_sampler, uv, lod).rgb;
+    let cam = raw_at(uv, lod);
     return max(to_work(cam * params.wb.rgb / params.wb.w) * params.basic.x, vec3<f32>(0.0));
 }
 
@@ -594,14 +890,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv_out = vec2<f32>(dot(params.rot.xy, d), dot(params.rot.zw, d)) + params.rot_off.xy;
     let lens = lens_coords(uv_out);
     let uv = lens.g;
-    let cam = vec3<f32>(
-        textureSample(raw_texture, texture_sampler, lens.r).r,
-        textureSample(raw_texture, texture_sampler, uv).g,
-        textureSample(raw_texture, texture_sampler, lens.b).b,
-    );
     // How many image pixels one screen pixel covers (needed before any branching).
     let texels = vec2<f32>(textureDimensions(raw_texture, 0));
     let footprint = max(length(dpdx(uv * texels)), length(dpdy(uv * texels)));
+    let base_lod = max(log2(footprint), 0.0);
+    let cam = vec3<f32>(
+        raw_at(lens.r, base_lod).r,
+        raw_at(uv, base_lod).g,
+        raw_at(lens.b, base_lod).b,
+    );
     if (d.x < 0.0 || d.y < 0.0 || d.x > 1.0 || d.y > 1.0) {
         discard;
     }
@@ -642,7 +939,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 if (i == 0 && j == 0) {
                     continue;
                 }
-                let tap = textureSampleLevel(raw_texture, texture_sampler, uv + vec2<f32>(f32(i), f32(j)) * reach, lod).rgb;
+                let tap = raw_at(uv + vec2<f32>(f32(i), f32(j)) * reach, lod);
                 let weight = select(1.0, 2.0, i == 0 || j == 0);
                 blur += weight * sqrt(max(dot(tap, w), 0.0));
             }
@@ -826,6 +1123,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = max(mix(vec3<f32>(base_grey), color, params.profile.y), vec3<f32>(0.0));
         let by_luma = color * (fitted_curve(vec3<f32>(base_grey)).x / max(base_grey, 1e-6));
         color = mix(by_luma, fitted_curve(color), 0.75);
+    }
+
+    // 5b. Color Mixer, on the picture as displayed.
+    if (params.hsl_info.x > 0.5) {
+        color = color_mixer(color);
+    }
+
+    // 5c. Tone curve (parametric regions and point curve) on a gamma 2.2 scale (fitted to
+    // Lightroom's point-curve references), applied the way Adobe applies tone curves: the brightest and darkest
+    // channels go through it and the middle one keeps its place between them, so hues hold
+    // (a plain per-channel curve turns a sunset pink when the highlights come down).
+    if (params.curve_info.x > 0.5) {
+        let e = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / CURVE_GAMMA));
+        let hi = max(e.r, max(e.g, e.b));
+        let lo = min(e.r, min(e.g, e.b));
+        let hi2 = tone_curve(hi);
+        let lo2 = tone_curve(lo);
+        let scale = (hi2 - lo2) / max(hi - lo, 1e-6);
+        let curved = select(vec3<f32>(lo2) + (e - vec3<f32>(lo)) * scale, vec3<f32>(hi2), hi - lo < 1e-6);
+        color = pow(max(curved, vec3<f32>(0.0)), vec3<f32>(CURVE_GAMMA));
     }
 
     // Working space -> linear sRGB.

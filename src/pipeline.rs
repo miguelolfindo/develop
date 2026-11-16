@@ -51,6 +51,33 @@ pub struct Uniforms {
     /// More of the same: x = 98th percentile of the darkest channel (min of R, G, B) on
     /// screen, the brightness of the photo's brightest near-neutral areas; yzw unused.
     pub scene2: [f32; 4],
+    /// Spot removal: x = number of spots; yzw unused.
+    pub spot_info: [f32; 4],
+    /// Per spot: target centre (xy) and source centre (zw), in texture coordinates.
+    pub spot_a: [[f32; 4]; crate::spots::MAX_SPOTS],
+    /// Per spot: radius (fraction of the texture height), feather, opacity, 1 = clone.
+    pub spot_b: [[f32; 4]; crate::spots::MAX_SPOTS],
+    /// Per spot: first point in `spot_pts` and number of points (1 = circle).
+    pub spot_c: [[f32; 4]; crate::spots::MAX_SPOTS],
+    /// Per spot: bounding box of the target, brush included (x0, y0, x1, y1).
+    pub spot_box: [[f32; 4]; crate::spots::MAX_SPOTS],
+    /// Target points, two per entry (xy, zw).
+    pub spot_pts: [[f32; 4]; crate::spots::MAX_POINTS / 2],
+    /// Per Heal spot with worked-out gains (see `spots::HealGrid`): the grid's first node and
+    /// 1 / spacing (texture coordinates), and its slot in the gain atlas (uv of node 0, last
+    /// node index across and down).
+    pub spot_g: [[f32; 4]; crate::spots::MAX_SPOTS],
+    pub spot_t: [[f32; 4]; crate::spots::MAX_SPOTS],
+    /// Tone curve lookup table (`tone::LUT_SIZE` entries, four per vec4) and x = 1 when it
+    /// changes anything.
+    pub curve_lut: [[f32; 4]; crate::tone::LUT_SIZE / 4],
+    pub curve_info: [f32; 4],
+    /// Color Mixer: hue, saturation, luminance for the eight colours (see tone::hsl_uniform),
+    /// and x = 1 when any is moved.
+    pub hsl: [[f32; 4]; 6],
+    pub hsl_info: [f32; 4],
+    /// Linear sRGB -> working space (the inverse of work_to_srgb), for the Color Mixer.
+    pub srgb_to_work: [[f32; 4]; 3],
 }
 
 /// Export renders into half floats and converts on the CPU, so 16-bit output is real 16-bit.
@@ -72,6 +99,9 @@ pub struct ImageRenderer {
     hue_sat_view: wgpu::TextureView,
     look_view: wgpu::TextureView,
     curve_view: wgpu::TextureView,
+    /// Healing gains, one slot per spot (see `spots::HealGrid`).
+    heal_texture: wgpu::Texture,
+    heal_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     /// Settings and bindings for rendering the picture small for the scopes.
     scope_uniform_buf: wgpu::Buffer,
@@ -131,6 +161,7 @@ impl ImageRenderer {
                 texture_entry(4, wgpu::TextureViewDimension::D3),
                 texture_entry(5, wgpu::TextureViewDimension::D2),
                 sampler_entry(6),
+                texture_entry(7, wgpu::TextureViewDimension::D2),
             ],
         });
 
@@ -193,6 +224,18 @@ impl ImageRenderer {
         let hue_sat_view = Self::upload_lut(device, queue, wgpu::TextureDimension::D3, [1, 1, 1], &one_texel);
         let look_view = Self::upload_lut(device, queue, wgpu::TextureDimension::D3, [1, 1, 1], &one_texel);
         let curve_view = Self::upload_lut(device, queue, wgpu::TextureDimension::D2, [1, 1, 1], &one_texel);
+        let atlas = crate::spots::HEAL_ATLAS as u32;
+        let heal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("healing gains"),
+            size: wgpu::Extent3d { width: atlas, height: atlas, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let heal_view = heal_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let scope_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scope uniforms"),
@@ -222,6 +265,8 @@ impl ImageRenderer {
             hue_sat_view,
             look_view,
             curve_view,
+            heal_texture,
+            heal_view,
             shader_encodes_srgb: !target_format.is_srgb(),
         };
         this.rebuild_bind_group(device);
@@ -316,8 +361,26 @@ impl ImageRenderer {
                 view(4, &self.look_view),
                 view(5, &self.curve_view),
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.table_sampler) },
+                view(7, &self.heal_view),
             ],
         })
+    }
+
+    /// Upload a Heal spot's gains into atlas slot `slot`.
+    pub fn write_heal_grid(&self, queue: &wgpu::Queue, slot: usize, grid: &crate::spots::HealGrid) {
+        use crate::spots::{HEAL_CELL, HEAL_SLOTS_X};
+        let texels: Vec<u16> = grid.log.iter().flat_map(|v| [v[0], v[1], v[2], 0.0]).map(|v| half::f16::from_f32(v).to_bits()).collect();
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.heal_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: ((slot % HEAL_SLOTS_X) * HEAL_CELL) as u32, y: ((slot / HEAL_SLOTS_X) * HEAL_CELL) as u32, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&texels),
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(grid.nx as u32 * 8), rows_per_image: Some(grid.ny as u32) },
+            wgpu::Extent3d { width: grid.nx as u32, height: grid.ny as u32, depth_or_array_layers: 1 },
+        );
     }
 
     fn rebuild_bind_group(&mut self, device: &wgpu::Device) {

@@ -19,15 +19,17 @@ Sony, Nikon, Canon, Panasonic and Fujifilm cameras, a slider lands within about 
 of 255) of Lightroom on average.
 
 **What it does well:** fast global editing (every adjustment runs on the GPU), Lightroom-style
-Tone, Presence and Color sliders, AI noise reduction, lens corrections, crop and straighten,
-undo and redo, copying settings between photos, ratings and filters, and exporting one photo
-or a whole selection to JPEG, PNG or TIFF.
+Tone, Presence and Color sliders, a tone curve and colour mixer, a white balance eyedropper,
+AI noise reduction, lens corrections, crop and straighten, spot healing and cloning (circles or
+painted strokes), undo and redo, copying settings between photos, ratings and filters, and
+exporting one photo or a whole selection to JPEG, PNG or TIFF.
 
 **What it does not have (Lightroom does):**
 - A catalog: no keywords, collections, face recognition, map or search across your library.
 - Local adjustments: no masks, brushes, gradients, or AI subject and sky selection.
-- Healing and cloning, and removing objects.
-- A tone curve, a colour mixer (HSL) or colour grading panel, and develop presets.
+- Content-aware fill and AI object removal: retouching copies from a source you can
+  move (heal or clone), it does not invent content.
+- A colour grading panel, per-channel (red, green, blue) curves, and develop presets.
 - HDR and panorama merge, printing, mobile apps and cloud sync.
 
 AI is used for one thing only: noise reduction, running on your own computer.
@@ -39,18 +41,37 @@ AI is used for one thing only: noise reduction, running on your own computer.
   X-Trans), ORF, ORI, PEF, SRW, IIQ, 3FR, FFF, DCR, DCS, KDC, MEF, MOS, MRW, ERF, X3F, ARI,
   QTK, RAW and DNG, plus JPEG, PNG, TIFF and HEIC. See [Cameras](#cameras) for which ones
   are calibrated against Lightroom.
-- **Edit panel:** Crop, Tone, Presence, Color, Detail and Lens Correction.
+- **Edit panel,** in the order most photos are worked on:
+  - **Profile:** Adobe camera profiles when installed (see below), or the built-in one.
+  - **Crop:** crop, straighten and aspect ratio.
+  - **White Balance:** temperature and tint, and an eyedropper (W): click something that
+    should be neutral and the white balance is set to make it so.
   - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks, on Lightroom's
     scales. Highlights, Shadows and Whites adapt to each photo's own brightness, as
     Lightroom's do.
-  - **Presence:** Texture, Clarity, Dehaze, also adapting to the photo.
-  - **Color:** white balance (temperature and tint), Vibrance, Saturation.
+  - **Presence:** Texture, Clarity, Dehaze (also adapting to the photo), Vibrance and
+    Saturation.
+  - **Tone Curve:** a point curve (click to add a point, drag, double-click to remove) and
+    Lightroom's four regions (Highlights, Lights, Darks, Shadows), applied so hues hold.
+  - **Color Mixer:** hue, saturation and luminance for eight colours, on the colours as
+    displayed. Both are fitted to Lightroom references (one photo so far): the tone curve
+    lands within about 1-2 levels of Lightroom's, the Color Mixer within about 6.
   - **Detail:** sharpening and **AI noise reduction** (RawNIND model, runs on the GPU
     through DirectML on Windows; works on Bayer raws, X-Trans raws and linear DNGs).
   - **Lens correction:** Lensfun lens profiles (database included), the camera's own
     correction data for Sony lenses, plus manual distortion, defringe and vignette.
     Distortion correction is applied automatically for Nikon Z, Panasonic, Olympus / OM
     System and Fujifilm cameras, as Lightroom does.
+  - **Retouch** (Q): click a dust spot or blemish to remove it, or paint over a longer
+    one (a wire, a branch, a scratch). Develop picks a nearby area to copy from; **Heal**
+    blends it into the surroundings, **Clone** copies it as it is. Spots are layered in
+    order: a Heal painted after a Clone copies from and blends into the cloned result, so
+    you can clone out an awkward edge first and heal over it. Drag either outline to move
+    it; `[` `]` change the brush size, Shift+`[` `]` the feather, and each spot has its own
+    opacity. Space+drag (or the middle button) pans, Delete removes the selected spot, H
+    hides the outlines, Esc finishes. Spots are saved with the photo's other edits, can be
+    undone, and are copied with Copy / Paste settings (useful for sensor dust across a
+    series).
 - **Camera profiles:** uses the Adobe camera profiles (`.dcp`) installed with Lightroom
   or Camera Raw when they are present, including an approximation of Adobe Color.
 - **Filmstrip** with ratings, **histogram and scopes**, **before/after split**, and
@@ -170,8 +191,11 @@ such as `v0.1.3` builds both on GitHub Actions and attaches them to a release.
 `lightroom/DevelopReferences.lrplugin` is a Lightroom Classic plugin used to tune
 Develop's sliders. For each selected photo it resets the photo, exports a blank
 reference JPEG, then one JPEG per slider value (for example `DSC05615-cla+050.jpg`),
-using a Lightroom export preset. Add it in Lightroom with **File › Plug-in Manager ›
-Add**, then run **Library › Plug-in Extras › Export Reference JPEGs…**.
+using a Lightroom export preset. It also covers the tone curve (the four regions and a set
+of named point curves, such as `DSC05615-pc-mid+32.jpg`) and the Color Mixer (each
+colour's hue, saturation and luminance, such as `DSC05615-hsl-s-blue-100.jpg`). Add it in
+Lightroom with **File › Plug-in Manager › Add**, then run **Library › Plug-in Extras ›
+Export Reference JPEGs…**.
 
 ## License
 

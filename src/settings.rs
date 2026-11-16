@@ -35,6 +35,14 @@ pub struct Saved {
     /// Texture, clarity, dehaze (-100..100).
     pub presence: [f32; 3],
     pub lens: crate::lens::LensSettings,
+    /// Heal and clone spots (see spots.rs).
+    pub spots: Vec<crate::spots::Spot>,
+    /// Tone curve: the point curve (0..1) and the parametric regions (Highlights, Lights,
+    /// Darks, Shadows, -100..100).
+    pub curve: Vec<[f32; 2]>,
+    pub regions: [f32; 4],
+    /// Color Mixer: hue, saturation, luminance per colour (-100..100), see tone::COLOURS.
+    pub hsl: [[f32; 8]; 3],
 }
 
 /// Sharpening a photo starts with (Lightroom's defaults for raw files).
@@ -146,7 +154,12 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     let tint = number().unwrap_or(0.0).clamp(-150.0, 150.0);
     let presence = [0; 3].map(|_| number().unwrap_or(0.0).clamp(-100.0, 100.0));
     let lens = crate::lens::LensSettings::from_fields(&mut fields);
-    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens }))
+    let spots = fields.next().map(crate::spots::from_field).unwrap_or_default();
+    let curve = fields.next().map(crate::tone::curve_from_field).unwrap_or_else(crate::tone::identity_curve);
+    let regions = fields.next().map(|f| crate::tone::numbers_from_field::<4>(f, -100.0, 100.0)).unwrap_or_default();
+    let hsl_flat = fields.next().map(|f| crate::tone::numbers_from_field::<24>(f, -100.0, 100.0)).unwrap_or([0.0; 24]);
+    let hsl = std::array::from_fn(|k| std::array::from_fn(|i| hsl_flat[k * 8 + i]));
+    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl }))
 }
 
 /// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.dvlp` beside it.
@@ -170,7 +183,7 @@ const SIDECAR_HEADER: &str = "Develop settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -188,7 +201,11 @@ fn saved_fields(s: &Saved) -> String {
         s.presence[0],
         s.presence[1],
         s.presence[2],
-        s.lens.to_fields()
+        s.lens.to_fields(),
+        crate::spots::to_field(&s.spots),
+        crate::tone::curve_to_field(&s.curve),
+        crate::tone::numbers_to_field(&s.regions),
+        crate::tone::numbers_to_field(&s.hsl.concat())
     )
 }
 

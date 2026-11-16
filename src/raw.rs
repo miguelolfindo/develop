@@ -555,11 +555,80 @@ fn denoised_linear(data: &[f32], width: usize, height: usize, meta: &Meta) -> Re
     };
     let mut rec2020 = vec![0f32; data.len()];
     apply(&m, data, &mut rec2020);
-    let result = crate::denoise::run_linear(&rec2020, width, height)?;
+    // Phones store very dark data and brighten it with a large baseline exposure (+3 EV on
+    // the Galaxy S24 Ultra). The model, trained on normally exposed pictures, casts the
+    // shadows of data that dark red, so it is brightened first (to an average of 0.25, at
+    // most 32x) and darkened again afterwards.
+    let mean = rec2020.par_iter().map(|&v| v.max(0.0) as f64).sum::<f64>() / rec2020.len().max(1) as f64;
+    let k = if mean > 1e-6 { (0.25 / mean as f32).clamp(1.0, 32.0) } else { 1.0 };
+    let lifted: Vec<f32> = rec2020.par_iter().map(|v| v * k).collect();
+    let mut result = crate::denoise::run_linear(&lifted, width, height)?;
+    drop(lifted);
+    result.rgb.par_iter_mut().for_each(|v| *v /= k);
+    // The linear model also draws coloured (mostly red) fringes around bright edges. Its
+    // brightness detail is clean, so that is kept, and the colour comes from the original,
+    // smoothed to take out colour noise, as colour noise reduction does.
+    // Colour is carried as each channel's share of the brightness, averaged over a few
+    // pixels weighted by brightness, so it never goes negative next to bright detail.
+    let luma = |p: &[f32]| 0.2627 * p[0] + 0.6780 * p[1] + 0.0593 * p[2];
+    let mut colour = rec2020;
+    box_blur_rgb(&mut colour, width, height, 2);
+    box_blur_rgb(&mut colour, width, height, 2);
+    result.rgb.par_chunks_mut(3).zip(colour.par_chunks(3)).for_each(|(p, c)| {
+        let y = luma(p).max(0.0);
+        let around = luma(c);
+        if around > 1e-9 {
+            for i in 0..3 {
+                p[i] = y * c[i] / around;
+            }
+        } else {
+            p.fill(y);
+        }
+    });
+    drop(colour);
     let mut out = vec![0f32; data.len()];
     apply(&back, &result.rgb, &mut out);
     out.par_iter_mut().for_each(|v| *v = v.max(0.0));
     Ok((out, result.note))
+}
+
+/// Box blur of interleaved RGB, `radius` pixels each way, horizontally then vertically.
+fn box_blur_rgb(data: &mut [f32], width: usize, height: usize, radius: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let pass = |src: &[f32], dst: &mut [f32], len: usize, lines: usize, at: &(dyn Fn(usize, usize) -> usize + Sync)| {
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        (0..lines).into_par_iter().for_each(|line| {
+            let mut acc = [0f32; 3];
+            let r = radius as isize;
+            let clampi = |i: isize| i.clamp(0, len as isize - 1) as usize;
+            for i in -r..=r {
+                let o = at(line, clampi(i)) * 3;
+                for c in 0..3 {
+                    acc[c] += src[o + c];
+                }
+            }
+            let n = (2 * radius + 1) as f32;
+            for i in 0..len as isize {
+                let o = at(line, i as usize) * 3;
+                // SAFETY: each line writes only its own pixels.
+                unsafe {
+                    let d = (dst_ptr as *mut f32).add(o);
+                    for c in 0..3 {
+                        *d.add(c) = acc[c] / n;
+                    }
+                }
+                let (add, sub) = (at(line, clampi(i + r + 1)) * 3, at(line, clampi(i - r)) * 3);
+                for c in 0..3 {
+                    acc[c] += src[add + c] - src[sub + c];
+                }
+            }
+        });
+    };
+    let mut temp = vec![0f32; data.len()];
+    pass(data, &mut temp, width, height, &|line, i| line * width + i);
+    pass(&temp, data, height, width, &|line, i| i * width + line);
 }
 
 /// A finished picture (JPEG, PNG, TIFF, HEIC): decode it and turn its sRGB values back into

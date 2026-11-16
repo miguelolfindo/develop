@@ -21,7 +21,9 @@ mod profile;
 mod raw;
 mod scopes;
 mod settings;
+mod spots;
 mod theme;
+mod tone;
 mod todng;
 mod ui;
 mod update;
@@ -377,6 +379,11 @@ struct History {
     committed: Option<settings::Saved>,
 }
 
+/// Smallest and largest spot radius, as fractions of the picture height (the Size slider
+/// shows thousandths).
+const SPOT_MIN: f32 = 0.002;
+const SPOT_MAX: f32 = 0.2;
+
 /// Steps of undo kept per photo.
 const HISTORY_STEPS: usize = 200;
 
@@ -444,6 +451,18 @@ struct App {
     /// Presence (texture, clarity, dehaze) and lens correction of the open photo, the Lensfun
     /// profiles found, the profile matched to the open photo, and the maker picked in the panel.
     presence: [f32; 3],
+    /// Tone curve (point curve and parametric regions) and Color Mixer of the open photo, the
+    /// mixer tab shown (0 hue, 1 saturation, 2 luminance), and the curve point being dragged.
+    curve: Vec<[f32; 2]>,
+    regions: [f32; 4],
+    hsl: [[f32; 8]; 3],
+    hsl_tab: usize,
+    curve_drag: Option<usize>,
+    /// The white balance eyedropper is waiting for a click on the picture (W).
+    wb_pick: bool,
+    /// Scroll the edit panel to the Tone Curve and Color Mixer on the next frame (`--show-curve`,
+    /// for testing).
+    curve_reveal: bool,
     lens: lens::LensSettings,
     lens_db: lens::Database,
     lens_auto: Option<usize>,
@@ -507,6 +526,26 @@ struct App {
     /// whether to embed the original raw file in it.
     export_dng: bool,
     export_dng_embed: bool,
+    /// Spot removal: the open photo's spots, the tool switched on (Q), the spot selected, the
+    /// circle being dragged (spot, source rather than target, grab offset), circles hidden
+    /// (H), the brush (size as a fraction of the picture height, feather, opacity, clone),
+    /// and a small copy of the photo for choosing sources.
+    spots: Vec<spots::Spot>,
+    spot_tool: bool,
+    spot_selected: Option<usize>,
+    spot_drag: Option<(usize, bool, [f32; 2])>,
+    /// The stroke being painted (texture coordinates).
+    spot_paint: Option<Vec<[f32; 2]>>,
+    /// Healing gains worked out for the Heal spots, by spot index (= atlas slot); see
+    /// `sync_heal`.
+    heal_grids: std::cell::RefCell<Vec<Option<spots::HealGrid>>>,
+    /// Stroke outlines already traced (see `spot_edges`).
+    spot_outlines: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<Vec<[[f32; 2]; 2]>>>>,
+    spot_hide: bool,
+    spot_brush: spots::Spot,
+    spot_preview: spots::Preview,
+    /// Open the Spot Removal section on the next frame (the tool was just switched on).
+    spot_reveal: bool,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
 }
@@ -571,6 +610,13 @@ impl App {
             ab_pos: 0.5,
             clipping: false,
             presence: [0.0; 3],
+            curve: tone::identity_curve(),
+            regions: [0.0; 4],
+            hsl: [[0.0; 8]; 3],
+            hsl_tab: 1,
+            curve_drag: None,
+            wb_pick: false,
+            curve_reveal: false,
             lens: lens::LensSettings::default(),
             lens_db: lens::Database::load(),
             lens_auto: None,
@@ -620,6 +666,17 @@ impl App {
             dng_cancel: None,
             export_dng: false,
             export_dng_embed: false,
+            spots: Vec::new(),
+            spot_tool: false,
+            spot_selected: None,
+            spot_drag: None,
+            spot_paint: None,
+            spot_outlines: Default::default(),
+            heal_grids: Default::default(),
+            spot_hide: false,
+            spot_brush: spots::Spot { x: 0.0, y: 0.0, sx: 0.0, sy: 0.0, path: Vec::new(), radius: 0.012, feather: 0.5, opacity: 1.0, clone: false },
+            spot_preview: spots::Preview::default(),
+            spot_reveal: false,
             overrides: {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
@@ -854,6 +911,15 @@ impl App {
                 self.sharpen = settings::SHARPEN_DEFAULT;
                 self.tint = 0.0;
                 self.presence = [0.0; 3];
+                self.curve = tone::identity_curve();
+                self.regions = [0.0; 4];
+                self.hsl = [[0.0; 8]; 3];
+                self.curve_drag = None;
+                self.spots.clear();
+                self.spot_selected = None;
+                self.spot_drag = None;
+                self.spot_preview = spots::Preview::from_mips(&image.mips, 2400);
+                self.heal_grids.borrow_mut().clear();
                 self.lens = lens::LensSettings::default();
                 self.lens_make_pick = None;
                 self.lens_auto = self.lens_db.auto_match(&image.exif);
@@ -943,6 +1009,38 @@ impl App {
                         "--texture" => self.presence[0] = value.clamp(-100.0, 100.0),
                         "--clarity" => self.presence[1] = value.clamp(-100.0, 100.0),
                         "--dehaze" => self.presence[2] = value.clamp(-100.0, 100.0),
+                        // Tone curve and Color Mixer, for testing: regions, a point at the middle
+                        // (`--curve-mid 0.6` puts 0.5 at 0.6), and `--hsl-s-blue -100` and so on.
+                        "--curve-highlights" => self.regions[0] = value.clamp(-100.0, 100.0),
+                        "--curve-lights" => self.regions[1] = value.clamp(-100.0, 100.0),
+                        "--curve-darks" => self.regions[2] = value.clamp(-100.0, 100.0),
+                        "--curve-shadows" => self.regions[3] = value.clamp(-100.0, 100.0),
+                        "--curve-mid" => self.curve = vec![[0.0, 0.0], [0.5, value.clamp(0.0, 1.0)], [1.0, 1.0]],
+                        // `--curve-x 0.25 --curve-y 0.4 ...`: a point curve point by point (0..1);
+                        // the first point replaces the straight curve.
+                        "--curve-x" => {
+                            if self.curve == tone::identity_curve() {
+                                self.curve.clear();
+                            }
+                            self.curve.push([value.clamp(0.0, 1.0), f32::NAN]);
+                        }
+                        "--curve-y" => {
+                            if let Some(p) = self.curve.iter_mut().find(|p| p[1].is_nan()) {
+                                p[1] = value.clamp(0.0, 1.0);
+                            }
+                            self.curve.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+                        }
+                        other if other.starts_with("--hsl-") => {
+                            let mut parts = other.trim_start_matches("--hsl-").splitn(2, '-');
+                            let kind = match parts.next() {
+                                Some("h") => 0,
+                                Some("s") => 1,
+                                _ => 2,
+                            };
+                            if let Some(i) = parts.next().and_then(|name| tone::COLOURS.iter().position(|c| c.0.eq_ignore_ascii_case(name))) {
+                                self.hsl[kind][i] = value.clamp(-100.0, 100.0);
+                            }
+                        }
                         "--lens" => self.lens.enabled = value > 0.5,
                         "--lens-source" => self.lens.source = [lens::Source::Auto, lens::Source::Lensfun, lens::Source::Embedded][(value as usize).min(2)],
                         "--lens-distortion" => self.lens.distortion = value.clamp(-100.0, 100.0),
@@ -963,6 +1061,42 @@ impl App {
                         "--crop-r" => self.crop[2] = value,
                         "--crop-b" => self.crop[3] = value,
                         "--crop-mode" => self.crop_mode = value > 0.5,
+                        // Spots, for testing: `--spot-x 0.4 --spot-y 0.6 --spot-r 0.01` adds a
+                        // healed spot there with an automatic source (`--spot-clone 1` first
+                        // for clone); `--spot-px 0.5 --spot-py 0.6` before `--spot-r` makes it
+                        // a stroke through more points; `--spot-tool 1` shows the tool.
+                        "--spot-x" => self.spot_brush.x = value,
+                        "--spot-y" => self.spot_brush.y = value,
+                        "--spot-px" => self.spot_brush.path.push([value, self.spot_brush.y]),
+                        "--spot-py" => {
+                            if let Some(p) = self.spot_brush.path.last_mut() {
+                                p[1] = value;
+                            }
+                        }
+                        "--spot-clone" => self.spot_brush.clone = value > 0.5,
+                        "--spot-feather" => self.spot_brush.feather = value.clamp(0.0, 1.0),
+                        "--spot-r" => {
+                            let mut spot = std::mem::take(&mut self.spot_brush.path);
+                            spot.insert(0, [self.spot_brush.x, self.spot_brush.y]);
+                            let radius = value.clamp(SPOT_MIN, SPOT_MAX);
+                            let [dx, dy] = self.spot_preview.find_offset(&spot, radius);
+                            let (x, y) = (spot[0][0], spot[0][1]);
+                            self.spots.push(spots::Spot { x, y, sx: x + dx, sy: y + dy, path: spot[1..].to_vec(), radius, ..self.spot_brush.clone() });
+                            self.spot_selected = Some(self.spots.len() - 1);
+                        }
+                        "--spot-tool" => self.set_spot_tool(value > 0.5),
+                        "--wb-pick" => self.wb_pick = value > 0.5,
+                        "--show-curve" => self.curve_reveal = value > 0.5,
+                        // `--wb-x 0.3 --wb-y 0.6`: what a click there with the eyedropper sets
+                        // (texture coordinates), for testing.
+                        "--wb-x" => self.spot_brush.sx = value,
+                        "--wb-y" => {
+                            let sample = self.spot_preview.average(self.spot_brush.sx, value, 2);
+                            if let Some((kelvin, tint)) = color.neutral_for(sample) {
+                                self.adjust.kelvin = kelvin;
+                                self.tint = tint;
+                            }
+                        }
                         // Canvas HUD toggles, for testing.
                         "--clipping" => self.clipping = value > 0.5,
                         "--export-panel" => self.export_open = value > 0.5,
@@ -1098,6 +1232,13 @@ impl App {
         self.adjust = Adjust::from_array(values);
         self.sharpen = saved.sharpen;
         self.presence = saved.presence;
+        self.curve = saved.curve.clone();
+        self.regions = saved.regions;
+        self.hsl = saved.hsl;
+        self.curve_drag = None;
+        self.spots = saved.spots.clone();
+        self.spot_selected = self.spot_selected.filter(|&i| i < self.spots.len());
+        self.spot_drag = None;
         self.lens = saved.lens.clone();
         self.tint = saved.tint;
         self.profile = match saved.profile.as_str() {
@@ -1188,7 +1329,11 @@ impl App {
             sharpen: self.sharpen,
             tint: self.tint,
             presence: self.presence,
+            curve: self.curve.clone(),
+            regions: self.regions,
+            hsl: self.hsl,
             lens: self.lens.clone(),
+            spots: self.spots.clone(),
             values: self.adjust.to_array(),
             quarter_turns: self.quarter_turns % 4,
             profile: match self.profile {
@@ -1246,7 +1391,27 @@ impl App {
     /// only in that and in who applies the sRGB encoding.
     fn uniforms(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool) -> Uniforms {
         self.measure_scene(loaded);
-        self.uniforms_with(loaded, view, shader_encodes_srgb, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens)
+        let mut u = self.uniforms_with(loaded, view, shader_encodes_srgb, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens);
+        // Only gains worked out for the spots as they are now (a spot changed since the last
+        // `sync_heal` uses the shader's own estimate until the next frame).
+        let grids = self.heal_grids.borrow();
+        let current: Vec<Option<&spots::HealGrid>> = (0..self.spots.len().min(spots::MAX_SPOTS))
+            .map(|i| grids.get(i).and_then(|g| g.as_ref()).filter(|g| !self.spots[i].clone && g.key == spots::heal_key(&self.spots, i, &self.spot_preview)))
+            .collect();
+        spots::fill_uniforms(&self.spots, &current, loaded.width / loaded.height.max(1.0), &mut u);
+        // Tone curve and Color Mixer (the "before" view and the scene measurement leave them out).
+        if !tone::curve_is_identity(&self.curve, &self.regions) {
+            let lut = tone::lut(&self.curve, &self.regions);
+            for (i, v) in lut.iter().enumerate() {
+                u.curve_lut[i / 4][i % 4] = *v;
+            }
+            u.curve_info[0] = 1.0;
+        }
+        if self.hsl.iter().flatten().any(|v| v.abs() > 1e-3) {
+            u.hsl = tone::hsl_uniform(&self.hsl);
+            u.hsl_info[0] = 1.0;
+        }
+        u
     }
 
     /// Measure the photo's display levels (`Uniforms::scene`) when the photo or the settings
@@ -1372,6 +1537,22 @@ impl App {
             knots: lens_gpu.knots,
             scene: self.scene.get(),
             scene2: self.scene2.get(),
+            spot_info: [0.0; 4],
+            spot_a: [[0.0; 4]; spots::MAX_SPOTS],
+            spot_b: [[0.0; 4]; spots::MAX_SPOTS],
+            spot_c: [[0.0; 4]; spots::MAX_SPOTS],
+            spot_box: [[0.0; 4]; spots::MAX_SPOTS],
+            spot_pts: [[0.0; 4]; spots::MAX_POINTS / 2],
+            spot_g: [[0.0; 4]; spots::MAX_SPOTS],
+            spot_t: [[0.0; 4]; spots::MAX_SPOTS],
+            curve_lut: [[0.0; 4]; tone::LUT_SIZE / 4],
+            curve_info: [0.0; 4],
+            hsl: [[0.0; 4]; 6],
+            hsl_info: [0.0; 4],
+            srgb_to_work: {
+                let inv = color::invert(&render.work_to_srgb).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+                rows(&inv)
+            },
             sharpen: {
                 let [amount, radius, detail, masking] = sharpen;
                 [
@@ -1729,6 +1910,7 @@ impl App {
     /// background thread. The GPU part takes a moment and runs here; the slow part (resize
     /// and compression) does not block the window.
     fn start_export(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.sync_heal();
         let Some(loaded) = &self.loaded else { return };
         if self.export_job.is_some() {
             return;
@@ -2420,6 +2602,387 @@ impl App {
         }
     }
 
+    /// Work out the healing gains of Heal spots that are new or have changed (reusing any
+    /// already worked out for the same spot, if it only moved in the list) and upload them
+    /// to the spot's atlas slot. Called once a frame, before anything holds the renderer.
+    fn sync_heal(&self) {
+        if self.loaded.is_none() || self.spot_preview.width == 0 {
+            return;
+        }
+        let n = self.spots.len().min(spots::MAX_SPOTS);
+        let mut grids = self.heal_grids.borrow_mut();
+        let mut changed = Vec::new();
+        let mut fresh: Vec<Option<spots::HealGrid>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if self.spots[i].clone {
+                fresh.push(None);
+                continue;
+            }
+            let key = spots::heal_key(&self.spots, i, &self.spot_preview);
+            if grids.get(i).and_then(|g| g.as_ref()).is_some_and(|g| g.key == key) {
+                fresh.push(grids[i].clone());
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let grid = grids.iter().flatten().find(|g| g.key == key).cloned().unwrap_or_else(|| self.spot_preview.heal_grid(&self.spots, i));
+            if std::env::var_os("DEVELOP_DEBUG_HEAL").is_some() {
+                eprintln!("heal grid {i}: {} x {} in {:.1} ms", grid.nx, grid.ny, started.elapsed().as_secs_f64() * 1000.0);
+            }
+            changed.push(i);
+            fresh.push(Some(grid));
+        }
+        *grids = fresh;
+        if changed.is_empty() {
+            return;
+        }
+        let rs = &self.render_state;
+        let renderer = rs.renderer.read();
+        if let Some(res) = renderer.callback_resources.get::<ImageRenderer>() {
+            for i in changed {
+                if let Some(grid) = &grids[i] {
+                    res.write_heal_grid(&rs.queue, i, grid);
+                }
+            }
+        }
+    }
+
+    /// Switch the white balance eyedropper on or off (the spot tool and crop mode go off).
+    fn set_wb_pick(&mut self, on: bool) {
+        self.wb_pick = on;
+        if on {
+            self.set_spot_tool(false);
+            self.crop_mode = false;
+        }
+    }
+
+    fn set_spot_tool(&mut self, on: bool) {
+        if on {
+            self.wb_pick = false;
+        }
+        self.spot_tool = on;
+        self.spot_drag = None;
+        self.spot_paint = None;
+        if on {
+            self.crop_mode = false;
+            self.spot_hide = false;
+            self.spot_reveal = true;
+        } else {
+            self.spot_selected = None;
+        }
+    }
+
+    /// Where the picture lies on screen in the viewport, for the spot tool.
+    fn spot_map(&self, loaded: &Loaded, rect: egui::Rect, scale: egui::Vec2, cropped: [f32; 4]) -> spots::ScreenMap {
+        let view = [scale.x * cropped[2], scale.y * cropped[3], cropped[0] + self.center.x * cropped[2], cropped[1] + self.center.y * cropped[3]];
+        let u = self.uniforms_with(loaded, view, true, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens);
+        spots::ScreenMap::new(&u, rect, loaded.width / loaded.height.max(1.0))
+    }
+
+    /// The spot the panel acts on: the selected one, else the brush for new spots.
+    fn spot_target(&mut self) -> &mut spots::Spot {
+        match self.spot_selected.filter(|&i| i < self.spots.len()) {
+            Some(i) => &mut self.spots[i],
+            None => &mut self.spot_brush,
+        }
+    }
+
+    /// [ / ] (smaller / bigger) and Shift+[ / Shift+] (harder / softer edge): the brush, and
+    /// the selected spot if there is one.
+    fn spot_keys(&mut self, up: bool, shift: bool) {
+        let size = |r: f32| (if up { r * 1.15 } else { r / 1.15 }).clamp(SPOT_MIN, SPOT_MAX);
+        let soft = |f: f32| ((f + if up { 0.1 } else { -0.1 }) * 10.0).round().clamp(0.0, 10.0) / 10.0;
+        let selected = self.spot_selected.filter(|&i| i < self.spots.len());
+        for spot in std::iter::once(&mut self.spot_brush).chain(selected.map(|i| &mut self.spots[i])) {
+            if shift {
+                spot.feather = soft(spot.feather);
+            } else {
+                spot.radius = size(spot.radius);
+            }
+        }
+    }
+
+    fn spot_hit(&self, map: &spots::ScreenMap, t: [f32; 2]) -> Option<(usize, bool)> {
+        spot_hit(&self.spots, self.spot_selected, map, t)
+    }
+
+    /// The spots' outlines, the brush under the pointer (or the stroke being painted), and a
+    /// hint, over the picture.
+    fn spot_overlay(&self, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, rect: egui::Rect) {
+        let painter = ui.painter().with_clip_rect(rect);
+        let shadow = egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(110));
+        let ring = |edges: Vec<[egui::Pos2; 2]>, stroke: egui::Stroke| {
+            for e in &edges {
+                painter.line_segment(*e, shadow);
+            }
+            for e in edges {
+                painter.line_segment(e, stroke);
+            }
+        };
+        let hovered = response.hover_pos().map(|p| map.to_texture(p));
+        let hit = hovered.and_then(|t| self.spot_hit(map, t));
+        if !self.spot_hide {
+            for (i, s) in self.spots.iter().enumerate() {
+                let points: Vec<[f32; 2]> = s.points().collect();
+                if self.spot_selected == Some(i) {
+                    let (a, b) = (map.to_screen([s.x, s.y]), map.to_screen([s.sx, s.sy]));
+                    let dir = (a - b).normalized();
+                    let r_a = s.radius * map.points_per_height([s.x, s.y]);
+                    let r_b = s.radius * map.points_per_height([s.sx, s.sy]);
+                    // A line from the source's edge to the target's (at their first points),
+                    // then both outlines.
+                    if (a - b).length() > r_a + r_b {
+                        painter.line_segment([b + dir * r_b, a - dir * r_a], egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(170)));
+                    }
+                    ring(self.spot_edges(map, &points, s.offset(), s.radius), egui::Stroke::new(1.25_f32, egui::Color32::from_white_alpha(170)));
+                    ring(self.spot_edges(map, &points, [0.0, 0.0], s.radius), egui::Stroke::new(2.0_f32, theme::ACCENT));
+                    // The feather's inner edge, on circles (on a stroke it only adds clutter).
+                    if s.feather > 0.0 && s.feather < 1.0 && s.path.is_empty() {
+                        for e in self.spot_edges(map, &points, [0.0, 0.0], s.radius * (1.0 - s.feather)) {
+                            painter.line_segment(e, egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(90)));
+                        }
+                    }
+                } else {
+                    let color = if hit.map(|h| h.0) == Some(i) { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(150) };
+                    ring(self.spot_edges(map, &points, [0.0, 0.0], s.radius), egui::Stroke::new(1.25_f32, color));
+                }
+            }
+        }
+        // The stroke being painted, or the brush where a click or stroke would start.
+        if let Some(path) = &self.spot_paint {
+            let fill = self.spot_edges(map, path, [0.0, 0.0], self.spot_brush.radius);
+            ring(fill, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else {
+            let space = ui.input(|i| i.key_down(egui::Key::Space));
+            match (response.hover_pos(), hovered) {
+                _ if space => ui.ctx().set_cursor_icon(if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }),
+                (Some(p), Some(t)) if hit.is_none() && self.spot_drag.is_none() => {
+                    let r = self.spot_brush.radius * map.points_per_height(t);
+                    painter.circle_stroke(p, r, shadow);
+                    painter.circle_stroke(p, r, egui::Stroke::new(1.25_f32, egui::Color32::WHITE));
+                    if self.spot_brush.feather > 0.0 && self.spot_brush.feather < 1.0 {
+                        painter.circle_stroke(p, r * (1.0 - self.spot_brush.feather), egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(110)));
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                _ if self.spot_drag.is_some() => ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing),
+                _ if hit.is_some() => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
+                _ => {}
+            }
+        }
+        let hint = format!(
+            "{}  ·  Click or paint over a spot  ·  Drag an outline to move it  ·  Space+drag pans  ·  [ ] size  ·  Shift+[ ] feather  ·  H hide  ·  Esc done",
+            if self.spot_target_ref().clone { "Clone" } else { "Heal" }
+        );
+        let galley = painter.layout_no_wrap(hint, theme::font(11.5), theme::TEXT);
+        let back = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 10.0 + galley.size().y * 0.5 + 4.0), galley.size() + egui::vec2(16.0, 8.0));
+        painter.rect_filled(back, 5.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xD8));
+        painter.galley(back.min + egui::vec2(8.0, 4.0), galley, theme::TEXT);
+    }
+
+    /// A spot's outline on screen as line pieces: a circle, or the edge of a painted stroke
+    /// as one merged shape (traced once per stroke and size, then kept). `offset` shifts it
+    /// to the source.
+    fn spot_edges(&self, map: &spots::ScreenMap, points: &[[f32; 2]], offset: [f32; 2], radius: f32) -> Vec<[egui::Pos2; 2]> {
+        let shift = |p: [f32; 2]| map.to_screen([p[0] + offset[0], p[1] + offset[1]]);
+        if points.len() < 2 {
+            let p = points.first().copied().unwrap_or([0.0, 0.0]);
+            let ring = map.outline(p[0] + offset[0], p[1] + offset[1], radius);
+            return (0..ring.len()).map(|i| [ring[i], ring[(i + 1) % ring.len()]]).collect();
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for p in points {
+            (p[0].to_bits(), p[1].to_bits()).hash(&mut hasher);
+        }
+        (radius.to_bits(), map.aspect().to_bits()).hash(&mut hasher);
+        let key = hasher.finish();
+        let mut cache = self.spot_outlines.borrow_mut();
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        let edges = cache.entry(key).or_insert_with(|| std::rc::Rc::new(spots::outline_segments(points, radius, map.aspect()))).clone();
+        drop(cache);
+        edges.iter().map(|e| [shift(e[0]), shift(e[1])]).collect()
+    }
+
+    fn spot_target_ref(&self) -> &spots::Spot {
+        self.spot_selected.and_then(|i| self.spots.get(i)).unwrap_or(&self.spot_brush)
+    }
+
+    /// The "Spot Removal" section: the tool, Heal or Clone, and the size, feather and opacity
+    /// of the selected spot (or of new spots when none is selected).
+    fn spot_panel(&mut self, ui: &mut egui::Ui) {
+        let amber = theme::ACCENT;
+        ui.add_enabled_ui(self.loaded.is_some(), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let clear_width = 58.0;
+                let (text, look) = if self.spot_tool { ("Done", ui::Look::teal()) } else { ("Remove Spots", ui::Look::raised()) };
+                let width = ui.available_width() - clear_width - 6.0;
+                let hint = "Q. Click a spot, or paint over a longer one, to remove it; Develop picks a nearby area to copy from. Drag either outline to move it. Later spots see earlier Clone spots, so you can clone an edge first and heal over it.";
+                if ui::button(ui, text, egui::vec2(width, 28.0), look, theme::font(12.5), None).on_hover_text(hint).clicked() {
+                    self.set_spot_tool(!self.spot_tool);
+                }
+                if ui
+                    .add_enabled_ui(!self.spots.is_empty(), |ui| ui::button(ui, "Clear", egui::vec2(clear_width, 28.0), ui::Look::secondary(), theme::font(12.0), None))
+                    .inner
+                    .on_hover_text("Remove all spots")
+                    .clicked()
+                {
+                    self.spots.clear();
+                    self.spot_selected = None;
+                }
+            });
+            ui.add_space(6.0);
+            let selected = self.spot_selected.filter(|&i| i < self.spots.len());
+            let mut clone = self.spot_target().clone;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Mode").color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut clone, true, "Clone").on_hover_text("Copy the source exactly");
+                    ui.selectable_value(&mut clone, false, "Heal").on_hover_text("Copy the source's texture and blend it into the surroundings");
+                });
+            });
+            self.spot_target().clone = clone;
+            let target = self.spot_target().clone();
+            let (mut size, mut feather, mut opacity) = (target.radius * 1000.0, target.feather * 100.0, target.opacity * 100.0);
+            if ui::pro_slider_with(ui, "Size", &mut size, SPOT_MIN * 1000.0..=SPOT_MAX * 1000.0, 12.0, "", amber, 0, 1.0, true) {
+                self.spot_target().radius = (size / 1000.0).clamp(SPOT_MIN, SPOT_MAX);
+            }
+            if ui::pro_slider_with(ui, "Feather", &mut feather, 0.0..=100.0, 50.0, "", amber, 0, 1.0, true) {
+                self.spot_target().feather = (feather / 100.0).clamp(0.0, 1.0);
+            }
+            if ui::pro_slider_with(ui, "Opacity", &mut opacity, 0.0..=100.0, 100.0, "", amber, 0, 1.0, true) {
+                self.spot_target().opacity = (opacity / 100.0).clamp(0.0, 1.0);
+            }
+            let status = match (self.spots.len(), selected) {
+                (0, _) => "No spots".to_owned(),
+                (n, Some(i)) => format!("Spot {} of {n} selected · Delete removes it", i + 1),
+                (n, None) => format!("{n} spot{}  ·  the sliders set new spots", if n == 1 { "" } else { "s" }),
+            };
+            ui.add_space(4.0);
+            ui.label(ui::dim(&status, 11.5));
+            ui.label(ui::dim("Click or paint  ·  Space+drag pans  ·  [ ] size  ·  Shift+[ ] feather  ·  H hide", 11.5));
+        });
+    }
+
+    /// The "Tone Curve" section: the point curve graph and the four region sliders.
+    fn curve_panel(&mut self, ui: &mut egui::Ui) {
+        let amber = theme::ACCENT;
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, width), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        let to_screen = |p: [f32; 2]| egui::pos2(rect.left() + p[0] * rect.width(), rect.bottom() - p[1] * rect.height());
+        let from_screen = |p: egui::Pos2| [((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0)];
+        // Background, quarter grid, the straight line, and the region boundaries.
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(0x15, 0x17, 0x1A));
+        let grid = egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(18));
+        for k in 1..4 {
+            let t = k as f32 / 4.0;
+            painter.line_segment([to_screen([t, 0.0]), to_screen([t, 1.0])], grid);
+            painter.line_segment([to_screen([0.0, t]), to_screen([1.0, t])], grid);
+        }
+        painter.line_segment([to_screen([0.0, 0.0]), to_screen([1.0, 1.0])], egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(30)));
+        // The whole curve (regions and points), then the points.
+        let lut = tone::lut(&self.curve, &self.regions);
+        let line: Vec<egui::Pos2> = lut.iter().enumerate().step_by(2).chain(std::iter::once((tone::LUT_SIZE - 1, &lut[tone::LUT_SIZE - 1]))).map(|(i, &y)| to_screen([i as f32 / (tone::LUT_SIZE - 1) as f32, y])).collect();
+        painter.add(egui::Shape::line(line, egui::Stroke::new(1.75_f32, egui::Color32::from_gray(230))));
+        let pointer = response.hover_pos().or(response.interact_pointer_pos());
+        let near = |p: egui::Pos2, points: &[[f32; 2]]| points.iter().position(|q| (to_screen(*q) - p).length() < 9.0);
+        let hovered = pointer.and_then(|p| near(p, &self.curve));
+        for (i, q) in self.curve.iter().enumerate() {
+            let active = self.curve_drag == Some(i) || hovered == Some(i);
+            painter.circle(to_screen(*q), if active { 5.0 } else { 4.0 }, egui::Color32::from_rgb(0x15, 0x17, 0x1A), egui::Stroke::new(1.5_f32, if active { amber } else { egui::Color32::from_gray(230) }));
+        }
+        // Click on the curve to add a point, drag a point to move it, double-click to remove.
+        let spline = tone::Spline::new(&self.curve);
+        if response.drag_started() {
+            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                self.curve_drag = near(origin, &self.curve).or_else(|| {
+                    let x = from_screen(origin)[0];
+                    (self.curve.len() < 16).then(|| {
+                        let at = self.curve.partition_point(|q| q[0] < x);
+                        self.curve.insert(at, [x, spline.eval(x)]);
+                        at
+                    })
+                });
+            }
+        }
+        if let (Some(i), Some(p)) = (self.curve_drag, response.interact_pointer_pos()) {
+            if response.dragged() && i < self.curve.len() {
+                let [x, y] = from_screen(p);
+                let lo = if i == 0 { 0.0 } else { self.curve[i - 1][0] + 0.01 };
+                let hi = if i + 1 == self.curve.len() { 1.0 } else { self.curve[i + 1][0] - 0.01 };
+                self.curve[i] = [x.clamp(lo, hi.max(lo)), y];
+            }
+        }
+        if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+            self.curve_drag = None;
+        }
+        if response.double_clicked() {
+            if let Some(i) = pointer.and_then(|p| near(p, &self.curve)) {
+                if i > 0 && i + 1 < self.curve.len() {
+                    self.curve.remove(i);
+                }
+            }
+        } else if response.clicked() && hovered.is_none() && self.curve.len() < 16 {
+            if let Some(p) = response.interact_pointer_pos() {
+                let x = from_screen(p)[0];
+                let at = self.curve.partition_point(|q| q[0] < x);
+                self.curve.insert(at, [x, spline.eval(x)]);
+            }
+        }
+        // What the pointer is over, on Lightroom's 0-255 scale.
+        let readout = match (self.curve_drag.or(hovered), pointer) {
+            (Some(i), _) if i < self.curve.len() => {
+                let q = self.curve[i];
+                format!("Input {:.0}  ·  Output {:.0}", q[0] * 255.0, q[1] * 255.0)
+            }
+            (_, Some(p)) if rect.contains(p) => {
+                let x = from_screen(p)[0];
+                format!("Input {:.0}  ·  Output {:.0}", x * 255.0, lut[((x * 255.0).round() as usize).min(255)] * 255.0)
+            }
+            _ => String::new(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(ui::dim(&readout, 11.5));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let changed = !tone::curve_is_identity(&self.curve, &self.regions);
+                if ui.add_enabled_ui(changed, |ui| ui::button(ui, "Reset", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(11.5), None)).inner.on_hover_text("Straight curve, regions at 0").clicked() {
+                    self.curve = tone::identity_curve();
+                    self.regions = [0.0; 4];
+                }
+            });
+        });
+        ui.add_space(4.0);
+        for (i, name) in ["Highlights", "Lights", "Darks", "Shadows"].iter().enumerate() {
+            ui::pro_slider_with(ui, name, &mut self.regions[i], -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
+        }
+    }
+
+    /// The "Color Mixer" section: Hue, Saturation or Luminance for the eight colours.
+    fn mixer_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (i, name) in ["Hue", "Saturation", "Luminance"].iter().enumerate() {
+                ui.selectable_value(&mut self.hsl_tab, i, *name);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let row = &mut self.hsl[self.hsl_tab];
+                let changed = row.iter().any(|v| v.abs() > 1e-3);
+                if ui.add_enabled_ui(changed, |ui| ui::button(ui, "Reset", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(11.5), None)).inner.on_hover_text("This tab's sliders back to 0").clicked() {
+                    *row = [0.0; 8];
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let tab = self.hsl_tab;
+        for (i, (name, _, rgb)) in tone::COLOURS.iter().enumerate() {
+            let colour = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            ui::pro_slider_with(ui, name, &mut self.hsl[tab][i], -100.0..=100.0, 0.0, "", colour, 0, 1.0, false);
+        }
+    }
+
     fn reset_all(&mut self) {
         // White balance goes back to what the camera recorded for this file (5500 K with no file).
         let kelvin = self.loaded.as_ref().map_or(KELVIN_DEFAULT, |l| l.color.as_shot_kelvin);
@@ -2427,6 +2990,11 @@ impl App {
         self.sharpen = settings::SHARPEN_DEFAULT;
         self.tint = 0.0;
         self.presence = [0.0; 3];
+        self.curve = tone::identity_curve();
+        self.regions = [0.0; 4];
+        self.hsl = [[0.0; 8]; 3];
+        self.spots.clear();
+        self.spot_selected = None;
         self.lens = lens::LensSettings::default();
         self.reset_crop();
     }
@@ -2630,7 +3198,71 @@ impl App {
     /// Right pane, scrolling middle: the editing sections.
     fn pane_middle(&mut self, ui: &mut egui::Ui) {
         let amber = theme::ACCENT;
+        // In the order most photos are worked on: profile, crop, white balance, tone, presence,
+        // detail, lens. Retouching comes last, after the darkroom adjustments.
+        ui::section(ui, "Profile", true, "How the camera's colours and base tone are rendered", |ui| {
+            let is_raw = self.input_mode != 2;
+            ui.add_enabled_ui(is_raw, |ui| {
+                ui.horizontal(|ui| {
+                    let selected = match self.profile {
+                        _ if !is_raw => "Picture (sRGB)".to_owned(),
+                        Profile::Linear => "Linear".to_owned(),
+                        Profile::Standard => "Standard (built-in)".to_owned(),
+                        Profile::Dcp(i) => self.dcps.get(i).map_or_else(|| "Standard (built-in)".to_owned(), |(l, _, _)| l.clone()),
+                    };
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        egui::ComboBox::from_id_source("profile").selected_text(selected).width(ui.available_width()).show_ui(ui, |ui| {
+                            for (i, (label, _, _)) in self.dcps.iter().enumerate() {
+                                ui.selectable_value(&mut self.profile, Profile::Dcp(i), label)
+                                    .on_hover_text("Adobe camera profile installed on this computer");
+                            }
+                            if !self.dcps.is_empty() {
+                                ui.separator();
+                            }
+                            ui.selectable_value(&mut self.profile, Profile::Standard, "Standard (built-in)")
+                                .on_hover_text("Built-in base tone curve, no camera colour tables");
+                            ui.selectable_value(&mut self.profile, Profile::Linear, "Linear")
+                                .on_hover_text("No base curve: flat, dark, exactly what the sensor recorded");
+                        });
+                    });
+                });
+            });
+        });
         ui::section(ui, "Crop", false, "Crop, straighten and aspect ratio  (R)", |ui| self.crop_panel(ui));
+
+        ui::section(ui, "White Balance", true, "", |ui| {
+            let as_shot = self.loaded.as_ref().map(|l| l.color.as_shot_kelvin);
+            let a = &mut self.adjust;
+            ui::pro_slider_with(ui, "Temp", &mut a.kelvin, KELVIN_MIN..=KELVIN_MAX, as_shot.unwrap_or(KELVIN_DEFAULT), " K", amber, 0, 10.0, false);
+            let mut pick = None;
+            ui.columns(3, |columns| {
+                let width = columns[0].available_width();
+                let look = if self.wb_pick { ui::Look::teal() } else { ui::Look::bordered() };
+                if columns[0]
+                    .add_enabled_ui(self.loaded.is_some(), |ui| ui::button(ui, "Pick", egui::vec2(width, 24.0), look, theme::font(12.0), None))
+                    .inner
+                    .on_hover_text("W. Click something on the picture that should be neutral grey or white")
+                    .clicked()
+                {
+                    pick = Some(!self.wb_pick);
+                }
+                let width = columns[1].available_width();
+                if columns[1].add_enabled_ui(as_shot.is_some(), |ui| ui::button(ui, "As Shot", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None)).inner.clicked() {
+                    a.kelvin = as_shot.unwrap_or(KELVIN_DEFAULT);
+                    self.tint = 0.0;
+                }
+                let width = columns[2].available_width();
+                if ui::button(&mut columns[2], "5500 K", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None).clicked() {
+                    a.kelvin = KELVIN_DEFAULT;
+                }
+            });
+            if let Some(on) = pick {
+                self.set_wb_pick(on);
+            }
+            ui.add_space(8.0);
+            ui::pro_slider(ui, "Tint", &mut self.tint, -150.0..=150.0, 0.0, "", amber);
+        });
 
         ui::section(ui, "Tone", true, "", |ui| {
             let a = &mut self.adjust;
@@ -2652,57 +3284,17 @@ impl App {
             ui::pro_slider_with(ui, "Texture", texture, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
             ui::pro_slider_with(ui, "Clarity", clarity, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
             ui::pro_slider_with(ui, "Dehaze", dehaze, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
-        });
-
-        ui::section(ui, "Color", true, "", |ui| {
-            let as_shot = self.loaded.as_ref().map(|l| l.color.as_shot_kelvin);
-            let is_raw = self.input_mode != 2;
-            ui.add_enabled_ui(is_raw, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Profile").color(theme::TEXT));
-                    let selected = match self.profile {
-                        _ if !is_raw => "Picture (sRGB)".to_owned(),
-                        Profile::Linear => "Linear".to_owned(),
-                        Profile::Standard => "Standard (built-in)".to_owned(),
-                        Profile::Dcp(i) => self.dcps.get(i).map_or_else(|| "Standard (built-in)".to_owned(), |(l, _, _)| l.clone()),
-                    };
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().interact_size.y = 24.0;
-                        egui::ComboBox::from_id_source("profile").selected_text(selected).width(176.0).show_ui(ui, |ui| {
-                            for (i, (label, _, _)) in self.dcps.iter().enumerate() {
-                                ui.selectable_value(&mut self.profile, Profile::Dcp(i), label)
-                                    .on_hover_text("Adobe camera profile installed on this computer");
-                            }
-                            if !self.dcps.is_empty() {
-                                ui.separator();
-                            }
-                            ui.selectable_value(&mut self.profile, Profile::Standard, "Standard (built-in)")
-                                .on_hover_text("Built-in base tone curve, no camera colour tables");
-                            ui.selectable_value(&mut self.profile, Profile::Linear, "Linear")
-                                .on_hover_text("No base curve: flat, dark, exactly what the sensor recorded");
-                        });
-                    });
-                });
-            });
-            ui.add_space(4.0);
-            let a = &mut self.adjust;
-            ui::pro_slider_with(ui, "Temp", &mut a.kelvin, KELVIN_MIN..=KELVIN_MAX, as_shot.unwrap_or(KELVIN_DEFAULT), " K", amber, 0, 10.0, false);
-            ui.columns(2, |columns| {
-                let width = columns[0].available_width();
-                if columns[0].add_enabled_ui(as_shot.is_some(), |ui| ui::button(ui, "As Shot", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None)).inner.clicked() {
-                    a.kelvin = as_shot.unwrap_or(KELVIN_DEFAULT);
-                    self.tint = 0.0;
-                }
-                let width = columns[1].available_width();
-                if ui::button(&mut columns[1], "5500 K", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None).clicked() {
-                    a.kelvin = KELVIN_DEFAULT;
-                }
-            });
             ui.add_space(8.0);
-            ui::pro_slider(ui, "Tint", &mut self.tint, -150.0..=150.0, 0.0, "", amber);
+            let a = &mut self.adjust;
             ui::pro_slider(ui, "Vibrance", &mut a.vibrance, -100.0..=100.0, 0.0, "", amber);
             ui::pro_slider(ui, "Saturation", &mut a.saturation, -100.0..=100.0, 0.0, "", amber);
         });
+
+        ui::section(ui, "Tone Curve", true, "Click the curve to add a point, drag points, double-click a point to remove it", |ui| self.curve_panel(ui));
+        if std::mem::take(&mut self.curve_reveal) {
+            ui.scroll_to_cursor(Some(egui::Align::Center));
+        }
+        ui::section(ui, "Color Mixer", true, "Hue, saturation and luminance of eight colours", |ui| self.mixer_panel(ui));
 
         ui::section(ui, "Detail", true, "", |ui| {
             let has_model = denoise::model_path(denoise::Model::Bayer).is_some() || denoise::model_path(denoise::Model::Linear).is_some();
@@ -2732,6 +3324,16 @@ impl App {
         });
 
         ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));
+
+        // Switching the spot tool on opens this section and scrolls it into view.
+        let reveal = std::mem::take(&mut self.spot_reveal);
+        if reveal {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("section", "Retouch")), true));
+        }
+        ui::section(ui, "Retouch", false, "Remove dust spots and blemishes by healing or cloning  (Q)", |ui| self.spot_panel(ui));
+        if reveal {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        }
     }
 
     /// True when Lightroom would correct this lens's distortion even with profile corrections
@@ -3013,6 +3615,8 @@ impl App {
             return;
         }
         if self.crop_mode {
+            self.spot_tool = false;
+            self.spot_paint = None;
             self.crop_viewport(ui, rect, &response);
             return;
         }
@@ -3030,6 +3634,36 @@ impl App {
         let max_zoom = fit.max(16.0);
         let mut zoom = self.zoom.unwrap_or(fit).clamp(fit, max_zoom);
         let half = egui::vec2(0.5, 0.5);
+        // White balance eyedropper: a click sets the white balance that makes that spot neutral.
+        if self.wb_pick {
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if response.clicked() {
+                if let Some(p) = response.interact_pointer_pos() {
+                    let t = self.spot_map(loaded, rect, view_px / (dims * zoom), cropped).to_texture(p);
+                    if (0.0..=1.0).contains(&t[0]) && (0.0..=1.0).contains(&t[1]) {
+                        let sample = self.spot_preview.average(t[0], t[1], 2);
+                        match loaded.color.neutral_for(sample) {
+                            Some((kelvin, tint)) => {
+                                self.adjust.kelvin = kelvin;
+                                self.tint = tint;
+                                self.wb_pick = false;
+                            }
+                            None => self.error = Some("That spot is too dark or too bright to set the white balance from; pick a mid grey or a light area that isn't blown out.".to_owned()),
+                        }
+                    }
+                }
+            }
+        }
+        // Spot tool: clicks add and select spots, drags move them (before panning sees them).
+        if self.spot_tool {
+            let map = self.spot_map(loaded, rect, view_px / (dims * zoom), cropped);
+            // Space held (or the middle button) pans instead of painting.
+            let pan = ui.input(|i| i.key_down(egui::Key::Space));
+            let mut io = SpotInput { spots: &mut self.spots, selected: &mut self.spot_selected, drag: &mut self.spot_drag, paint: &mut self.spot_paint };
+            io.handle(&self.spot_brush, &self.spot_preview, ui, &response, &map, pan);
+        }
         // Offset of the pointer from the viewport centre, in viewport fractions.
         let pointer = response.hover_pos().map_or(egui::Vec2::ZERO, |p| (p - rect.min) / rect.size() - half);
 
@@ -3043,7 +3677,7 @@ impl App {
         if factor != 1.0 {
             target = Some(zoom * factor);
         }
-        if response.double_clicked() {
+        if response.double_clicked() && !self.spot_tool && !self.wb_pick {
             target = Some(if self.zoom.is_some() { fit } else { 1.0_f32.max(fit * 2.0) });
         }
         if let Some(target) = target {
@@ -3053,7 +3687,9 @@ impl App {
             self.center += pointer * old_scale - pointer * new_scale;
             zoom = new_zoom;
         }
-        if response.dragged_by(egui::PointerButton::Primary) {
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let spot_busy = self.spot_tool && (!space || self.spot_drag.is_some() || self.spot_paint.is_some());
+        if (response.dragged_by(egui::PointerButton::Primary) && !spot_busy) || response.dragged_by(egui::PointerButton::Middle) {
             self.center -= response.drag_delta() * ppp / (dims * zoom);
         }
         self.zoom = if zoom <= fit * 1.0001 { None } else { Some(zoom) };
@@ -3114,6 +3750,18 @@ impl App {
         } else {
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, ImageCallback { before: false }));
         }
+        if self.wb_pick {
+            let painter = ui.painter().with_clip_rect(rect);
+            let galley = painter.layout_no_wrap("White balance  ·  Click something that should be neutral grey or white  ·  Esc cancels".to_owned(), theme::font(11.5), theme::TEXT);
+            let back = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 10.0 + galley.size().y * 0.5 + 4.0), galley.size() + egui::vec2(16.0, 8.0));
+            painter.rect_filled(back, 5.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xD8));
+            painter.galley(back.min + egui::vec2(8.0, 4.0), galley, theme::TEXT);
+        }
+        if self.spot_tool {
+            // Circles drawn where the picture is now (after this frame's zoom and pan).
+            let map = self.spot_map(loaded, rect, scale, cropped);
+            self.spot_overlay(ui, &response, &map, rect);
+        }
         self.canvas_hud(ui, outer, zoom);
     }
 }
@@ -3121,6 +3769,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_loader();
+        self.sync_heal();
         self.update_dialog(ctx);
         self.export_windows(ctx);
         // Record finished edits in the open photo's undo history.
@@ -3178,11 +3827,18 @@ impl eframe::App for App {
         // Command-line test runs (`app file.ARW --highlights -100 ...`) show the picture and
         // sliders only, so their captures keep the same layout.
         let browsing = self.remember;
-        // [ and ] show or hide the side panels.
+        // [ and ] show or hide the side panels; with the spot tool on they size the brush
+        // (and the selected spot), and with Shift change its feather.
         if !ctx.wants_keyboard_input() {
-            let (left, right) = ctx.input(|i| (i.key_pressed(egui::Key::OpenBracket), i.key_pressed(egui::Key::CloseBracket)));
-            self.show_left ^= left;
-            self.show_right ^= right;
+            let (left, right, shift) = ctx.input(|i| (i.key_pressed(egui::Key::OpenBracket), i.key_pressed(egui::Key::CloseBracket), i.modifiers.shift));
+            if self.spot_tool && self.loaded.is_some() {
+                if left || right {
+                    self.spot_keys(right, shift);
+                }
+            } else {
+                self.show_left ^= left;
+                self.show_right ^= right;
+            }
         }
         egui::TopBottomPanel::top("top_bar")
             .exact_height(34.0)
@@ -3266,6 +3922,46 @@ impl eframe::App for App {
             self.crop_wish = self.crop;
             self.zoom = None;
         }
+        // Spot removal: Q switches the tool on and off, Esc deselects then leaves it, Delete
+        // removes the selected spot, H hides the circles.
+        if self.loaded.is_some() && !ctx.wants_keyboard_input() {
+            let (q, esc, delete, h) = ctx.input(|i| {
+                let plain = !i.modifiers.any();
+                (
+                    plain && i.key_pressed(egui::Key::Q),
+                    i.key_pressed(egui::Key::Escape),
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                    plain && i.key_pressed(egui::Key::H),
+                )
+            });
+            if q {
+                self.set_spot_tool(!self.spot_tool);
+            }
+            // W: white balance eyedropper; Esc cancels it.
+            let w = ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::W));
+            if w {
+                self.set_wb_pick(!self.wb_pick);
+            } else if esc && self.wb_pick {
+                self.wb_pick = false;
+            }
+            if self.spot_tool {
+                if esc {
+                    if self.spot_selected.is_some() {
+                        self.spot_selected = None;
+                    } else {
+                        self.set_spot_tool(false);
+                    }
+                }
+                if delete {
+                    if let Some(i) = self.spot_selected.take().filter(|&i| i < self.spots.len()) {
+                        self.spots.remove(i);
+                    }
+                }
+                if h {
+                    self.spot_hide = !self.spot_hide;
+                }
+            }
+        }
         let export_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::E);
         if ctx.input_mut(|i| i.consume_shortcut(&export_key)) && self.loaded.is_some() {
             self.export_open = true;
@@ -3303,5 +3999,117 @@ impl eframe::App for App {
                 }
             }
         }
+    }
+}
+
+/// Which spot is under `t` (texture coordinates): the spot, and whether it is the source.
+/// The selected spot is checked first, then the newest.
+fn spot_hit(spots: &[spots::Spot], selected: Option<usize>, map: &spots::ScreenMap, t: [f32; 2]) -> Option<(usize, bool)> {
+    let order = selected.into_iter().chain((0..spots.len()).rev());
+    for i in order {
+        let Some(s) = spots.get(i) else { continue };
+        if s.distance(t, map.aspect()) <= s.radius {
+            return Some((i, false));
+        }
+        if s.source_distance(t, map.aspect()) <= s.radius {
+            return Some((i, true));
+        }
+    }
+    None
+}
+
+/// What the spot tool changes as the pointer clicks, drags and paints.
+struct SpotInput<'a> {
+    spots: &'a mut Vec<spots::Spot>,
+    selected: &'a mut Option<usize>,
+    /// The outline being dragged: spot, source rather than target, grab offset.
+    drag: &'a mut Option<(usize, bool, [f32; 2])>,
+    paint: &'a mut Option<Vec<[f32; 2]>>,
+}
+
+impl SpotInput<'_> {
+    /// Clicks add a circle (or select the spot clicked); drags on an outline move it; drags
+    /// elsewhere paint a stroke, which becomes a spot when the button is let go. Nothing
+    /// starts while `pan` (Space) is held.
+    fn handle(&mut self, brush: &spots::Spot, preview: &spots::Preview, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, pan: bool) {
+        let aspect = map.aspect();
+        let inside = |t: [f32; 2]| (0.0..=1.0).contains(&t[0]) && (0.0..=1.0).contains(&t[1]);
+        if response.drag_started_by(egui::PointerButton::Primary) && !pan {
+            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                let t = map.to_texture(origin);
+                match spot_hit(self.spots, *self.selected, map, t) {
+                    Some((i, source)) => {
+                        let s = &self.spots[i];
+                        let anchor = if source { [s.sx, s.sy] } else { [s.x, s.y] };
+                        *self.drag = Some((i, source, [anchor[0] - t[0], anchor[1] - t[1]]));
+                        *self.selected = Some(i);
+                    }
+                    None if inside(t) && self.spots.len() < spots::MAX_SPOTS => *self.paint = Some(vec![t]),
+                    None => {}
+                }
+            }
+        }
+        let released = !ui.input(|i| i.pointer.primary_down());
+        if let Some((i, source, offset)) = *self.drag {
+            if let (Some(p), Some(s)) = (response.interact_pointer_pos(), self.spots.get_mut(i)) {
+                let t = map.to_texture(p);
+                let at = [t[0] + offset[0], t[1] + offset[1]];
+                if source {
+                    (s.sx, s.sy) = (at[0], at[1]);
+                } else {
+                    s.move_target(at[0], at[1]);
+                }
+            }
+            if released {
+                *self.drag = None;
+            }
+        }
+        if let Some(path) = self.paint.as_mut() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let t = map.to_texture(p);
+                let t = [t[0].clamp(0.0, 1.0), t[1].clamp(0.0, 1.0)];
+                let last = *path.last().unwrap_or(&t);
+                if ((t[0] - last[0]) * aspect).hypot(t[1] - last[1]) >= 0.1 * brush.radius {
+                    path.push(t);
+                }
+            }
+            if released {
+                let path = self.paint.take().unwrap_or_default();
+                self.add(path, brush, preview, aspect);
+            }
+        }
+        if response.clicked() && self.paint.is_none() {
+            let Some(p) = response.interact_pointer_pos() else { return };
+            let t = map.to_texture(p);
+            if !inside(t) {
+                return;
+            }
+            match spot_hit(self.spots, *self.selected, map, t) {
+                Some((i, _)) => *self.selected = Some(i),
+                None => self.add(vec![t], brush, preview, aspect),
+            }
+        }
+    }
+
+    /// Add a spot along `path` (one point = a circle) with the brush's settings and an
+    /// automatically chosen source, thinning the stroke to fit what the shader can hold.
+    fn add(&mut self, path: Vec<[f32; 2]>, brush: &spots::Spot, preview: &spots::Preview, aspect: f32) {
+        if path.is_empty() || self.spots.len() >= spots::MAX_SPOTS {
+            return;
+        }
+        let room = spots::MAX_POINTS.saturating_sub(self.spots.iter().map(|s| 1 + s.path.len()).sum::<usize>());
+        let mut step = 0.3 * brush.radius;
+        let mut points = spots::simplify(&path, step, aspect);
+        while points.len() > room && points.len() > 1 {
+            step *= 1.6;
+            points = spots::simplify(&path, step, aspect);
+        }
+        if points.len() > room {
+            return;
+        }
+        let [dx, dy] = preview.find_offset(&points, brush.radius);
+        let (x, y) = (points[0][0], points[0][1]);
+        self.spots.push(spots::Spot { x, y, sx: x + dx, sy: y + dy, path: points[1..].to_vec(), ..brush.clone() });
+        *self.selected = Some(self.spots.len() - 1);
     }
 }

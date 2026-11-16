@@ -40,6 +40,29 @@ local SLIDERS = {
     { id = "Sharpness",      label = "Sharpening",   suffix = "sha",    values = "0, 40, 75, 115, 150",     on = true },
     { id = "Temperature",    label = "Temp (+/- K)", suffix = "temp",   values = "-1000, -500, 500, 1000",  on = false, relative = true },
     { id = "Tint",           label = "Tint (+/-)",   suffix = "tint",   values = "-150, -75, 75, 150",      on = true,  relative = true },
+    -- Tone curve: the four parametric regions, and named point curves (see POINT_CURVES).
+    { id = "ParametricHighlights", label = "Curve Highlights", suffix = "ph", values = "-100, -50, 50, 100", on = false },
+    { id = "ParametricLights",     label = "Curve Lights",     suffix = "pl", values = "-100, -50, 50, 100", on = false },
+    { id = "ParametricDarks",      label = "Curve Darks",      suffix = "pd", values = "-100, -50, 50, 100", on = false },
+    { id = "ParametricShadows",    label = "Curve Shadows",    suffix = "ps", values = "-100, -50, 50, 100", on = false },
+    { id = "ToneCurvePV2012",      label = "Point curves",     suffix = "pc", values = "mid+32, mid-32, shadow+32, high-32, s, black+32", on = false, curves = true },
+    -- Color Mixer: each row exports all eight colours, e.g. <photo>-hsl-s-blue-100.jpg.
+    { id = "HueAdjustment",        label = "Mixer Hue (8)",        suffix = "hsl-h", values = "-100, 100", on = false, colours = true },
+    { id = "SaturationAdjustment", label = "Mixer Saturation (8)", suffix = "hsl-s", values = "-100, 100", on = false, colours = true },
+    { id = "LuminanceAdjustment",  label = "Mixer Luminance (8)",  suffix = "hsl-l", values = "-100, 100", on = false, colours = true },
+}
+
+-- The Color Mixer's colours, as Lightroom names its settings (HueAdjustmentRed...).
+local COLOURS = { "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta" }
+
+-- Point curves by name: x, y pairs on Lightroom's 0-255 scale.
+local POINT_CURVES = {
+    ["mid+32"] = { 0, 0, 128, 160, 255, 255 },
+    ["mid-32"] = { 0, 0, 128, 96, 255, 255 },
+    ["shadow+32"] = { 0, 0, 64, 96, 255, 255 },
+    ["high-32"] = { 0, 0, 192, 160, 255, 255 },
+    ["s"] = { 0, 0, 64, 48, 192, 208, 255, 255 },
+    ["black+32"] = { 0, 32, 255, 255 },
 }
 
 local WHITE_BALANCE = { Temperature = true, Tint = true }
@@ -130,6 +153,15 @@ end
 
 ---------------------------------------------------------------------------------------------
 -- Develop settings
+
+local function parse_curve_names(text)
+    local names = {}
+    for item in string.gmatch(text or "", "[^,%s]+") do
+        if not POINT_CURVES[item] then return nil, "\"" .. item .. "\" is not a known point curve" end
+        names[#names + 1] = item
+    end
+    return names
+end
 
 local function parse_values(text)
     local values = {}
@@ -233,7 +265,28 @@ end
 local function variants(base, blank, chosen)
     local jobs = {}
     for _, slider in ipairs(chosen) do
-        for _, v in ipairs(slider.parsed) do
+        if slider.curves then
+            for _, name in ipairs(slider.parsed) do
+                jobs[#jobs + 1] = {
+                    name = base .. "-pc-" .. name,
+                    settings = { ToneCurveName2012 = "Custom", ToneCurvePV2012 = POINT_CURVES[name] },
+                    undo = { ToneCurveName2012 = blank.ToneCurveName2012 or "Linear", ToneCurvePV2012 = blank.ToneCurvePV2012 or { 0, 0, 255, 255 } },
+                    curve = true,
+                }
+            end
+        elseif slider.colours then
+            for _, colour in ipairs(COLOURS) do
+                local id = slider.id .. colour
+                for _, v in ipairs(slider.parsed) do
+                    jobs[#jobs + 1] = {
+                        name = base .. "-" .. slider.suffix .. "-" .. string.lower(colour) .. format_value(v),
+                        settings = { [id] = v },
+                        undo = { [id] = blank[id] or 0 },
+                    }
+                end
+            end
+        end
+        for _, v in ipairs((slider.curves or slider.colours) and {} or slider.parsed) do
             local settings, undo = {}, {}
             if WHITE_BALANCE[slider.id] then
                 settings.WhiteBalance = "Custom"
@@ -262,7 +315,7 @@ local function run(context, props, chosen, preset)
     if LrFileUtils.exists(folder) ~= "directory" then LrFileUtils.createAllDirectories(folder) end
 
     local per_photo = (props.export_blank and 1 or 0)
-    for _, slider in ipairs(chosen) do per_photo = per_photo + #slider.parsed end
+    for _, slider in ipairs(chosen) do per_photo = per_photo + #slider.parsed * (slider.colours and #COLOURS or 1) end
     local total = per_photo * #photos
 
     local progress = LrProgressScope { title = "Exporting reference JPEGs", functionContext = context }
@@ -299,8 +352,10 @@ local function run(context, props, chosen, preset)
                 else
                     progress:setCaption(job.name .. ".jpg")
                     apply(catalog, photo, job.settings, "Reference " .. job.name)
+                    if job.curve then LrTasks.sleep(1.5) end -- a point curve is a list: wait_for cannot check it
                     local exported_ok, export_message = LrTasks.pcall(export_one, photo, preset, folder, job.name)
                     apply(catalog, photo, job.undo, "Reference: back to blank")
+                    if job.curve then LrTasks.sleep(1.5) end
                     if not exported_ok then error(export_message, 0) end
                     exported = exported + 1
                 end
@@ -364,7 +419,10 @@ local function dialog(context)
         rows[#rows + 1] = f:row {
             f:checkbox { title = slider.label, value = bind(slider.id .. "_on"), width = LrView.share("slider_label") },
             f:edit_field { value = bind(slider.id .. "_values"), enabled = bind(slider.id .. "_on"), width_in_chars = 24 },
-            f:static_text { title = "<photo>-" .. slider.suffix .. "+050.jpg", enabled = bind(slider.id .. "_on") },
+            f:static_text {
+                title = slider.curves and "<photo>-pc-mid+32.jpg" or (slider.colours and ("<photo>-" .. slider.suffix .. "-blue+100.jpg") or ("<photo>-" .. slider.suffix .. "+050.jpg")),
+                enabled = bind(slider.id .. "_on"),
+            },
         }
     end
 
@@ -434,12 +492,13 @@ local function dialog(context)
     local chosen = {}
     for _, slider in ipairs(SLIDERS) do
         if props[slider.id .. "_on"] then
-            local parsed, bad = parse_values(props[slider.id .. "_values"])
+            local parse = slider.curves and parse_curve_names or parse_values
+            local parsed, bad = parse(props[slider.id .. "_values"])
             if parsed == nil then
                 LrDialogs.message(PLUGIN, slider.label .. ": " .. bad, "critical")
                 return
             end
-            chosen[#chosen + 1] = { id = slider.id, suffix = slider.suffix, relative = slider.relative, parsed = parsed }
+            chosen[#chosen + 1] = { id = slider.id, suffix = slider.suffix, relative = slider.relative, parsed = parsed, curves = slider.curves, colours = slider.colours }
         end
     end
     if #chosen == 0 and not props.export_blank then

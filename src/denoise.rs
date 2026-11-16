@@ -236,7 +236,8 @@ pub fn run_linear(rgb: &[f32], width: usize, height: usize) -> Result<Denoised, 
     let mut done = 0u32;
     PROGRESS.store(total.min(0xffff), Ordering::Relaxed);
     let ramp: Vec<f32> = (0..TILE).map(|i| ((i.min(TILE - 1 - i) + 1) as f32 / OVERLAP as f32).min(1.0)).collect();
-    let (mut input_total, mut output_total) = (0f64, 0f64);
+    // Per colour, so the model's colour drift is undone as well as its brightness.
+    let (mut input_total, mut output_total) = ([0f64; 3], [0f64; 3]);
 
     let result = (|| -> Result<(), String> {
         for &ty in &ys {
@@ -251,14 +252,18 @@ pub fn run_linear(rgb: &[f32], width: usize, height: usize) -> Result<Denoised, 
                         }
                     }
                 }
-                input_total += input.iter().map(|&v| v as f64).sum::<f64>();
+                for (c, plane) in input.chunks_exact(TILE * TILE).enumerate() {
+                    input_total[c] += plane.iter().map(|&v| v as f64).sum::<f64>();
+                }
                 let tensor = Tensor::from_array(([1usize, 3, TILE, TILE], input.into_boxed_slice())).map_err(|e| e.to_string())?;
                 let outputs = session.run(ort::inputs![tensor]).map_err(|e| format!("Denoise failed: {e}"))?;
                 let (_, data) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                 if data.len() != 3 * TILE * TILE {
                     return Err("The denoise model returned an unexpected size.".into());
                 }
-                output_total += data.iter().map(|&v| v as f64).sum::<f64>();
+                for (c, plane) in data.chunks_exact(TILE * TILE).enumerate() {
+                    output_total[c] += plane.iter().map(|&v| v as f64).sum::<f64>();
+                }
                 for y in 0..TILE.min(height - ty) {
                     for x in 0..TILE.min(width - tx) {
                         let w = ramp[y] * ramp[x];
@@ -278,13 +283,16 @@ pub fn run_linear(rgb: &[f32], width: usize, height: usize) -> Result<Denoised, 
     PROGRESS.store(0, Ordering::Relaxed);
     result?;
 
-    // The model's overall brightness is arbitrary (even its sign): match it to the input.
-    let gain = if output_total.abs() > 1e-9 { (input_total / output_total) as f32 } else { 1.0 };
+    // The model's overall brightness is arbitrary (even its sign), and it drifts colour a
+    // little (warmer on Samsung Expert RAW files): match each colour to the input.
+    let gains: [f32; 3] = std::array::from_fn(|c| if output_total[c].abs() > 1e-9 { (input_total[c] / output_total[c]) as f32 } else { 1.0 });
     use rayon::prelude::*;
     sum.par_chunks_mut(3).zip(weight.par_iter()).for_each(|(px, &w)| {
-        let k = gain / w.max(1e-6);
-        for v in px {
-            *v = (*v * k).max(0.0);
+        // Not clamped here: in Rec.2020, saturated colours (cyan lights, say) have negative
+        // values, and clamping them would add their opposite colour. The caller clamps after
+        // converting back to camera colour.
+        for (v, g) in px.iter_mut().zip(gains) {
+            *v *= g / w.max(1e-6);
         }
     });
     let note = format!("AI denoise: {:.1} s on the {} ({total} tiles)", started.elapsed().as_secs_f32(), engine.device);
