@@ -1,13 +1,14 @@
 ## Develop 0.3.4
 
 ### Auto white balance
-- A new **Auto** button in the White Balance panel sets the white balance for you. When there
-  are people in the photo it goes by their **skin**: it finds the faces, judges their skin as if
-  they were correctly exposed, and cools (or warms) the picture until skin looks natural without
-  turning pink. That is what makes **firelight, candles and tungsten** come out right, where the
-  camera leaves everything orange and nothing in the picture is grey.
-- Without faces it makes the grey and white parts of the picture neutral; with nothing to go
-  by, it leaves the photo alone and says so.
+- A new **Auto** button in the White Balance panel sets the white balance for you. When enough
+  of the picture is grey or white, it makes those parts neutral.
+- When there is almost nothing grey, as under **firelight, candles and tungsten**, it goes by
+  people's **skin**: it finds the faces, judges their skin as if they were correctly exposed, and
+  cools the picture until the skin's colour is natural rather than orange, stopping before skin
+  turns pink. That is what makes those photos come out right, where the camera leaves everything
+  orange.
+- With neither grey nor faces, it leaves the photo alone and says so.
 - Only temperature (and tint, from grey areas) changes, never exposure. A note under the button
   says what it went by, and **Undo** goes back. Running it again gives the same answer.
 
@@ -84,8 +85,8 @@ codesign --force --deep --sign - /Applications/Develop.app
 ```
 
 ### Known limitations
-- Auto white balance's skin target was set from one firelit photo judged by eye and checked on
-  others; firelit photos with nobody in them are left as the camera made them (still orange).
+- Auto white balance's firelight setting was judged by eye on two firelit photos; firelit photos
+  with nobody in them are left as the camera made them (still orange).
 - **Auto** works on the open photo; to do many photos at once, use an AI assistant's
   `auto_white_balance`.
 - Focus measurements are a guide, best for comparing frames of the same scene; very noisy

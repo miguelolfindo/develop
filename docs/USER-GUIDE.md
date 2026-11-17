@@ -252,12 +252,13 @@ The viewer shows the cropped size in pixels and the angle while you crop.
   says so if the spot is too dark or too bright to judge.
 - **As Shot:** the camera's own white balance.
 - **5500 K:** daylight.
-- **Auto:** Develop finds the white balance itself. When there are people in the photo it goes by
-  their skin: it finds the faces, judges their skin as if the faces were correctly exposed, and
-  cools (or warms) the picture until skin looks natural without turning pink. That is what makes
-  firelight, candles and tungsten come out right, where the camera leaves everything orange and
-  nothing in the picture is grey. Without faces it makes the grey and white parts neutral, and if
-  there is nothing to go by it changes nothing. Only temperature (and tint, from grey areas) is
+- **Auto:** Develop finds the white balance itself. When enough of the picture is grey or white,
+  it makes those parts neutral: grey is the most reliable guide. When there is almost nothing
+  grey, as under firelight, candles and tungsten, it goes by people's skin instead: it finds the
+  faces, judges their skin as if the faces were correctly exposed, and cools the picture until the
+  skin's colour is natural rather than orange, stopping before skin turns pink. That is what makes
+  those photos come out right, where the camera leaves everything orange. With neither grey nor
+  faces it changes nothing. Only temperature (and tint, from grey areas) is
   changed, never exposure; a note under the button says what it went by, and **Undo** goes back.
 - **Tint:** -150 (green) to +150 (magenta), relative to the as-shot white balance.
 

@@ -3838,7 +3838,7 @@ impl App {
             if ui
                 .add_enabled_ui(self.loaded.is_some() && self.loading.is_none(), |ui| ui::button(ui, "Auto", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None))
                 .inner
-                .on_hover_text("Set the white balance from people's skin when there are faces (so firelight and tungsten come out natural), or else from the grey and white parts of the picture. Exposure is not changed; Undo goes back.")
+                .on_hover_text("Set the white balance from the grey and white parts of the picture, or, when there is almost nothing grey (firelight, tungsten), from people's skin. Exposure is not changed; Undo goes back.")
                 .clicked()
             {
                 self.auto_white_balance();

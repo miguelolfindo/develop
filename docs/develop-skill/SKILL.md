@@ -50,7 +50,8 @@ non-destructive and the original raw file is never touched.
   call measures for about 35 seconds; measurements are kept), read the bursts marked `check`,
   then call it again with `apply: true` to save the ratings. Use this for culling, not
   `check_photos`.
-- `auto_white_balance(paths)`: Develop sets white balance itself, from skin when there are faces
+- `auto_white_balance(paths)`: Develop sets white balance itself, from the neutral areas when there
+  are enough, else from skin when there are faces
   (right for firelight and tungsten) or from the neutral areas; temperature and tint only, never
   exposure. Use it instead of adjusting temperature by hand; look at the photos it marks `check`.
 - `check_focus(path)`: focus of one photo at full size, plus a 100% crop of its sharpest area
