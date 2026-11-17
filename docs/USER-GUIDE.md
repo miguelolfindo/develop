@@ -252,6 +252,13 @@ The viewer shows the cropped size in pixels and the angle while you crop.
   says so if the spot is too dark or too bright to judge.
 - **As Shot:** the camera's own white balance.
 - **5500 K:** daylight.
+- **Auto:** Develop finds the white balance itself. When there are people in the photo it goes by
+  their skin: it finds the faces, judges their skin as if the faces were correctly exposed, and
+  cools (or warms) the picture until skin looks natural without turning pink. That is what makes
+  firelight, candles and tungsten come out right, where the camera leaves everything orange and
+  nothing in the picture is grey. Without faces it makes the grey and white parts neutral, and if
+  there is nothing to go by it changes nothing. Only temperature (and tint, from grey areas) is
+  changed, never exposure; a note under the button says what it went by, and **Undo** goes back.
 - **Tint:** -150 (green) to +150 (magenta), relative to the as-shot white balance.
 
 ### Tone
@@ -439,6 +446,15 @@ saved versions. Only edited or rated photos get one. Keep it with the photo when
 it, and the edit comes along. If a folder cannot be written to (a memory card, a read-only disk),
 the edit is kept in the settings folder instead.
 
+**Changes made by another program show at once.** While a folder is open, Develop is told when
+another program changes one of its `.dvlp` files: an AI assistant editing through Develop's MCP
+server, or a second copy of Develop. New ratings and versions appear in the filmstrip, and if the
+changed photo is the one you have open, its sliders and picture update and a note says *Edited by
+another program*; **Undo** brings back what you had. The newest change wins, so neither program
+saves an old copy over the other's. (Develop does not check the folder on a timer for this; the
+system tells it. On a shared folder on another computer it checks every few seconds instead.)
+Other photos' thumbnails show the camera's preview until you open them again.
+
 **The settings folder:** `%APPDATA%\Develop` on Windows, `~/Library/Application Support/Develop`
 on a Mac.
 
@@ -477,7 +493,7 @@ Develop protects your work while an assistant edits:
 - Versions you made can never be changed or removed by an assistant.
 
 Setup for each AI app, every tool and setting, good practice and privacy notes are in
-**[MCP.md](MCP.md)**, and a ready-made guide to give your assistant is in
+**[MCP.md](MCP.md)** (including `check_photos`, which lets an assistant measure a whole folder at once; focus checks that measure the full-size photo and show the assistant its sharpest area at 100%; `cull_photos`, which rates a whole shoot by focus, keeping the sharpest frame of each burst; and a skin-tone reading, so an assistant can judge white balance from people's faces in firelight or tungsten, where nothing in the picture is grey), and a ready-made guide to give your assistant is in
 **[develop-skill](develop-skill/SKILL.md)**.
 
 ---
@@ -547,7 +563,7 @@ For scripting and automation. On Windows the program is
 | Command | Does |
 |---|---|
 | `develop <photo>` | Open Develop on a photo |
-| `develop <photo> --export <out.jpg> [options]` | Export one photo and quit (format from the file extension: `.jpg`, `.png`, `.tif`) |
+| `develop <photo> --export <out.jpg> [options]` | Export one photo and quit, without opening a window (format from the file extension: `.jpg`, `.png`, `.tif`) |
 | `develop <first> [options] --batch-export <folder> <more photos…>` | Export several photos into a folder and quit |
 | `develop --to-dng <folder> [--embed] <raw files…>` | Convert raw files to DNG in a folder |
 | `develop --mcp` | MCP server on standard input / output (see [MCP.md](MCP.md)) |
@@ -574,7 +590,9 @@ Other `--name value` options set sliders for testing.
 - **Edits did not follow a copied photo.** Copy its `.dvlp` file along with it.
 - **A network computer is missing.** Add it by address in Network; on Windows, make sure network
   discovery is on; on a Mac, use Connect….
-- **Changes made by an AI assistant do not show.** Open the photo again.
+- **Changes made by an AI assistant do not show.** They normally appear within a second. On some
+  network shares Develop is not told about changes and checks every few seconds instead; wait a
+  moment, or open the folder again.
 - **Graphics problems.** The top bar shows which graphics system Develop uses; updating the
   graphics driver usually helps.
 - **macOS says the app is damaged or will not open.** See the README's

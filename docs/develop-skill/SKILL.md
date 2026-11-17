@@ -1,6 +1,6 @@
 ---
 name: develop-photo-editing
-description: Edit, rate, match, convert and export raw photos with the Develop raw editor through its MCP tools (list_photos, get_settings, set_settings, check_photo, render_preview, apply_preset, export and others). Use when the user asks for help with their photos, culling, a look or grade, black and white, white balance, matching a series, or exporting, and the Develop tools are available.
+description: Edit, rate, match, convert and export raw photos with the Develop raw editor through its MCP tools (list_photos, get_settings, set_settings, check_photo, check_photos, cull_photos, auto_white_balance, check_focus, render_preview, apply_preset, export and others). Use when the user asks for help with their photos, culling, a look or grade, black and white, white balance, matching a series, or exporting, and the Develop tools are available.
 ---
 
 # Working with photos in Develop
@@ -40,6 +40,21 @@ non-destructive and the original raw file is never touched.
 - `set_settings(path|paths, settings)`: change only the settings you name.
 - `check_photo(path)`: measure the photo as edited: histogram, clipping, contrast, colour cast,
   colours, brightness grid, sharpness, and plain-language notes.
+- `check_photos(folder|paths, start, count)`: measure many photos, one short row each (when
+  taken, rating, edited, sharpness, brightness, clipping, colour cast). Use it for any job over
+  more than a few photos; never call `check_photo` photo by photo across a folder. Call again with
+  `start = next_start` until `next_start` is null. Add `focus: true` to measure focus at full size.
+  When culling, group bursts by `taken`: frames seconds apart are one burst; a minute or more
+  apart are usually different shots, even when they look alike.
+- `cull_photos(folder)`: rate a whole folder by focus. Call it until `status` is `done` (each
+  call measures for about 35 seconds; measurements are kept), read the bursts marked `check`,
+  then call it again with `apply: true` to save the ratings. Use this for culling, not
+  `check_photos`.
+- `auto_white_balance(paths)`: Develop sets white balance itself, from skin when there are faces
+  (right for firelight and tungsten) or from the neutral areas; temperature and tint only, never
+  exposure. Use it instead of adjusting temperature by hand; look at the photos it marks `check`.
+- `check_focus(path)`: focus of one photo at full size, plus a 100% crop of its sharpest area
+  (pass `include_crop: false` if you cannot see images).
 - `render_preview(path, long_edge)`: see the photo as edited (1024 px is usually enough).
 - `save_version` / `list_versions` / `restore_version`: snapshots of an edit (yours are always
   named `AI · ...`).
@@ -63,7 +78,7 @@ usually stay well inside the range; big numbers are for deliberate looks.
 | `highlights` | -100 to 100 | -20 to -70 to recover skies and bright areas |
 | `shadows` | -100 to 100 | +15 to +50 to open dark areas |
 | `whites` / `blacks` | -100 to 100 | ±10 to ±30 to set the end points |
-| `temperature` | kelvin, 2000-12000; 0 = as shot | daylight 5000-6000, shade 6500-7500, tungsten 2800-3400 |
+| `temperature` | kelvin, 2000-12000; 0 = as shot. Higher = warmer, as in Lightroom. Absolute: `check_photo` reports the photo's `white_balance.as_shot_temperature`; to warm by 300, set that + 300 | daylight 5000-6000, shade 6500-7500, tungsten 2800-3400; JPEGs start at about 6500 |
 | `tint` | -150 to 150 relative to as shot | ±5 to ±20 |
 | `texture` / `clarity` | -100 to 100 | +10 to +30 for detail; negative to soften skin |
 | `dehaze` | -100 to 100 | +10 to +30 for haze; negative for a dreamy look |
@@ -87,10 +102,12 @@ Use this whether or not you can see images; it is the only way to check if you c
 | Crushed shadows | `clipping_percent.pure_black` | under 1% | above, unless meant to be dark: raise `shadows`, then `blacks` |
 | Overall brightness | `brightness.mean` | about 100-140 in daylight | far outside, unless night, low key or high key: `exposure` in small steps |
 | Contrast | `contrast.range_p5_to_p95` | about 120-235 | flat: `contrast`, `clarity`, `dehaze`; harsh: the reverse, or `shadows` up |
-| White balance | `neutral_areas` | both values within ±2.5 | `blue_minus_red_half` > 2.5: raise `temperature`; < -2.5: lower it. `green_minus_magenta` > 2.5: raise `tint`; < -2.5: lower it |
+| White balance | `neutral_areas` | both values within ±2.5 | `blue_minus_red_half` > 2.5: raise `temperature` from `white_balance.temperature_now`; < -2.5: lower it. `green_minus_magenta` > 2.5: raise `tint`; < -2.5: lower it. First step: about 150 K per level near 6500 K, 110 K near 5500 K, 35 K near 3000 K (a steady 3.5 mired per level; mired = 1,000,000 / kelvin), and about 3 of `tint` per level. Then measure again: in strongly coloured scenes (small `neutral_share_percent`) the readings move less, so step again rather than jumping |
+| White balance with people (warm light, little neutral) | `skin` | `saturation` about 0.36, `off_skin_line_deg` above -6 | Measured as if the faces were at 20% (Develop does that; do not change exposure for it). `saturation` well above 0.36: too warm, lower `temperature` and measure again; `off_skin_line_deg` below -6: too pink or cool, go back up. Change only `temperature` and `tint`. No face: no reading, use `neutral_areas` |
 | Colour strength | `saturation.very_saturated_percent` | under 5% | above: check the strongest colour in `colours`, lower its `hsl_saturation` |
 | Sky versus ground | `brightness_grid_3x3` rows | | a bright top row with blown sky: `highlights` down; dark bottom row: `shadows` up |
-| Sharpness (culling) | `detail` | | compare photos rendered at the same size; clearly lower = likely soft or missed focus |
+| Sharpness (texture) | `detail` | | compare photos rendered at the same size; not a focus test |
+| Focus (culling) | `check_photos` with `focus: true`, or `check_focus` | `focus_sharpest_edge_px` 2.5-3.5 | clearly wider than neighbouring frames of the same scene: missed focus or motion; over about 5.5: soft. Confirm with the crop from `check_focus` if you can see images |
 
 Read the `notes` first: they state the main findings with the slider to move. Then change one or
 two settings, run `check_photo` again, and compare with the previous numbers. Stop when the
@@ -122,10 +139,21 @@ Make one or two changes, preview, and repeat. Three small rounds beat one big gu
 ## Workflows
 
 ### Culling and rating
-1. `list_photos` for the folder; preview photos (small, e.g. `long_edge` 512) in batches.
-2. Suggest ratings with a reason ("sharp, eyes open, good expression" / "missed focus"). Apply
-   with `set_rating` once the user agrees, or straight away if they asked you to rate.
-3. Common scale: 1 reject-but-keep, 3 usable, 4 good, 5 portfolio.
+1. For focus, call `cull_photos(folder)` until `status` is `done`. Do not re-read or keep the
+   measuring replies; only the final one matters.
+2. Look only at the bursts with a `check` note: `check_focus` on the keeper (its crop shows
+   whether the sharp part is the subject) and change a suggestion with `set_rating` if needed.
+3. Call `cull_photos(folder, apply: true)` to save the ratings, then `list_photos(folder,
+   min_rating: 4)` for the keepers to edit. Tell the user how many photos got each rating.
+4. For things focus cannot judge (eyes closed, expression), preview the keepers small (e.g.
+   `long_edge` 512). Common scale: 1 reject-but-keep, 3 usable, 4 good, 5 portfolio.
+
+### Correcting colour
+1. `auto_white_balance` on the photos (a list of paths; call again while `remaining` is above 0).
+   It needs no numbers from you and never changes exposure.
+2. Look only at the photos with a `check` note, and at any the user cares most about; adjust by
+   hand there if needed (`check_photo` shows the readings).
+3. Then fix clipping and exposure photo by photo with `check_photo` and `set_settings`.
 
 ### A look for a whole shoot
 1. Pick a representative photo with the user.

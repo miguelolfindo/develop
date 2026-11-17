@@ -86,6 +86,9 @@ pub struct Store {
     /// Photos with changes not yet written.
     dirty: HashSet<PathBuf>,
     changed: Option<Instant>,
+    /// Each sidecar's text as Develop last wrote or read it ("" = no sidecar), so a change
+    /// to the file can be told apart from Develop's own saves.
+    known: HashMap<PathBuf, String>,
 }
 
 /// The app's settings folder: `%APPDATA%\Develop` on Windows,
@@ -219,7 +222,7 @@ fn sidecar_with(photo: &Path, extension: &str) -> PathBuf {
     photo.with_file_name(name)
 }
 
-const SIDECAR_EXTENSION: &str = "dvlp";
+pub const SIDECAR_EXTENSION: &str = "dvlp";
 /// Earlier versions' sidecar extension; such files are read and replaced by `.dvlp` ones.
 const LEGACY_SIDECAR_EXTENSION: &str = "srp";
 const SIDECAR_HEADER: &str = "Develop settings\t1";
@@ -312,7 +315,7 @@ impl Store {
             }
         }
         let central = photos.keys().chain(ratings.keys()).cloned().collect();
-        Self { file, photos, ratings, versions: HashMap::new(), central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None }
+        Self { file, photos, ratings, versions: HashMap::new(), central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None, known: HashMap::new() }
     }
 
     /// Read the sidecars of a folder (once), and move any settings the central file still
@@ -339,6 +342,9 @@ impl Store {
                 self.touch(&photo);
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if !legacy {
+                self.known.insert(photo.clone(), text.clone());
+            }
             let (saved, rating, versions) = parse_sidecar(&text);
             match versions.is_empty() {
                 true => self.versions.remove(&photo),
@@ -362,6 +368,67 @@ impl Store {
         for photo in to_move {
             self.touch(&photo);
         }
+    }
+
+    /// Read `photo`'s sidecar again after another program changed it (an AI assistant through
+    /// the MCP server, another copy of Develop). Its settings, rating and versions replace what
+    /// is remembered, even changes not yet written: the newer change wins. Returns true when
+    /// anything changed; Develop's own saves and unchanged files return false.
+    pub fn reload_sidecar(&mut self, photo: &Path) -> bool {
+        let text = std::fs::read_to_string(sidecar_path(photo)).unwrap_or_default();
+        // No sidecar and none known: nothing was removed (a photo kept in the central file
+        // because its folder cannot be written has none).
+        if self.known.get(photo) == Some(&text) || (text.is_empty() && !self.known.contains_key(photo)) {
+            return false;
+        }
+        self.known.insert(photo.to_path_buf(), text.clone());
+        let (saved, rating, versions) = parse_sidecar(&text);
+        let changed = self.photos.get(photo) != saved.as_ref() || self.rating(photo) != rating || self.versions(photo) != versions.as_slice();
+        match saved {
+            Some(saved) => self.photos.insert(photo.to_path_buf(), saved),
+            None => self.photos.remove(photo),
+        };
+        match rating {
+            0 => self.ratings.remove(photo),
+            stars => self.ratings.insert(photo.to_path_buf(), stars),
+        };
+        match versions.is_empty() {
+            true => self.versions.remove(photo),
+            false => self.versions.insert(photo.to_path_buf(), versions),
+        };
+        self.dirty.remove(photo);
+        if !text.is_empty() && self.central.remove(photo) {
+            self.central_changed = true;
+            self.changed = Some(Instant::now());
+        }
+        changed
+    }
+
+    /// Read a folder's sidecars, and read again any that changed since (for the MCP server,
+    /// which runs beside the app: edits made in the app must not be written over).
+    pub fn load_folder_fresh(&mut self, dir: &Path) {
+        if self.folders.contains(dir) {
+            for photo in self.photos_in(dir) {
+                self.reload_sidecar(&photo);
+            }
+        } else {
+            self.load_folder(dir);
+        }
+    }
+
+    /// Every photo of `dir` that has a sidecar or that Develop remembers something for: the
+    /// ones to read again when too much changed in the folder to be told which.
+    pub fn photos_in(&self, dir: &Path) -> Vec<PathBuf> {
+        let mut photos: HashSet<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(SIDECAR_EXTENSION)))
+            .map(|p| p.with_extension(""))
+            .collect();
+        let remembered = self.photos.keys().chain(self.ratings.keys()).chain(self.versions.keys()).chain(self.known.keys());
+        photos.extend(remembered.filter(|p| p.parent() == Some(dir)).cloned());
+        photos.into_iter().collect()
     }
 
     fn touch(&mut self, photo: &Path) {
@@ -450,6 +517,7 @@ impl Store {
                 let _ = std::fs::remove_file(&sidecar);
                 let _ = std::fs::remove_file(&legacy);
                 self.central_changed |= self.central.remove(&photo);
+                self.known.insert(photo, String::new());
                 continue;
             }
             let mut text = format!("{SIDECAR_HEADER}\n");
@@ -465,6 +533,7 @@ impl Store {
             if write_whole(&sidecar, &text) {
                 self.central_changed |= self.central.remove(&photo);
                 let _ = std::fs::remove_file(&legacy);
+                self.known.insert(photo, text);
             } else {
                 // The folder cannot be written (a card, a read-only disk): keep it centrally.
                 self.central.insert(photo);
@@ -760,5 +829,59 @@ mod tests {
         assert_eq!(out.values[1], 2.0);
         assert_eq!(out.crop, [0.0, 0.2, 1.0, 0.8]);
         assert_eq!(out.values[0], 3200.0, "white balance only when the preset carries it");
+    }
+
+    /// A sidecar changed by another program is taken in, Develop's own saves are not, and a
+    /// photo kept only in the central file is not wiped for having no sidecar.
+    #[test]
+    fn outside_changes_are_taken_in() {
+        let dir = std::env::temp_dir().join(format!("develop-test-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("DSC00001.ARW");
+        let central = dir.join("DSC00002.ARW");
+        let mut store = Store {
+            file: None,
+            photos: HashMap::from([(central.clone(), sample())]),
+            ratings: HashMap::new(),
+            versions: HashMap::new(),
+            central: HashSet::from([central.clone()]),
+            central_changed: false,
+            folders: HashSet::new(),
+            dirty: HashSet::new(),
+            changed: None,
+            known: HashMap::new(),
+        };
+        // Develop's own save is not a change.
+        let mut mine = sample();
+        mine.values[1] = 0.5;
+        store.put(&photo, mine.clone());
+        store.set_rating(&photo, 2);
+        store.flush(true);
+        assert!(!store.reload_sidecar(&photo));
+        // Another program's save wins, even over a change not yet written.
+        let mut theirs = sample();
+        theirs.values[1] = -0.3;
+        store.put(&photo, mine.clone());
+        let text = format!("{SIDECAR_HEADER}
+settings	{}
+rating	4
+", saved_fields(&theirs));
+        std::fs::write(sidecar_path(&photo), text).unwrap();
+        assert!(store.reload_sidecar(&photo));
+        assert_eq!(store.get(&photo), Some(&theirs));
+        assert_eq!(store.rating(&photo), 4);
+        assert!(!store.dirty.contains(&photo));
+        assert!(!store.reload_sidecar(&photo), "read once");
+        // Removed by the other program: back to nothing.
+        std::fs::remove_file(sidecar_path(&photo)).unwrap();
+        assert!(store.reload_sidecar(&photo));
+        assert_eq!(store.get(&photo), None);
+        assert_eq!(store.rating(&photo), 0);
+        // The central-only photo keeps its settings.
+        assert!(store.photos_in(&dir).contains(&central));
+        assert!(!store.reload_sidecar(&central));
+        assert!(store.contains(&central));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

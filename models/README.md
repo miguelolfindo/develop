@@ -1,3 +1,18 @@
+# Models
+
+## Face detector
+
+`face_detection_yunet_2023mar.onnx` finds faces for the skin-tone reading in the MCP server's
+`check_photo` (see `src/skin.rs`).
+
+- **Source:** [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet),
+  `models/face_detection_yunet/face_detection_yunet_2023mar.onnx`, unchanged (232,589 bytes;
+  SHA-256 `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`).
+- **Model:** YuNet, by Shiqi Yu and others (*YuNet: A Tiny Millisecond-level Face Detector*,
+  Machine Intelligence Research, 2023).
+- **License:** MIT (Copyright (c) 2020 Shiqi Yu), which allows use in this GPL program; the full
+  text is in `LICENSE-YuNet.txt` and ships with the model.
+
 # AI noise reduction models
 
 Develop's AI noise reduction uses the RawNIND models, as packaged by darktable:

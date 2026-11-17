@@ -44,7 +44,15 @@ Where the program is:
 - **macOS:** `/Applications/Develop.app/Contents/MacOS/develop`
 
 You do not need to start anything by hand for the first kind: the AI app starts Develop when it
-needs it and stops it afterwards. Develop itself can be open or closed meanwhile.
+needs it and stops it afterwards. Develop itself can be open or closed meanwhile. If it is open
+on the same folder, you see the assistant's work as it happens: its ratings and versions appear
+in the filmstrip, and the photo you have open updates when the assistant edits it (Undo goes
+back). Edits you make in Develop meanwhile are read by the server before it changes that photo,
+so neither side saves an old copy over the other's.
+
+To measure or preview a photo, the server renders it with Develop's own engine on the graphics
+card, without opening a window, so nothing appears on screen or in the taskbar while an
+assistant works.
 
 ## AI versions
 
@@ -298,6 +306,10 @@ which returns an image.
 | `save_version` | Save the photo's current edit as a version (named `AI · <name>`) | `path`, `name` (optional) |
 | `restore_version` | Make a saved version the current edit (itself saved as an AI version) | `path`, `name` |
 | `check_photo` | Render the photo with its edit and measure it: histogram, clipping, contrast, colour cast, colours, sharpness, plus plain-language notes | `path`, `long_edge` (256-2000, default 800) |
+| `check_photos` | Measure many photos at once and return one short row per photo: when it was taken, rating, edited, sharpness (`detail`), mean brightness, clipping and the colour cast in neutral areas; with `focus: true`, also the full-size focus measurement. Up to `count` photos per call; call again with `next_start` until it is null | `folder` or `paths`, `start` (default 0), `count` (1-60, default 30), `long_edge` (256-2000, default 512), `focus` (default false) |
+| `cull_photos` | Rate a whole folder by focus: group the photos into bursts by capture time and suggest 4 stars for each burst's sharpest frame, 3 for frames nearly as sharp and 1 for the rest. Returns one short row per burst, with those worth a look marked; `apply: true` saves the ratings. A large folder takes several calls while it measures (status `measuring`); measurements are kept | `folder`, `apply` (default false), `replace_ratings` (default false), `gap_seconds` (default 60), `sharp_px` (3.5), `near_px` (0.5), `soft_px` (5.5) |
+| `auto_white_balance` | Let Develop set the white balance itself, as the **Auto** button does: from skin when there are faces, else from the neutral areas; temperature (and tint) only, never exposure. Saved in the photo's AI version. Returns per photo the temperature, the method, readings before and after, and a `check` note when worth a look. About a second per photo, four at a time | `paths` (or `path`) |
+| `check_focus` | Measure focus on the full-size photo and return a 100% crop (512 x 512 px) of its sharpest area | `path`, `include_crop` (default true) |
 | `render_preview` | Render the photo with its edit and return the picture | `path`, `long_edge` (256-3000, default 1024) |
 | `export` | Write JPEG, PNG or TIFF files with each photo's edit | `path`/`paths`, `folder`, `format`, `long_edge`, `quality` |
 | `convert_to_dng` | Lossless DNG copies of raw files | `path`/`paths`, `folder` (default: beside the original), `embed_original` |
@@ -348,7 +360,7 @@ brought inside it.
 
 | Setting | Range | Notes |
 |---|---|---|
-| `temperature` | 2000-12000 K, or 0 | 0 means the camera's own white balance (as shot) |
+| `temperature` | 2000-12000 K, or 0 | 0 means the camera's own white balance (as shot). Higher is warmer, as in Lightroom. The value is absolute; `check_photo` reports the photo's own `as_shot_temperature` and the `temperature_now` in use, so a change can be made relative to them (JPEGs start at about 6500 K). As a first step, each level of `blue_minus_red_half` takes about 150 K near 6500 K, 110 K near 5500 K and 35 K near 3000 K, and each level of `green_minus_magenta` about 3 of `tint`; then measure again |
 | `tint` | -150 to 150 | Relative to as shot: negative greener, positive more magenta |
 | `exposure` | -5 to 5 | Stops |
 | `contrast`, `highlights`, `shadows`, `whites`, `blacks` | -100 to 100 | Lightroom's scales |
@@ -384,6 +396,8 @@ and returns, on the 0-255 levels of the finished picture:
 | `clipping_percent` | Pure white (all channels at maximum), any channel at maximum, per channel, pure black |
 | `zones_percent` | Share of deep shadows, shadows, midtones, highlights and the brightest tones |
 | `contrast` | Standard deviation of brightness, and the p5 to p95 range |
+| `skin` | Skin tone of the faces in the photo (found with a small face detector), measured as if the faces were at 20% brightness (Develop shifts exposure for the measurement only; the edit is not changed): `saturation` (about 0.36 looks natural; higher is too warm), `off_skin_line_deg` (hue against the skin line on Develop's vectorscope; below about -6 is too pink or cool), `faces`, and a plain `reading`. For white balance where nothing in the photo is grey or white, such as firelight and tungsten. No face, no reading |
+| `white_balance` | The photo's own `as_shot_temperature` and the `temperature_now` in use |
 | `neutral_areas` | Colour cast measured on low-colour areas: `blue_minus_red_half` (too cool if positive) and `green_minus_magenta` (too green if positive); within about ±2.5 is neutral |
 | `whole_picture_balance` | The same over all mid-tones, a rough backup when there are no grey areas |
 | `saturation` | Average saturation, and how much is very strongly coloured |
@@ -419,6 +433,74 @@ Rough guides (every photo is different, and the photographer's intent wins):
 A good loop: `check_photo` before an edit, change one or two settings with `set_settings`,
 `check_photo` again, compare.
 
+### Many photos: check_photos
+
+A full `check_photo` report is a few thousand characters. For a whole folder (culling for focus,
+finding colour casts across a shoot), use `check_photos` instead: it measures up to 60 photos per
+call (30 by default, four at a time) and returns one row each, in a fraction of the space, so a
+model with a small context does not run out of room. A call stops starting new measurements after
+about 35 seconds, so it returns before most assistants' tool timeout, and may return fewer photos
+than `count`. Each response has `columns`, `rows`, `total` and `next_start`; call again with
+`start` set to `next_start` until it is `null`. Each row includes `taken`, when the photo was
+taken by the camera's clock, so an assistant can tell a burst (frames seconds apart) from
+separate shots of a similar scene.
+`detail` is only comparable between photos of the same scene rendered at the same size, so compare
+neighbouring frames. Then use `check_photo` on the few photos you are going to edit.
+
+### Focus: check_focus, and check_photos with focus
+
+`detail` is measured on a small render and averaged over the whole picture, so it cannot tell a
+slightly missed focus or a sharp subject on a soft background. For focus, Develop measures the
+**full-size** picture instead: it finds edges that rise clearly above the photo's noise, measures
+how many pixels each takes to go from dark to light, and reports the sharpest area of the photo.
+
+| Field | What it tells |
+|---|---|
+| `sharpest_edge_px` | Edge width in full-size pixels in the sharpest area. About 2.7 is the sharpest this can read; crisp detail usually reads 2.5-3.5; bigger is softer |
+| `sharpest_edge_across_px`, `sharpest_edge_down_px` | The same, for edges crossed left to right and top to bottom. A large difference can mean motion blur or camera shake in the softer direction (or few edges that way in that area) |
+| `sharpest_at` | Where the sharpest area is, as fractions of the width and height (0, 0 = top left) |
+| `median_edge_px` | Typical of the whole picture: high with a shallow depth of field |
+| `verdict` | sharp (up to 3.5), slightly soft (up to 5.5) or soft |
+
+`check_focus` also returns the sharpest area as a 100% crop, 512 x 512 px and not resized, so an
+assistant that can see images can confirm that it is the subject (an eye, not the background) and
+that it looks sharp. `check_photos` with `focus: true` adds `focus_sharpest_edge_px`,
+`focus_median_edge_px` and `focus_sharpest_at` to every row; it is slower (about 1-2 seconds per
+photo), so use it when culling for focus.
+
+The numbers are a guide, best for comparing frames of the same scene (a burst, neighbouring
+shots): a frame clearly softer than its neighbours missed focus or moved. They are measured on the
+photo as edited, so sharpening, texture and clarity make edges steeper, and very noisy photos read
+less reliably.
+
+### Culling a folder: cull_photos
+
+Rating a shoot by focus is mostly arithmetic, so Develop does it and the assistant only reviews.
+`cull_photos` measures every photo's focus as above (about a second or two per photo; a call stops
+after about 35 seconds with `status: "measuring"`, so a large folder takes several calls with the
+same arguments). The measurements are kept in the settings folder until the photo or its edit
+changes, so calling again, even in a new session, measures nothing twice.
+
+When everything is measured (`status: "done"`), it groups the photos into **bursts**: frames taken
+within `gap_seconds` (60) of the one before. In each burst:
+
+| Stars | Which frames |
+|---|---|
+| 4 | The sharpest frame, if its edge width is at most `soft_px` (5.5) |
+| 3 | Frames at most `sharp_px` (3.5) wide and within `near_px` (0.5) of the sharpest |
+| 1 | Everything else, including whole bursts where even the sharpest frame is soft |
+
+It returns one row per burst (first and last file, number of frames, when, the keeper and its edge
+width, the 3-star frames) and a `check` note on bursts worth a look: a keeper that is only
+slightly sharp, a sharpest area near the edge of the frame (perhaps the background, not the
+subject), two frames almost equally sharp, or a soft burst close to the limit. An assistant that
+can see images can open those keepers with `check_focus`. Nothing is rated until it is called with
+`apply: true`; photos that already have a rating keep it unless `replace_ratings: true`.
+
+A 400-photo folder takes about 10-15 minutes to measure (longer while a local AI model is using the
+same graphics card) and then rates in one call, instead of the assistant reading and rating 20 rows
+at a time.
+
 ## Good practice
 
 For people and for assistants:
@@ -436,8 +518,9 @@ For people and for assistants:
    `temperature` and `tint`, then fix exposure photo by photo.
 6. **Try things on a copy.** For a big experiment, copy the folder (with its `.dvlp` files) and point
    the assistant at the copy.
-7. **Close the photo in Develop.** If Develop is open on the same photo while an assistant edits it,
-   whichever saves last wins. Develop shows the assistant's changes when you open the photo again.
+7. **Watch in Develop if you like.** With Develop open on the same folder, the assistant's ratings,
+   versions and edits appear as they are saved, and the open photo updates (Undo goes back). The
+   newest change wins, so avoid editing the same photo at the same moment as the assistant.
 8. **Keep previews small.** 1024 pixels is plenty to judge a look and keeps conversations fast;
    use larger previews only to check fine detail.
 9. **Ask before exporting or resetting many photos.** Exports write files; a reset clears the edit
@@ -466,8 +549,10 @@ For people and for assistants:
   photo opens in Develop itself. A window may flash briefly while a render runs.
 - **Slow exports time out.** Export fewer photos per call, or raise the app's tool timeout (see
   Gemini CLI above; other apps have similar settings).
-- **Changes do not appear in Develop.** Open the photo again (or another photo and back). Ratings and
-  edits made through MCP are already saved in the `.dvlp` files.
+- **Changes do not appear in Develop.** They should appear within a second in the open folder. If they
+  do not (some network shares do not report changes promptly; Develop then checks every few
+  seconds), wait a moment or open the folder again. Ratings and edits made through MCP are already
+  saved in the `.dvlp` files.
 - **`--mcp-http` prints nothing on Windows.** Run it from a terminal (Windows Terminal, PowerShell).
   The address and token are also in `mcp-http.txt` in the settings folder.
 - **401 Unauthorized.** The `Authorization: Bearer <token>` header is missing or the token is wrong.

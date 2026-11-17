@@ -55,7 +55,11 @@ static ENGINES: [OnceLock<Result<Engine, String>>; 2] = [OnceLock::new(), OnceLo
 /// A model file: `models/<name>` beside the program, in a folder above it (development),
 /// or in the app bundle's Resources (macOS).
 pub fn model_path(model: Model) -> Option<PathBuf> {
-    let file = model.file();
+    find_model(model.file())
+}
+
+/// Any model file by name, looked for as `model_path` does (also used by skin.rs).
+pub fn find_model(file: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     exe.ancestors()
         .skip(1)
@@ -64,15 +68,20 @@ pub fn model_path(model: Model) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The process's ONNX Runtime environment (one per process, shared by every model).
+pub fn environment() -> Result<&'static ort::environment::Environment, String> {
+    ENVIRONMENT
+        .get_or_init(|| ort::init().with_name("develop").build().map_err(|e| format!("ONNX Runtime: {e}")))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
 fn engine(model: Model) -> Result<&'static Engine, String> {
     ENGINES[model as usize]
         .get_or_init(|| {
             let path = model_path(model).ok_or_else(|| format!("The denoise model ({}) was not found.", model.file()))?;
             let text = |e: ort::Error| format!("ONNX Runtime: {e}");
-            let environment = ENVIRONMENT
-                .get_or_init(|| ort::init().with_name("develop").build().map_err(|e| format!("ONNX Runtime: {e}")))
-                .as_ref()
-                .map_err(|e| e.clone())?;
+            let environment = environment()?;
             // GPU first (DirectML on any DirectX 12 card, CoreML on a Mac); the processor if that
             // fails. darktable found the Bayer model overflows in half precision on Apple's GPU and
             // Neural Engine, so on a Mac that one runs on the processor.

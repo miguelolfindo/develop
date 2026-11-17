@@ -140,6 +140,8 @@ struct Server {
     /// next request).
     rounds: std::collections::HashMap<PathBuf, Round>,
     last_call: Option<std::time::Instant>,
+    /// Focus measurements kept between calls and runs (see `cull.rs`), read when first needed.
+    focus_cache: Option<crate::cull::Cache>,
 }
 
 /// The AI edits on a photo in one request: the version they go into (found by its time stamp,
@@ -160,7 +162,7 @@ pub const AI_PREFIX: &str = "AI · ";
 
 impl Server {
     fn new() -> Self {
-        Self { store: settings::Store::load(), presets: settings::Presets::load(), client: "assistant".into(), rounds: Default::default(), last_call: None }
+        Self { store: settings::Store::load(), presets: settings::Presets::load(), client: "assistant".into(), rounds: Default::default(), last_call: None, focus_cache: None }
     }
 
     /// THE RULE FOR AI EDITS, enforced here whatever the assistant is told:
@@ -281,14 +283,14 @@ impl Server {
     }
 
     fn call(&mut self, name: &str, args: &Value) -> Result<Vec<Value>, String> {
-        let text = |v: Value| Ok(vec![json!({"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()})]);
+        let text = |v: Value| Ok(vec![json!({"type": "text", "text": serde_json::to_string(&v).unwrap_or_default()})]);
         match name {
             "list_photos" => {
                 let folder = PathBuf::from(args["folder"].as_str().ok_or("folder is required")?);
                 if !folder.is_dir() {
                     return Err(format!("{} is not a folder", folder.display()));
                 }
-                self.store.load_folder(&folder);
+                self.store.load_folder_fresh(&folder);
                 let min_rating = args["min_rating"].as_u64().unwrap_or(0) as u8;
                 let mut photos: Vec<PathBuf> = std::fs::read_dir(&folder)
                     .map_err(|e| e.to_string())?
@@ -410,16 +412,294 @@ impl Server {
             "check_photo" => {
                 let path = self.photo(args)?;
                 let long_edge = args["long_edge"].as_u64().unwrap_or(800).clamp(256, 2000);
-                // PNG, so clipping and the darkest and brightest levels are exact.
-                let out = std::env::temp_dir().join(format!("develop-mcp-check-{}.png", std::process::id()));
-                render(&path, &out, &[("--export-long", long_edge.to_string())])?;
-                let picture = image::open(&out).map_err(|e| format!("Could not read the render: {e}"));
-                let _ = std::fs::remove_file(&out);
-                let rgb = picture?.to_rgb8();
-                let mut report = crate::measure::measure(rgb.as_raw(), rgb.width() as usize, rgb.height() as usize);
+                let (mut report, _) = measure_photo(&path, long_edge, 0, false, true)?;
                 report["path"] = json!(path.display().to_string());
                 report["settings_summary"] = settings_summary(self.store.get(&path));
                 text(report)
+            }
+            "check_photos" => {
+                // Many photos at once, one short row each, so a model can survey a whole folder
+                // without filling its context with full check_photo reports.
+                let all: Vec<PathBuf> = match args["folder"].as_str() {
+                    Some(folder) => {
+                        let folder = PathBuf::from(folder);
+                        if !folder.is_dir() {
+                            return Err(format!("{} is not a folder", folder.display()));
+                        }
+                        self.store.load_folder_fresh(&folder);
+                        let mut list: Vec<PathBuf> = std::fs::read_dir(&folder)
+                            .map_err(|e| e.to_string())?
+                            .filter_map(|e| e.ok().map(|e| e.path()))
+                            .filter(|p| crate::filmstrip::is_raw(p) || is_picture(p))
+                            .collect();
+                        list.sort();
+                        list
+                    }
+                    None => self.photos(args)?,
+                };
+                let start = (args["start"].as_u64().unwrap_or(0) as usize).min(all.len());
+                let count = args["count"].as_u64().unwrap_or(30).clamp(1, 60) as usize;
+                let long_edge = args["long_edge"].as_u64().unwrap_or(512).clamp(256, 2000);
+                let focus = args["focus"].as_bool().unwrap_or(false);
+                let batch = &all[start..(start + count).min(all.len())];
+                // A few renders at a time; each is its own Develop process. Stop starting new ones
+                // after BATCH_SECONDS so the call returns before the client's tool timeout (often 60
+                // seconds); next_start then continues where it stopped.
+                let started = std::time::Instant::now();
+                let mut reports: Vec<Result<Value, String>> = Vec::with_capacity(batch.len());
+                for (n, group) in batch.chunks(4).enumerate() {
+                    if started.elapsed().as_secs() >= BATCH_SECONDS {
+                        break;
+                    }
+                    let results: Vec<Result<Value, String>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = group.iter().enumerate().map(|(i, p)| s.spawn(move || measure_photo(p, long_edge, n * 4 + i + 1, focus, false).map(|r| r.0))).collect();
+                        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("measuring failed".into()))).collect()
+                    });
+                    reports.extend(results);
+                }
+                let mut rows = Vec::new();
+                let mut failed = Vec::new();
+                let batch = &batch[..reports.len()];
+                for (path, report) in batch.iter().zip(reports) {
+                    let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    match report {
+                        Ok(r) => {
+                            let mut row = vec![
+                                json!(file),
+                                json!(crate::filmstrip::capture_date(path)),
+                                json!(self.store.rating(path)),
+                                json!(self.store.contains(path)),
+                                r["detail"].clone(),
+                                r["brightness"]["mean"].clone(),
+                                r["clipping_percent"]["pure_white_all_channels"].clone(),
+                                r["clipping_percent"]["any_channel_at_max"].clone(),
+                                r["clipping_percent"]["pure_black"].clone(),
+                                r["neutral_areas"]["blue_minus_red_half"].clone(),
+                                r["neutral_areas"]["green_minus_magenta"].clone(),
+                                r["neutral_areas"]["share_percent"].clone(),
+                            ];
+                            if focus {
+                                row.push(r["focus"]["sharpest_edge_px"].clone());
+                                row.push(r["focus"]["median_edge_px"].clone());
+                                row.push(r["focus"]["sharpest_at"].clone());
+                            }
+                            rows.push(Value::Array(row));
+                        }
+                        Err(e) => failed.push(format!("{file}: {e}")),
+                    }
+                }
+                let next = start + batch.len();
+                let mut columns = vec!["file", "taken", "rating", "edited", "detail", "mean", "white_clip_pct", "any_channel_max_pct", "black_clip_pct", "neutral_blue_minus_red", "neutral_green_minus_magenta", "neutral_share_pct"];
+                if focus {
+                    columns.extend(["focus_sharpest_edge_px", "focus_median_edge_px", "focus_sharpest_at"]);
+                }
+                text(json!({
+                    "total": all.len(),
+                    "start": start,
+                    "next_start": if next < all.len() { json!(next) } else { Value::Null },
+                    "columns": columns,
+                    "rows": rows,
+                    "failed": failed,
+                    "how_to_read": "taken: when the photo was taken (camera clock, YYYY:MM:DD HH:MM:SS); frames seconds apart are one burst or scene, a gap of a minute or more usually means a different shot. detail: sharpness and texture at this render size, higher is sharper; compare frames of the same scene (neighbours), not different scenes. mean: brightness 0-255. neutral_*: colour cast in low-colour areas (positive blue_minus_red = too cool, raise temperature; positive green_minus_magenta = too green, raise tint), unreliable when neutral_share_pct is small. focus_* (with focus: true): edge width in pixels at full size of the sharpest area, about 2.7 at best and crisp detail 2.5-3.5, bigger is softer; compare frames of the same scene; focus_sharpest_at is where (fractions of width and height). Call again with start = next_start until it is null; use check_photo for the full report on one photo, and check_focus to see the sharpest area.",
+                }))
+            }
+            "cull_photos" => {
+                let folder = PathBuf::from(args["folder"].as_str().ok_or("folder is required")?);
+                if !folder.is_dir() {
+                    return Err(format!("{} is not a folder", folder.display()));
+                }
+                self.store.load_folder_fresh(&folder);
+                let mut all: Vec<PathBuf> = std::fs::read_dir(&folder)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| crate::filmstrip::is_raw(p) || is_picture(p))
+                    .collect();
+                all.sort();
+                let rules = crate::cull::Rules {
+                    gap: args["gap_seconds"].as_u64().unwrap_or(60).clamp(1, 3600) as i64,
+                    sharp: args["sharp_px"].as_f64().unwrap_or(3.5).clamp(2.0, 10.0) as f32,
+                    near: args["near_px"].as_f64().unwrap_or(0.5).clamp(0.0, 5.0) as f32,
+                    soft: args["soft_px"].as_f64().unwrap_or(5.5).clamp(2.0, 20.0) as f32,
+                };
+                let cache = self.focus_cache.get_or_insert_with(crate::cull::Cache::load);
+                // Measure what is not kept yet, a few at a time, for up to BATCH_SECONDS.
+                let keys: Vec<String> = all.iter().map(|p| crate::cull::key(p)).collect();
+                let todo: Vec<usize> = (0..all.len()).filter(|&i| cache.get(&all[i], &keys[i]).is_none()).collect();
+                let started = std::time::Instant::now();
+                let mut failed = Vec::new();
+                let mut measured_now = 0;
+                for (n, group) in todo.chunks(4).enumerate() {
+                    if started.elapsed().as_secs() >= BATCH_SECONDS {
+                        break;
+                    }
+                    let results: Vec<Result<Value, String>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = group
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &k)| {
+                                let p = &all[k];
+                                s.spawn(move || measure_photo(p, 256, n * 4 + i + 1, true, false).map(|r| r.0))
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("measuring failed".into()))).collect()
+                    });
+                    for (&k, result) in group.iter().zip(results) {
+                        let path = &all[k];
+                        let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                        match result {
+                            Ok(r) if r["focus"].is_object() => {
+                                let f = &r["focus"];
+                                let num = |v: &Value| v.as_f64().map(|v| v as f32);
+                                let at = match (num(&f["sharpest_at"][0]), num(&f["sharpest_at"][1])) {
+                                    (Some(x), Some(y)) => Some([x, y]),
+                                    _ => None,
+                                };
+                                let measured = crate::cull::Measured {
+                                    taken: crate::filmstrip::capture_date(path),
+                                    sharpest: num(&f["sharpest_edge_px"]),
+                                    median: num(&f["median_edge_px"]),
+                                    at,
+                                };
+                                cache.put(path, keys[k].clone(), measured);
+                                measured_now += 1;
+                            }
+                            Ok(_) => failed.push(format!("{file}: focus could not be measured")),
+                            Err(e) => failed.push(format!("{file}: {e}")),
+                        }
+                    }
+                }
+                cache.save();
+                let shots: Vec<(usize, crate::cull::Measured)> = (0..all.len()).filter_map(|i| cache.get(&all[i], &keys[i]).map(|m| (i, m.clone()))).collect();
+                if shots.len() + failed.len() < all.len() {
+                    return text(json!({
+                        "status": "measuring",
+                        "measured": shots.len(),
+                        "total": all.len(),
+                        "remaining": all.len() - shots.len(),
+                        "measured_this_call": measured_now,
+                        "failed": failed,
+                        "next": "Call cull_photos again with the same folder to continue. Measurements are kept, so nothing is measured twice; you do not need to remember anything from this reply.",
+                    }));
+                }
+                let measured: Vec<crate::cull::Measured> = shots.iter().map(|(_, m)| m.clone()).collect();
+                let bursts = crate::cull::cull(&measured, &rules);
+                let apply = args["apply"].as_bool().unwrap_or(false);
+                let replace = args["replace_ratings"].as_bool().unwrap_or(false);
+                let (mut counts, mut kept, mut changed) = ([0usize; 6], 0, 0);
+                let mut rows = Vec::new();
+                let name = |i: usize| all[shots[i].0].file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                for burst in &bursts {
+                    for (&i, &stars) in burst.photos.iter().zip(&burst.stars) {
+                        counts[stars as usize] += 1;
+                        if apply {
+                            let path = &all[shots[i].0];
+                            let current = self.store.rating(path);
+                            if current != 0 && !replace {
+                                kept += 1;
+                            } else if current != stars {
+                                self.store.set_rating(path, stars);
+                                changed += 1;
+                            }
+                        }
+                    }
+                    let first = burst.photos[0];
+                    let last = *burst.photos.last().unwrap_or(&first);
+                    let seconds: Vec<String> = burst.photos.iter().zip(&burst.stars).filter(|(_, s)| **s == 3).map(|(i, _)| name(*i)).collect();
+                    let keeper = burst.photos.iter().zip(&burst.stars).find(|(_, s)| **s == 4).map(|(i, _)| *i);
+                    rows.push(json!([
+                        name(first),
+                        if last == first { Value::Null } else { json!(name(last)) },
+                        burst.photos.len(),
+                        measured[first].taken,
+                        keeper.map(name),
+                        burst.best.and_then(|b| measured[b].sharpest).map(|w| (w as f64 * 100.0).round() / 100.0),
+                        seconds,
+                        if burst.check.is_empty() { Value::Null } else { json!(burst.check.join("; ")) },
+                    ]));
+                }
+                if apply {
+                    self.store.flush(true);
+                }
+                let mut report = json!({
+                    "status": "done",
+                    "total": all.len(),
+                    "bursts": bursts.len(),
+                    "suggested_stars": {"4": counts[4], "3": counts[3], "1": counts[1]},
+                    "columns": ["first", "last", "frames", "taken", "keeper_4_stars", "best_edge_px", "seconds_3_stars", "check"],
+                    "rows": rows,
+                    "failed": failed,
+                    "how_to_read": "One row per burst (frames taken within gap_seconds of the one before), in capture order; last is null for a single frame. keeper_4_stars is the burst's sharpest frame (null when even that is soft, so every frame gets 1 star); best_edge_px is its edge width; seconds_3_stars are frames nearly as sharp; every other frame gets 1 star. Edge widths are in full-size pixels: about 2.7 at best, 2.5-3.5 crisp, bigger is softer. check says why a burst is worth a look: use check_focus on its keeper to see a 100% crop of the sharpest area, and set_rating to change a suggestion.",
+                });
+                if apply {
+                    report["applied"] = json!({"ratings_changed": changed, "already_rated_kept": kept});
+                    if kept > 0 {
+                        report["note"] = json!("Photos that already had a rating kept it; pass replace_ratings: true to replace those too.");
+                    }
+                } else {
+                    report["next"] = json!("Nothing is rated yet. Call again with apply: true to save these ratings (photos that already have a rating keep it unless replace_ratings: true).");
+                }
+                text(report)
+            }
+            "auto_white_balance" => {
+                // Develop finds each photo's white balance itself (see autowb.rs), four photos at a
+                // time, and the result goes into the photo's AI version like any other edit.
+                let paths = self.photos(args)?;
+                let started = std::time::Instant::now();
+                let mut results: Vec<(PathBuf, Result<Value, String>)> = Vec::new();
+                for (n, group) in paths.chunks(4).enumerate() {
+                    if started.elapsed().as_secs() >= BATCH_SECONDS {
+                        break;
+                    }
+                    let found: Vec<Result<Value, String>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = group.iter().enumerate().map(|(i, p)| s.spawn(move || auto_wb(p, n * 4 + i + 1))).collect();
+                        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("measuring failed".into()))).collect()
+                    });
+                    results.extend(group.iter().cloned().zip(found));
+                }
+                let mut rows = Vec::new();
+                for (path, result) in &results {
+                    let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    match result {
+                        Ok(r) if r["error"].is_null() => {
+                            if r["method"] != "unchanged" {
+                                let (k, tint) = (r["temperature"].as_f64().unwrap_or(0.0) as f32, r["tint"].as_f64().unwrap_or(0.0) as f32);
+                                self.ai_edit(path, "auto white balance", false, |base| {
+                                    let mut saved = base.clone();
+                                    saved.values[0] = k;
+                                    saved.tint = tint;
+                                    saved
+                                });
+                            }
+                            let mut row = r.clone();
+                            row["file"] = json!(file);
+                            rows.push(row);
+                        }
+                        Ok(r) => rows.push(json!({"file": file, "error": r["error"]})),
+                        Err(e) => rows.push(json!({"file": file, "error": e})),
+                    }
+                }
+                self.store.flush(true);
+                let done = results.len();
+                text(json!({
+                    "done": done,
+                    "remaining": paths.len() - done,
+                    "photos": rows,
+                    "how_to_read": "Develop set each photo's temperature (and, from neutral areas, tint) itself; exposure is unchanged. method says what it went by: skin (faces, measured as if at 20% brightness, brought to natural saturation without turning pink), neutral areas (grey and white parts made neutral) or unchanged (nothing to measure). before and after show the readings. check says why a photo is worth a look. If remaining is above 0, call again with the photos not yet done.",
+                }))
+            }
+            "check_focus" => {
+                let path = self.photo(args)?;
+                let (report, crop) = measure_photo(&path, 512, 0, true, false)?;
+                let mut focus = report["focus"].clone();
+                focus["path"] = json!(path.display().to_string());
+                let mut content = vec![json!({"type": "text", "text": serde_json::to_string(&focus).unwrap_or_default()})];
+                if args["include_crop"].as_bool().unwrap_or(true) {
+                    if let Some(bytes) = crop {
+                        content.push(json!({"type": "image", "data": base64(&bytes), "mimeType": "image/jpeg"}));
+                        content.push(json!({"type": "text", "text": "The image is a 100% crop (512 x 512 px, not resized) centred on the sharpest area of the full-size photo."}));
+                    }
+                }
+                Ok(content)
             }
             "render_preview" => {
                 let path = self.photo(args)?;
@@ -488,6 +768,8 @@ impl Server {
         if let Some(dir) = path.parent() {
             self.store.load_folder(dir);
         }
+        // The app may have changed it since (the newer edit wins).
+        self.store.reload_sidecar(&path);
         Ok(path)
     }
 
@@ -507,16 +789,20 @@ impl Server {
             if let Some(dir) = path.parent() {
                 self.store.load_folder(dir);
             }
+            self.store.reload_sidecar(path);
         }
         Ok(list)
     }
 }
 
+/// How long check_photos keeps starting renders before it returns what it has.
+const BATCH_SECONDS: u64 = 35;
+
 const INSTRUCTIONS: &str = "Develop is a raw photo editor. Photos are files on disk; each photo's edit lives in a .dvlp file beside it. \
 Your changes to a photo are saved automatically in one version per photo per request, labelled 'AI · ...' (it is updated as you keep working on the request; pass new_version: true to set_settings or apply_preset to start a separate version, e.g. for an alternative look such as black and white), and the user's own edit is kept first as 'Before AI · ...'; other versions are never changed. Use list_photos to see a folder, get_settings to read an edit, set_settings to change it (only the settings you name change), \
-render_preview to look at the result (or check_photo to measure it with numbers: histogram, clipping, colour cast; use it if you cannot see images), and export to write JPEG, PNG or TIFF files. Slider scales follow Lightroom's: exposure in stops (-5..5), \
+render_preview to look at the result (or check_photo to measure it with numbers: histogram, clipping, colour cast; use it if you cannot see images), check_photos to measure many photos at once with one short row each (use it for whole folders instead of check_photo on each photo; focus: true adds a full-size focus measurement), cull_photos to rate a whole folder by focus (bursts grouped by capture time; call it until status is done, then with apply: true), auto_white_balance to let Develop set photos' white balance itself (from skin, or neutral areas), check_focus to measure one photo's focus and see a 100% crop of its sharpest area, and export to write JPEG, PNG or TIFF files. Slider scales follow Lightroom's: exposure in stops (-5..5), \
 most other sliders -100..100, temperature in kelvin (0 = as shot), tint -150..150. Tell the user which AI versions you made. \
-If Develop is open on the same folder, it shows changes made here when the photo is opened again.";
+If Develop is open on the same folder, it shows changes made here as they happen.";
 
 /// The tools, with their input schemas.
 fn tools() -> Value {
@@ -554,6 +840,18 @@ curve is a list of [x, y] points 0..1; hsl_hue / hsl_saturation / hsl_luminance 
         {"name": "check_photo", "title": "Measure a photo",
          "description": "Render the photo with its current edit and measure it, for checking an edit without looking: brightness histogram (32 bins) and percentiles per channel, clipping (blown highlights, crushed shadows), tone zones, contrast, colour cast in neutral areas (with which way to move temperature and tint), saturation and the share of each Color Mixer colour, brightness in a 3x3 grid, a detail (sharpness) score, and plain-language notes. Use it before and after changes.",
          "inputSchema": {"type": "object", "properties": {"path": path, "long_edge": {"type": "integer", "minimum": 256, "maximum": 2000}}, "required": ["path"]}},
+        {"name": "check_photos", "title": "Measure many photos",
+         "description": "Measure a batch of photos (a folder, or a list of paths) and return one short row per photo: rating, edited, detail (sharpness) score, mean brightness, clipping and the colour cast in neutral areas. Use it to survey or compare many photos instead of calling check_photo on each. Pass focus: true to also measure focus at full size (edge width of the sharpest area; slower), for example to find the sharp photos in a shoot. Returns up to `count` photos (default 30, max 60) from `start`, fewer if measuring takes more than about 35 seconds (so the call does not time out); call again with next_start until it is null.",
+         "inputSchema": {"type": "object", "properties": {"folder": {"type": "string"}, "paths": paths, "start": {"type": "integer", "minimum": 0}, "count": {"type": "integer", "minimum": 1, "maximum": 60}, "long_edge": {"type": "integer", "minimum": 256, "maximum": 2000}, "focus": {"type": "boolean"}}}},
+        {"name": "cull_photos", "title": "Cull a folder by focus",
+         "description": "Rate a whole folder by focus in a few calls. Groups the photos into bursts by capture time and, in each burst, suggests 4 stars for the sharpest frame (if it is reasonably sharp), 3 for frames nearly as sharp, and 1 for the rest; returns one short row per burst, with the bursts worth a look marked. Measuring takes about a second per photo, so a large folder takes several calls: while status is measuring, call again with the same folder (measurements are kept, also between sessions). With apply: true it saves the ratings (photos that already have one keep it unless replace_ratings: true). Use this instead of check_photos when culling.",
+         "inputSchema": {"type": "object", "properties": {"folder": {"type": "string"}, "apply": {"type": "boolean"}, "replace_ratings": {"type": "boolean"}, "gap_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Frames taken within this many seconds of the one before are one burst (default 60)"}, "sharp_px": {"type": "number", "description": "A 3-star frame must be at most this wide (default 3.5)"}, "near_px": {"type": "number", "description": "and within this much of the keeper (default 0.5)"}, "soft_px": {"type": "number", "description": "A burst whose sharpest frame is wider than this is all rejects (default 5.5)"}}, "required": ["folder"]}},
+        {"name": "auto_white_balance", "title": "Auto white balance",
+         "description": "Let Develop set the white balance of photos itself, by measuring renders: from people's skin when there are faces (measured as if the faces were at 20%, brought to natural saturation without turning pink; right for firelight and tungsten), otherwise from the grey and white parts of the picture. Changes temperature (and tint when going by neutral areas) only, never exposure, and saves into the photo's AI version. Returns, per photo, the temperature set, the method, readings before and after, and anything worth a look. Several seconds per photo; for many photos it may return early with remaining above 0: call again with the rest. Prefer this to adjusting temperature by hand.",
+         "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path}}},
+        {"name": "check_focus", "title": "Check focus",
+         "description": "Measure focus on the full-size photo: the edge width in pixels of its sharpest area (about 2.7 at best; crisp detail reads 2.5-3.5; bigger is softer), across and down (a big difference can mean motion blur), where that area is, the typical edge width of the whole picture, and a verdict. Also returns a 100% crop (512 x 512 px) of the sharpest area so you can see whether the subject is in focus; pass include_crop: false if you cannot see images. For many photos use check_photos with focus: true.",
+         "inputSchema": {"type": "object", "properties": {"path": path, "include_crop": {"type": "boolean"}}, "required": ["path"]}},
         {"name": "render_preview", "title": "Look at a photo",
          "description": "Render the photo with its current settings and return it as an image (default 1024 px on the long edge).",
          "inputSchema": {"type": "object", "properties": {"path": path, "long_edge": {"type": "integer", "minimum": 256, "maximum": 3000}}, "required": ["path"]}},
@@ -774,6 +1072,92 @@ fn free_name(dir: &Path, stem: &str, ext: &str) -> PathBuf {
 }
 
 /// Render `photo` with its saved settings into `out` by running Develop itself.
+/// Render a photo with its edit (PNG, so clipping and the darkest and brightest levels are exact)
+/// and measure it. With `focus`, the same render also measures focus on the full-size picture
+/// (see `focus.rs`): the report gains `focus`, and the 100% crop of the sharpest area is returned
+/// as JPEG bytes. `slot` keeps the temporary files of parallel renders apart.
+/// Run Develop's own auto white balance on a photo with its edit (see autowb.rs).
+fn auto_wb(photo: &Path, slot: usize) -> Result<Value, String> {
+    let out = std::env::temp_dir().join(format!("develop-mcp-autowb-{}-{slot}.json", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(exe)
+        .arg(photo)
+        .args(["--with-settings", "1", "--auto-wb"])
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("Could not start Develop: {e}"))?;
+    let text = std::fs::read_to_string(&out).map_err(|_| format!("Measuring {} failed ({status})", photo.display()))?;
+    let _ = std::fs::remove_file(&out);
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn measure_photo(path: &Path, long_edge: u64, slot: usize, focus: bool, skin: bool) -> Result<(Value, Option<Vec<u8>>), String> {
+    let out = std::env::temp_dir().join(format!("develop-mcp-check-{}-{slot}.png", std::process::id()));
+    let focus_out = std::env::temp_dir().join(format!("develop-mcp-focus-{}-{slot}.json", std::process::id()));
+    let info_out = std::env::temp_dir().join(format!("develop-mcp-info-{}-{slot}.json", std::process::id()));
+    let crop_out = crate::focus::crop_path(&focus_out);
+    let _ = std::fs::remove_file(&focus_out);
+    let _ = std::fs::remove_file(&info_out);
+    let mut options = vec![("--export-long", long_edge.to_string()), ("--info-out", info_out.display().to_string())];
+    if focus {
+        options.push(("--focus-out", focus_out.display().to_string()));
+    }
+    let rendered = render(path, &out, &options);
+    let picture = rendered.and_then(|_| image::open(&out).map_err(|e| format!("Could not read the render: {e}")));
+    let _ = std::fs::remove_file(&out);
+    let rgb = picture?.to_rgb8();
+    let mut report = crate::measure::measure(rgb.as_raw(), rgb.width() as usize, rgb.height() as usize);
+    // With `skin`, the skin tone of any faces (see skin.rs), for white balance without neutrals.
+    // Skin colour is judged with the faces at 20%: if they are not, the photo is rendered again
+    // with its exposure shifted for the measurement only (the edit is not changed).
+    if skin {
+        let mut reading = crate::skin::measure(rgb.as_raw(), rgb.width() as usize, rgb.height() as usize);
+        let mut shift = 0.0;
+        for _ in 0..2 {
+            let Some(step) = reading["exposure_to_target_stops"].as_f64() else { break };
+            if step.abs() < 0.1 {
+                break;
+            }
+            shift = (shift + step).clamp(-5.0, 5.0);
+            let out = std::env::temp_dir().join(format!("develop-mcp-skin-{}-{slot}.png", std::process::id()));
+            let shifted = render(path, &out, &[("--export-long", long_edge.to_string()), ("--exposure-shift", format!("{shift:.2}"))])
+                .and_then(|_| image::open(&out).map_err(|e| e.to_string()));
+            let _ = std::fs::remove_file(&out);
+            let Ok(shifted) = shifted else { break };
+            let shifted = shifted.to_rgb8();
+            reading = crate::skin::measure(shifted.as_raw(), shifted.width() as usize, shifted.height() as usize);
+        }
+        if let Some(obj) = reading.as_object_mut() {
+            obj.remove("exposure_to_target_stops");
+            obj.insert("measured_with_exposure_shift_stops".into(), json!((shift * 100.0_f64).round() / 100.0));
+        }
+        report["skin"] = reading;
+    }
+    // The photo's own white balance, so a temperature change can be made relative to it.
+    if let Some(info) = std::fs::read_to_string(&info_out).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        report["white_balance"] = json!({
+            "as_shot_temperature": info["as_shot_temperature"],
+            "temperature_now": info["temperature"],
+            "how_to_read": "Kelvin, as in Lightroom: a higher temperature makes the picture warmer (more yellow), a lower one cooler (bluer). temperature in set_settings is absolute: to warm the photo by 300 K, set as_shot_temperature + 300 (or temperature_now + 300 to build on the current edit); 0 means as shot. tint is relative to the as-shot white balance already (0 = as shot; positive = more magenta, negative = greener). JPEG and other finished pictures start at about 6500 K.",
+        });
+    }
+    let _ = std::fs::remove_file(&info_out);
+    let mut crop = None;
+    if focus {
+        report["focus"] = std::fs::read_to_string(&focus_out)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| json!("focus could not be measured"));
+        crop = std::fs::read(&crop_out).ok();
+        let _ = std::fs::remove_file(&focus_out);
+        let _ = std::fs::remove_file(&crop_out);
+    }
+    Ok((report, crop))
+}
+
 fn render(photo: &Path, out: &Path, options: &[(&str, String)]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = std::process::Command::new(exe);
@@ -840,7 +1224,7 @@ mod tests {
 
     #[test]
     fn initialize_and_list() {
-        let mut server = Server { store: settings::Store::load(), presets: settings::Presets::load(), client: "test".into(), rounds: Default::default(), last_call: None };
+        let mut server = Server { store: settings::Store::load(), presets: settings::Presets::load(), client: "test".into(), rounds: Default::default(), last_call: None, focus_cache: None };
         let reply: Value = serde_json::from_str(&server.handle_text(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#).unwrap()).unwrap();
         assert_eq!(reply["result"]["serverInfo"]["name"], "develop");
         assert!(server.handle_text(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());

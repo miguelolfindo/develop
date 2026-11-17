@@ -1,6 +1,6 @@
 [package]
 name = "develop"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Develop: a GPU raw photo processor"
 license = "GPL-3.0-or-later"
@@ -22,6 +22,9 @@ roxmltree = "0.20" # Lensfun lens-profile XML files
 # Update check: the latest release from GitHub, and downloading its installer.
 ureq = "3"
 serde_json = "1"
+# Told by the system when sidecars in the open folder change (edits from an AI assistant
+# through the MCP server, or another copy of Develop), so they show without checking.
+notify = "6"
 # AI denoise: ONNX Runtime (prebuilt, fetched at build time). The GPU backend is chosen per
 # platform below.
 ort = "=2.0.0-rc.15"
@@ -55,6 +58,9 @@ resources = [
     # The AI denoise model (GPL-3.0, from darktable-ai), looked for in `models/` beside the app.
     { src = "models/rawnind_bayer.onnx", target = "models/rawnind_bayer.onnx" },
     { src = "models/rawnind_linear.onnx", target = "models/rawnind_linear.onnx" },
+    # Face detector for the skin-tone reading in check_photo (YuNet, MIT).
+    { src = "models/face_detection_yunet_2023mar.onnx", target = "models/face_detection_yunet_2023mar.onnx" },
+    { src = "models/LICENSE-YuNet.txt", target = "models/LICENSE-YuNet.txt" },
     # Lensfun lens profiles (.xml), if a `lensfun` folder is added to the project.
     { src = "lensfun", target = "lensfun" },
     # ONNX Runtime's DirectML helper on Windows (no such file on macOS).

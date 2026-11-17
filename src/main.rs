@@ -7,12 +7,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod color;
+mod autowb;
 mod crop;
+mod cull;
 mod dcp;
 mod denoise;
 mod explorer;
 mod export;
 mod filmstrip;
+mod focus;
+mod headless;
 mod heic;
 mod lens;
 mod mcp;
@@ -23,12 +27,14 @@ mod profile;
 mod raw;
 mod scopes;
 mod settings;
+mod skin;
 mod spots;
 mod theme;
 mod tone;
 mod todng;
 mod ui;
 mod update;
+mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -115,6 +121,15 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 4 && args[1] == "--dump-raw" {
         let _ = std::fs::write(&args[3], raw::describe(std::path::Path::new(&args[2])));
+        return Ok(());
+    }
+
+    // `app <photo> --export <file> ...` and `--auto-wb <file>` (how the MCP server renders and
+    // measures): no window at all, so
+    // nothing flashes up on screen while an assistant works. Falls back to a window if the GPU
+    // cannot be reached without one.
+    let scripted = args.len() >= 4 && (args[2] == "--export" || args.iter().any(|a| a == "--auto-wb"));
+    if scripted && headless::run(std::env::args_os().nth(1).map(PathBuf::from)) {
         return Ok(());
     }
 
@@ -404,6 +419,8 @@ struct History {
 const SPOT_MIN: f32 = 0.002;
 const SPOT_MAX: f32 = 0.2;
 
+/// How long the note "Changed by another program" shows.
+const OUTSIDE_NOTE_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 /// Steps of undo kept per photo.
 const HISTORY_STEPS: usize = 200;
 
@@ -435,6 +452,14 @@ struct App {
     store: settings::Store,
     defaults: Option<settings::Saved>,
     remember: bool,
+    /// Watches the filmstrip's folder for sidecars changed by another program (an AI
+    /// assistant through the MCP server, another copy of Develop).
+    folder_watch: Option<watch::FolderWatch>,
+    /// Photos changed by another program, waiting to be taken in (the open photo waits while
+    /// a slider is being dragged or a number typed).
+    outside: std::collections::HashSet<PathBuf>,
+    /// When the open photo was last changed by another program, for the note under its name.
+    outside_note: Option<(PathBuf, Instant)>,
     /// The settings the open photo's filmstrip thumbnail currently shows.
     thumb_shows: Option<settings::Saved>,
     /// Settings copied with "Copy settings", in the form they are stored.
@@ -492,6 +517,11 @@ struct App {
     curve_drag: Option<usize>,
     /// The white balance eyedropper is waiting for a click on the picture (W).
     wb_pick: bool,
+    /// The last Auto white balance's result, shown under the buttons.
+    auto_wb_note: Option<String>,
+    /// `--auto-wb <file>`: find the white balance, write the result there as JSON, and quit
+    /// (with `--with-settings 1`; for the MCP server).
+    pending_auto_wb: Option<PathBuf>,
     /// Scroll the edit panel to the Tone Curve and Color Mixer on the next frame (`--show-curve`,
     /// for testing).
     curve_reveal: bool,
@@ -585,14 +615,29 @@ struct App {
     spot_reveal: bool,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
+    /// `--focus-out <file>`: with `--export`, also measure focus on the full-size picture and
+    /// write the report there (for the MCP server).
+    focus_out: Option<PathBuf>,
+    /// `--info-out <file>`: with `--export`, also write the photo's own (as-shot) white balance
+    /// and the temperature used, as JSON (for the MCP server).
+    info_out: Option<PathBuf>,
+    /// `--exposure-shift <stops>`: added to the exposure after the saved edit is applied, for a
+    /// measuring render only (the MCP server judges skin with the faces at 20%).
+    exposure_shift: f32,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        let render_state = cc.wgpu_render_state.clone().expect("eframe must run with the wgpu renderer");
+        Self::with_gpu(&cc.egui_ctx, render_state, initial)
+    }
+
+    /// The app on a GPU connection: a window's (see `new`), or one made without a window for
+    /// exports (see headless.rs).
+    fn with_gpu(egui_ctx: &egui::Context, render_state: egui_wgpu::RenderState, initial: Option<PathBuf>) -> Self {
         // Settings from versions that kept them under another folder name.
         settings::migrate_legacy_settings();
-        theme::apply(&cc.egui_ctx);
-        let render_state = cc.wgpu_render_state.clone().expect("eframe must run with the wgpu renderer");
+        theme::apply(egui_ctx);
         let renderer = ImageRenderer::new(&render_state.device, &render_state.queue, render_state.target_format);
         render_state.renderer.write().callback_resources.insert(renderer);
         let scopes = scopes::Scopes::new(&render_state.device, render_state.target_format);
@@ -615,7 +660,7 @@ impl App {
             loaded: None,
             loading: None,
             loading_path: None,
-            filmstrip: filmstrip::Filmstrip::new(&cc.egui_ctx),
+            filmstrip: filmstrip::Filmstrip::new(egui_ctx),
             store: settings::Store::load(),
             defaults: None,
             // `app file.ARW --something ...` is a test or batch run: start from defaults and
@@ -624,6 +669,9 @@ impl App {
                 let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
                 args.len() <= 2 || (args.len() == 4 && args[2] == "--export-dialog")
             },
+            folder_watch: None,
+            outside: Default::default(),
+            outside_note: None,
             thumb_shows: None,
             clipboard: None,
             menu_action: None,
@@ -661,6 +709,11 @@ impl App {
             pending_version: None,
             curve_drag: None,
             wb_pick: false,
+            auto_wb_note: None,
+            pending_auto_wb: {
+                let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                args.iter().position(|a| a == "--auto-wb").and_then(|i| args.get(i + 1)).map(PathBuf::from)
+            },
             curve_reveal: false,
             sections_reveal: false,
             with_settings: false,
@@ -671,7 +724,7 @@ impl App {
             icon: image::load_from_memory(include_bytes!("../assets/icon-256.png")).ok().map(|icon| {
                 let small = icon.resize(72, 72, image::imageops::FilterType::Lanczos3).to_rgba8();
                 let pixels = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
-                cc.egui_ctx.load_texture("app icon", pixels, egui::TextureOptions::LINEAR)
+                egui_ctx.load_texture("app icon", pixels, egui::TextureOptions::LINEAR)
             }),
             sharpen: settings::SHARPEN_DEFAULT,
             tint: 0.0,
@@ -728,6 +781,18 @@ impl App {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
             },
+            focus_out: {
+                let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                args.iter().position(|a| a == "--focus-out").and_then(|i| args.get(i + 1)).map(PathBuf::from)
+            },
+            exposure_shift: {
+                let args: Vec<String> = std::env::args().collect();
+                args.iter().position(|a| a == "--exposure-shift").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+            },
+            info_out: {
+                let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                args.iter().position(|a| a == "--info-out").and_then(|i| args.get(i + 1)).map(PathBuf::from)
+            },
         };
         if app.remember {
             let (presets, last) = export::Presets::load(settings::export_file());
@@ -759,11 +824,11 @@ impl App {
             }
         }
         if let Some(path) = initial {
-            app.start_loading(path, &cc.egui_ctx);
+            app.start_loading(path, egui_ctx);
         } else if app.remember {
             // Started without a file: come back to the photo and folder of the last session.
             if let Some(photo) = app.session.photo.clone().filter(|p| p.is_file()) {
-                app.start_loading(photo, &cc.egui_ctx);
+                app.start_loading(photo, egui_ctx);
             }
             if let Some(folder) = app.session.folder.clone().filter(|p| p.is_dir()) {
                 app.filmstrip.set_folder(Some(&folder));
@@ -774,7 +839,7 @@ impl App {
         let scripted = std::env::args().skip(1).any(|a| a.starts_with("--"));
         if !scripted && std::env::var_os("DEVELOP_NO_UPDATE_CHECK").is_none() {
             let (tx, rx) = mpsc::channel();
-            let ctx = cc.egui_ctx.clone();
+            let ctx = egui_ctx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(update::check());
                 ctx.request_repaint();
@@ -1219,6 +1284,10 @@ impl App {
                     }
                 }
                 self.denoise = image.denoised;
+                if self.exposure_shift != 0.0 {
+                    self.adjust.exposure = (self.adjust.exposure + std::mem::take(&mut self.exposure_shift)).clamp(-5.0, 5.0);
+                    self.render_key = None;
+                }
                 if let (Some(note), Some(loaded)) = (&image.denoise_note, &mut self.loaded) {
                     loaded.info.push('\n');
                     loaded.info.push_str(note);
@@ -1276,6 +1345,67 @@ impl App {
         }
         self.filmstrip.set_version_thumb(ctx, &key, egui::ColorImage::from_rgb([w as usize, h as usize], &rgb8));
         ctx.request_repaint();
+    }
+
+    /// Render the open photo small (long side `long`) with the current settings, as 8-bit RGB.
+    fn render_small(&mut self, long: u32) -> Option<(Vec<u8>, usize, usize)> {
+        self.sync_profile();
+        let loaded = self.loaded.as_ref()?;
+        let (width, height) = self.output_size(loaded);
+        let scale = long as f32 / width.max(height).max(1) as f32;
+        let (w, h) = (((width as f32 * scale).round() as u32).max(1), ((height as f32 * scale).round() as u32).max(1));
+        let uniforms = self.uniforms(loaded, [1.0, 1.0, 0.5, 0.5], true);
+        let rs = &self.render_state;
+        let renderer = rs.renderer.read();
+        let rgb16 = renderer.callback_resources.get::<ImageRenderer>()?.render_full(&rs.device, &rs.queue, &uniforms, w, h, self.crop_region()).ok()?;
+        Some((rgb16.iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect(), w as usize, h as usize))
+    }
+
+    /// Render the open photo at this temperature and tint, with exposure shifted by `shift`
+    /// for the measurement only, and measure skin and neutral areas (for autowb.rs).
+    fn wb_probe(&mut self, kelvin: f32, tint: f32, shift: f32) -> autowb::Probe {
+        let exposure = self.adjust.exposure;
+        self.adjust.kelvin = kelvin;
+        self.tint = tint;
+        self.adjust.exposure = (exposure + shift).clamp(-5.0, 5.0);
+        let picture = self.render_small(800);
+        self.adjust.exposure = exposure;
+        let Some((rgb, w, h)) = picture else { return autowb::Probe::default() };
+        let report = measure::measure(&rgb, w, h);
+        let num = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32;
+        autowb::Probe {
+            skin: skin::read(&rgb, w, h).ok(),
+            blue_minus_red: num(&report["neutral_areas"]["blue_minus_red_half"]),
+            green_minus_magenta: num(&report["neutral_areas"]["green_minus_magenta"]),
+            neutral_share: num(&report["neutral_areas"]["share_percent"]),
+        }
+    }
+
+    /// Auto white balance for the open photo (see autowb.rs): sets temperature (and, without
+    /// faces, tint); exposure is left as it is. One Undo step goes back.
+    fn auto_white_balance(&mut self) -> Option<autowb::Outcome> {
+        if self.loaded.is_none() || self.loading.is_some() {
+            return None;
+        }
+        // Always from the camera's own white balance, so the answer does not depend on where
+        // the sliders happen to be (a photo already pushed far off has nothing left to measure).
+        let kelvin = self.loaded.as_ref().map_or(self.adjust.kelvin, |l| l.color.as_shot_kelvin);
+        let tint = 0.0;
+        let outcome = autowb::solve(kelvin, tint, |k, t, s| self.wb_probe(k, t, s));
+        self.adjust.kelvin = outcome.kelvin;
+        self.tint = outcome.tint;
+        self.render_key = None;
+        self.sync_profile();
+        let how = match outcome.method {
+            autowb::Method::Skin => format!("From skin: {:.0} K", outcome.kelvin),
+            autowb::Method::Neutral => format!("From neutral areas: {:.0} K, tint {:.0}", outcome.kelvin, outcome.tint),
+            autowb::Method::Unchanged => "Nothing to measure: unchanged".to_owned(),
+        };
+        self.auto_wb_note = Some(match outcome.check.first() {
+            Some(c) if outcome.method != autowb::Method::Unchanged => format!("{how} ({c})"),
+            _ => how,
+        });
+        Some(outcome)
     }
 
     fn update_thumbnail(&mut self, ctx: &egui::Context) {
@@ -2103,10 +2233,23 @@ impl App {
         let settings = self.export.clone();
         let meta = loaded.photo.clone();
         let path_for_reveal = path.clone();
+        let focus_out = self.focus_out.take();
+        if let Some(info_path) = self.info_out.take() {
+            let info = serde_json::json!({
+                "as_shot_temperature": loaded.color.as_shot_kelvin.round(),
+                "temperature": self.adjust.kelvin.round(),
+            });
+            let _ = std::fs::write(info_path, info.to_string());
+        }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
+            if let Some(focus_path) = focus_out {
+                if let Err(e) = focus::write(&focus_path, &rgb, width, height) {
+                    eprintln!("Focus measurement failed: {e}");
+                }
+            }
             let result = export::save(&path, rgb, width, height, &settings, &meta).map(|saved| {
                 format!(
                     "Saved {} × {} px, {:.1} MB in {:.1} s\n{}",
@@ -2546,6 +2689,57 @@ impl App {
                 history.committed = Some(now);
             }
             _ => {}
+        }
+    }
+
+    /// Take in edits, ratings and versions that another program saved for photos of the
+    /// folder (an AI assistant through the MCP server, another copy of Develop): the newer
+    /// change wins. The open photo shows them at once, and Undo brings back what it had.
+    fn take_outside_changes(&mut self, ctx: &egui::Context) {
+        let Some(watch) = &mut self.folder_watch else { return };
+        let settled = watch.settled(ctx);
+        let dir = watch.dir().to_path_buf();
+        self.outside.extend(settled.photos);
+        if settled.everything {
+            self.outside.extend(self.store.photos_in(&dir));
+        }
+        // Not while a photo is opening: its settings are put on it when it is ready.
+        if self.outside.is_empty() || self.loading.is_some() {
+            return;
+        }
+        let open = self.loaded.as_ref().map(|l| l.path.clone());
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        for photo in std::mem::take(&mut self.outside) {
+            if busy && open.as_ref() == Some(&photo) {
+                self.outside.insert(photo);
+                continue;
+            }
+            if !self.store.reload_sidecar(&photo) {
+                continue;
+            }
+            ctx.request_repaint();
+            if open.as_ref() != Some(&photo) {
+                // Its saved thumbnail shows the old edit.
+                if let Some(file) = settings::thumb_file(&photo) {
+                    let _ = std::fs::remove_file(file);
+                }
+                self.filmstrip.reload(&photo);
+                continue;
+            }
+            let Some(defaults) = self.defaults.clone() else { continue };
+            let theirs = self.store.get(&photo).cloned().unwrap_or_else(|| self.storable(defaults));
+            if theirs == self.storable(self.snapshot()) {
+                continue; // only the rating or versions changed
+            }
+            if theirs.denoise != self.denoise {
+                // AI denoise is part of opening the photo: open it again with the new switch.
+                self.denoise = theirs.denoise;
+                self.denoise_override = Some(theirs.denoise);
+                self.reload = true;
+            }
+            self.restore_snapshot(&theirs);
+            self.outside_note = Some((photo, Instant::now()));
+            ctx.request_repaint_after(OUTSIDE_NOTE_TIME);
         }
     }
 
@@ -3473,6 +3667,12 @@ impl App {
                     .on_hover_text(&loaded.info);
             }
         }
+        if let (Some((photo, at)), Some(loaded)) = (&self.outside_note, &self.loaded) {
+            if *photo == loaded.path && at.elapsed() < OUTSIDE_NOTE_TIME {
+                ui.add(egui::Label::new(egui::RichText::new("Edited by another program. Undo reverts.").font(theme::font(11.5)).color(theme::TEAL)).truncate(true))
+                    .on_hover_text("Another program saved new settings for this photo: an AI assistant using Develop's tools, or another copy of Develop.");
+            }
+        }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -3633,6 +3833,19 @@ impl App {
             if let Some(on) = pick {
                 self.set_wb_pick(on);
             }
+            ui.add_space(4.0);
+            let width = ui.available_width();
+            if ui
+                .add_enabled_ui(self.loaded.is_some() && self.loading.is_none(), |ui| ui::button(ui, "Auto", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None))
+                .inner
+                .on_hover_text("Set the white balance from people's skin when there are faces (so firelight and tungsten come out natural), or else from the grey and white parts of the picture. Exposure is not changed; Undo goes back.")
+                .clicked()
+            {
+                self.auto_white_balance();
+            }
+            if let Some(note) = &self.auto_wb_note {
+                ui.add(egui::Label::new(egui::RichText::new(note).font(theme::font(11.0)).color(theme::TEXT_HEADER)).wrap(true));
+            }
             ui.add_space(8.0);
             ui::pro_slider(ui, "Tint", &mut self.tint, -150.0..=150.0, 0.0, "", amber);
         });
@@ -3666,10 +3879,10 @@ impl App {
             });
         });
 
-        ui::section(ui, "Tone Curve", true, "Click the curve to add a point, drag points, double-click a point to remove it", |ui| self.curve_panel(ui));
         if std::mem::take(&mut self.curve_reveal) {
-            ui.scroll_to_cursor(Some(egui::Align::Center));
+            ui.scroll_to_cursor(Some(egui::Align::Min));
         }
+        ui::section(ui, "Tone Curve", true, "Click the curve to add a point, drag points, double-click a point to remove it", |ui| self.curve_panel(ui));
         if self.mono {
             ui::section(ui, "B&W Mix", true, "How bright each colour becomes in black and white", |ui| self.mono_panel(ui));
         } else {
@@ -4148,6 +4361,13 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl App {
+    /// One frame of the app: in a window, or run without one for exports (headless.rs).
+    fn frame(&mut self, ctx: &egui::Context) {
         self.poll_loader();
         self.sync_heal();
         self.update_dialog(ctx);
@@ -4207,11 +4427,17 @@ impl eframe::App for App {
                 self.keep_view = Some((zoom, center));
             }
         }
-        // Read the settings saved beside the photos of the folder on show (once per folder).
+        // Read the settings saved beside the photos of the folder on show (once per folder),
+        // then watch it for changes made by another program.
         if self.remember {
-            if let Some(dir) = self.filmstrip.dir() {
-                self.store.load_folder(dir);
+            if let Some(dir) = self.filmstrip.dir().map(Path::to_path_buf) {
+                self.store.load_folder(&dir);
+                if self.folder_watch.as_ref().map(|w| w.dir()) != Some(dir.as_path()) {
+                    self.folder_watch = watch::FolderWatch::new(&dir, ctx);
+                    self.outside.clear();
+                }
             }
+            self.take_outside_changes(ctx);
         }
         self.filmstrip.poll(ctx);
         let current = self.loading_path.clone().or_else(|| self.loaded.as_ref().map(|l| l.path.clone()));
@@ -4378,6 +4604,16 @@ impl eframe::App for App {
             self.store.flush(false);
             if self.store.pending() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
+        // `--auto-wb <file>`: once the picture is ready, find the white balance, write it, quit.
+        if self.loaded.is_some() && self.render.is_some() && self.loading.is_none() {
+            if let Some(path) = self.pending_auto_wb.take() {
+                let result = self.auto_white_balance().map_or_else(|| serde_json::json!({"error": "the photo could not be measured"}), |o| o.to_json());
+                let _ = std::fs::write(&path, result.to_string());
+                if self.pending_export.is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         // `--export <file>`: once the picture and its profile are ready, export and quit.

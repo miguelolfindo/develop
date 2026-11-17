@@ -69,8 +69,10 @@ you choose to, you can also connect an AI assistant of your own through the
     Color Mixer becomes a **B&W Mix** that sets how bright each colour turns out in grey,
     and Vibrance and Saturation are switched off.
   - **Crop:** crop, straighten and aspect ratio.
-  - **White Balance:** temperature and tint, and an eyedropper (W): click something that
-    should be neutral and the white balance is set to make it so.
+  - **White Balance:** temperature and tint, an eyedropper (W): click something that
+    should be neutral and the white balance is set to make it so, and **Auto**, which goes by
+    people's skin when there are faces (right for firelight and tungsten, where nothing is
+    grey) and by the neutral parts of the picture otherwise.
   - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks, on Lightroom's
     scales. Highlights, Shadows and Whites adapt to each photo's own brightness, as
     Lightroom's do.
@@ -110,7 +112,8 @@ you choose to, you can also connect an AI assistant of your own through the
   password when a computer needs one; on macOS, shares are mounted through Finder and
   your Keychain.
 - **Non-destructive:** edits are saved in a small `.dvlp` sidecar file next to each photo;
-  the original is never changed.
+  the original is never changed. Changes made by another program (an AI assistant, or a
+  second copy of Develop) show at once in the open folder, and Undo goes back.
 - **Export** to JPEG, PNG or TIFF, with resizing and metadata options, one photo or a
   batch (right-click a photo, or select several), with a progress bar.
 - **Convert to DNG:** choose **DNG (original raw)** as the format in the Export dialog, or
@@ -131,7 +134,10 @@ Develop includes an [MCP](https://modelcontextprotocol.io) server, so any AI ass
 speaks MCP (Claude, Gemini, ChatGPT-based tools, local models in LM Studio, Cursor, VS Code
 Copilot, Codex, Continue and others) can help with your photos: list a folder, read and change
 edits, apply presets, rate, save and restore versions, look at a rendered preview or measure it with numbers (for AIs that cannot see images), export,
-and convert to DNG. It works with the photos' `.dvlp` files exactly as the app does and never
+and convert to DNG. Develop also does the arithmetic-heavy jobs itself, so even small local
+models handle a whole shoot quickly: **rate a folder by focus** (the sharpest frame of each
+burst), **measure focus** at full size, and **set white balance automatically** (from skin or
+neutral areas). Renders for the assistant happen without opening a window. It works with the photos' `.dvlp` files exactly as the app does and never
 changes the original raw files. Each request to an AI is saved as one clearly labelled version
 per photo (`AI · ...`), your edit is kept first (`Before AI · ...`), and versions you made can
 never be changed or removed through MCP.
@@ -270,6 +276,8 @@ full text.
   3.0 (see `lensfun/README.md`).
 - AI noise reduction model: RawNIND (Brummer & De Vleeschouwer), GPL-3.0, as packaged
   by [darktable-ai](https://github.com/darktable-org/darktable-ai).
+- Face detector for the skin-tone reading: YuNet (Shiqi Yu and others), MIT, from
+  [opencv_zoo](https://github.com/opencv/opencv_zoo) (see `models/LICENSE-YuNet.txt`).
 - User interface: [egui / eframe](https://github.com/emilk/egui); GPU:
   [wgpu](https://github.com/gfx-rs/wgpu); ONNX inference:
   [ort](https://github.com/pykeio/ort).
