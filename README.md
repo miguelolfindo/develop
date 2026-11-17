@@ -5,6 +5,16 @@ respond instantly, even on 61-megapixel files. The sliders are tuned against Lig
 Classic exports of photos from Sony, Nikon, Canon, Panasonic and Fujifilm cameras, so
 moving a slider in Develop looks much like moving the same slider in Lightroom.
 
+## Documentation
+
+- **[User guide](docs/USER-GUIDE.md):** every feature, step by step: browsing, editing, presets,
+  versions, retouching, exporting, DNG, keyboard shortcuts, where edits are kept, and
+  troubleshooting.
+- **[AI assistants (MCP)](docs/MCP.md):** connecting an AI app, every tool and setting, good
+  practice and privacy; plus a ready-made [assistant guide](docs/develop-skill/SKILL.md).
+- **[Release notes](RELEASE_NOTES.md)** for the current version, and the
+  [Releases](https://github.com/miguelolfindo/develop/releases) page for downloads and history.
+
 ## Develop and Lightroom
 
 Develop is **free and open-source software** (GNU GPL v3). There is nothing to buy, no
@@ -21,18 +31,21 @@ of 255) of Lightroom on average.
 **What it does well:** fast global editing (every adjustment runs on the GPU), Lightroom-style
 Tone, Presence and Color sliders, a tone curve and colour mixer, a white balance eyedropper,
 AI noise reduction, lens corrections, crop and straighten, spot healing and cloning (circles or
-painted strokes), undo and redo, copying settings between photos, ratings and filters, and
-exporting one photo or a whole selection to JPEG, PNG or TIFF.
+painted strokes), black & white, develop presets, saved versions of an edit, undo and redo,
+copying settings between photos, ratings and filters, exporting one photo or a whole
+selection to JPEG, PNG or TIFF, and an MCP server so AI assistants can help with your work.
 
 **What it does not have (Lightroom does):**
 - A catalog: no keywords, collections, face recognition, map or search across your library.
 - Local adjustments: no masks, brushes, gradients, or AI subject and sky selection.
 - Content-aware fill and AI object removal: retouching copies from a source you can
   move (heal or clone), it does not invent content.
-- A colour grading panel, per-channel (red, green, blue) curves, and develop presets.
+- A colour grading panel and per-channel (red, green, blue) curves.
 - HDR and panorama merge, printing, mobile apps and cloud sync.
 
-AI is used for one thing only: noise reduction, running on your own computer.
+Develop's own AI does one thing only: noise reduction, running on your own computer. If
+you choose to, you can also connect an AI assistant of your own through the
+[MCP server](#ai-assistants-mcp).
 
 ## Features
 
@@ -42,7 +55,19 @@ AI is used for one thing only: noise reduction, running on your own computer.
   QTK, RAW and DNG, plus JPEG, PNG, TIFF and HEIC. See [Cameras](#cameras) for which ones
   are calibrated against Lightroom.
 - **Edit panel,** in the order most photos are worked on:
-  - **Profile:** Adobe camera profiles when installed (see below), or the built-in one.
+  - **Presets:** save the current look as a preset (optionally with its white balance), and
+    apply a preset to the open photo or to every selected photo with one click. A preset
+    carries tone, presence, colour, curve, mixer, detail and profile settings; crop,
+    rotation, lens correction and retouching stay as they are on each photo.
+  - **Versions:** save named versions of a photo's edit, switch between them (Undo goes
+    back), update or delete them, and show any version as "before" in the A/B split to
+    compare it with the current edit. Versions are kept in the photo's `.dvlp` file, and
+    appear in the filmstrip as smaller cards (V1, V2...) grouped with their photo in a
+    shared frame; click one to open the photo at that version.
+  - **Profile:** **Color** or **Black & White** treatment, and the camera profile (Adobe
+    camera profiles when installed, see below, or the built-in one). In Black & White the
+    Color Mixer becomes a **B&W Mix** that sets how bright each colour turns out in grey,
+    and Vibrance and Saturation are switched off.
   - **Crop:** crop, straighten and aspect ratio.
   - **White Balance:** temperature and tint, and an eyedropper (W): click something that
     should be neutral and the white balance is set to make it so.
@@ -74,8 +99,11 @@ AI is used for one thing only: noise reduction, running on your own computer.
     series).
 - **Camera profiles:** uses the Adobe camera profiles (`.dcp`) installed with Lightroom
   or Camera Raw when they are present, including an approximation of Adobe Color.
-- **Filmstrip** with ratings, **histogram and scopes**, **before/after split**, and
-  clipping warnings.
+- **Filmstrip** with ratings, sorting and filtering, a photo's saved versions grouped with it,
+  **histogram and scopes**, **before/after split** (against the original or any saved version),
+  and clipping warnings.
+- **Copy and paste settings:** Ctrl+C / Ctrl+V (Cmd on a Mac), or right-click a photo.
+  Paste onto the open photo or onto every selected photo in the filmstrip.
 - **Network browsing:** the folder tree has a **Network** entry listing the computers and
   NAS boxes on your network and the folders they share; add one by address
   (`\\computer\share` on Windows, `smb://computer/share` on macOS). Windows asks for a
@@ -96,6 +124,27 @@ AI is used for one thing only: noise reduction, running on your own computer.
   comes from the Lensfun lens profile rather than the camera maker's own data, so it is close
   to, not identical with, Adobe's. Develop's edits come along in a `.dvlp` file beside each
   DNG, so Develop reopens it as you left it; other applications open the DNG unedited.
+
+## AI assistants (MCP)
+
+Develop includes an [MCP](https://modelcontextprotocol.io) server, so any AI assistant that
+speaks MCP (Claude, Gemini, ChatGPT-based tools, local models in LM Studio, Cursor, VS Code
+Copilot, Codex, Continue and others) can help with your photos: list a folder, read and change
+edits, apply presets, rate, save and restore versions, look at a rendered preview or measure it with numbers (for AIs that cannot see images), export,
+and convert to DNG. It works with the photos' `.dvlp` files exactly as the app does and never
+changes the original raw files. Each request to an AI is saved as one clearly labelled version
+per photo (`AI · ...`), your edit is kept first (`Before AI · ...`), and versions you made can
+never be changed or removed through MCP.
+
+- `develop --mcp` for AI apps on your computer (they start it themselves).
+- `develop --mcp-http <port>` for AI services that connect over the network: listens on this
+  computer only and requires an access token.
+
+**[docs/MCP.md](docs/MCP.md)** has the setup for each AI app, every tool and setting, good
+practice, privacy notes and troubleshooting. **[docs/develop-skill](docs/develop-skill/SKILL.md)**
+is a ready-made guide to give your assistant (as a Claude skill, custom instructions, a system
+prompt or an `AGENTS.md`) so it edits carefully: saving versions first, previewing before
+batch changes, and asking before exporting.
 
 ## Cameras
 
@@ -183,8 +232,9 @@ cargo install cargo-packager --locked
 cargo packager --release
 ```
 
-This makes an NSIS installer on Windows and a `.dmg` on macOS, in `dist/`. Pushing a tag
-such as `v0.1.3` builds both on GitHub Actions and attaches them to a release.
+This makes an NSIS installer on Windows and a `.dmg` on macOS, in `dist/`. Pushing a tag such as `v0.3.3` builds both on GitHub Actions and attaches them to a release.
+Releases follow [RELEASING.md](RELEASING.md); every release must update all the documentation
+first, and the release workflow checks it.
 
 ## Lightroom reference plugin
 

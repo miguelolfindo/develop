@@ -1,45 +1,48 @@
-## Develop 0.3.2
+## Develop 0.3.3
 
-### Retouch: heal and clone
-- New **Retouch** section (press **Q**): click a dust spot or blemish to remove it, or
-  **paint over** a longer one, such as a wire, a branch or a scratch. Develop picks a nearby
-  area to copy from.
-- **Heal** blends the copied area into its surroundings, even across wide painted patches;
-  **Clone** copies it exactly.
-- Spots are layered in order: clone out an awkward edge first, then heal over it, and the
-  heal works from the cloned result.
-- Drag either outline to move it. `[` `]` change the brush size, Shift+`[` `]` the feather,
-  and each spot has its own opacity. Space+drag pans, Delete removes the selected spot, H
-  hides the outlines, Esc finishes.
-- Spots are saved with the photo, can be undone, and are copied with Copy / Paste settings
-  (handy for sensor dust across a series).
+### Presets
+- Save the current look as a **preset** (optionally with its white balance) and apply it to the
+  open photo or to every selected photo with one click. Presets carry tone, presence, colour,
+  curve, mixer, detail and profile settings; crop, rotation, lens correction and retouching stay
+  as they are on each photo.
 
-### Tone Curve and Color Mixer
-- **Tone Curve:** a point curve you edit on the graph (click to add a point, drag it,
-  double-click to remove it) and Lightroom's four regions: Highlights, Lights, Darks and
-  Shadows. Fitted to Lightroom's own exports: a curve lands within about 1 to 2 levels of
-  Lightroom's.
-- **Color Mixer:** hue, saturation and luminance for eight colours, fitted to Lightroom's
-  exports (close, not yet exact; purple and magenta are not calibrated yet).
+### Versions
+- Keep several **versions** of a photo's edit: save, switch (Undo goes back), update and delete
+  them, and compare any version with the current edit in the A/B split.
+- Versions appear in the **filmstrip** as smaller cards (V1, V2…) grouped with their photo, each
+  with a thumbnail of that version. Click one to open the photo at that version.
+- Versions are saved in the photo's `.dvlp` file, so they travel with it.
 
-### White balance eyedropper
-- Click **Pick** in White Balance (or press **W**), then click something on the photo that
-  should be neutral grey or white.
+### Black & White
+- A **Color / Black & White** treatment switch in the Profile section. In black and white, the
+  Color Mixer becomes a **B&W Mix**: one slider per colour sets how bright it turns out in grey
+  (darker skies, brighter skin and sand).
 
-### A tidier edit panel
-- The sections now follow the order most photos are edited in: Profile, Crop, White
-  Balance, Tone, Presence, Tone Curve, Color Mixer, Detail, Lens Correction, Retouch.
-- Vibrance and Saturation moved into Presence, as in Lightroom.
+### AI assistants (MCP)
+- Develop now includes an **MCP server**, so an AI assistant (Claude, Gemini, ChatGPT-based tools,
+  local models in LM Studio, Cursor, VS Code Copilot, Codex and others) can help with your photos:
+  list a folder, read and change edits, apply presets, rate, save and restore versions, export,
+  and convert to DNG.
+- Assistants can **look at a preview**, or **measure a photo with numbers** (histogram, clipping,
+  colour cast, contrast, sharpness) so even models that cannot see images can check their work.
+- **Your work is protected:** your edit is kept as a `Before AI` version before an assistant
+  changes anything, each request's changes go into one clearly labelled `AI ·` version per photo,
+  and versions you made can never be changed or removed by an assistant.
+- Setup for each AI app and everything else is in the new [MCP guide](docs/MCP.md).
+
+### Documentation
+- A complete **[user guide](docs/USER-GUIDE.md)** covering every feature, keyboard shortcuts,
+  where edits are kept and troubleshooting.
 
 ### Fixes
-- **AI Denoise** no longer turns phone DNGs (such as Samsung Galaxy S24 Ultra Expert RAW)
-  reddish, and no longer draws red fringes around bright edges.
-- **AI Denoise** on Fujifilm X-Trans raws gave badly wrong colours; it now works properly.
+- **Ctrl+C / Ctrl+V** for copying settings stopped working when the clipboard held a picture
+  (a screenshot, for example) or nothing at all. Copying now also puts a line of text on the
+  clipboard, so pasting always works.
 
 ### Installing
-- **Windows:** run `develop_0.3.2_x64-setup.exe`. It installs over an earlier version and
+- **Windows:** run `develop_0.3.3_x64-setup.exe`. It installs over an earlier version and
   keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.2_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.3_aarch64.dmg`, see below.
 
 #### macOS
 
@@ -78,9 +81,10 @@ codesign --force --deep --sign - /Applications/Develop.app
 ```
 
 ### Known limitations
-- The Color Mixer is calibrated on one photo so far; purple and magenta are approximate.
-- Heal brings in the colour of whatever surrounds the spot; next to busy detail, clone the
-  edge first and heal over it.
+- The Color Mixer and B&W Mix are calibrated on one reference photo so far; purple and magenta
+  are approximate.
+- Changes an AI assistant makes while Develop is open on the same photo show when the photo is
+  opened again.
 - DNG lens corrections come from Lensfun lens profiles, so they are close to, not identical
   with, Adobe's built-in corrections.
 - Cameras outside the five calibrated brands may differ slightly from Lightroom.

@@ -15,6 +15,8 @@ mod export;
 mod filmstrip;
 mod heic;
 mod lens;
+mod mcp;
+mod measure;
 mod network;
 mod pipeline;
 mod profile;
@@ -48,6 +50,24 @@ fn main() -> eframe::Result<()> {
             Err(e) => e,
         };
         let _ = std::fs::write(&args[3], text);
+        return Ok(());
+    }
+
+    // `app --mcp`: an MCP server on stdin / stdout for AI assistants (see mcp.rs).
+    // `app --mcp-http <port> [--mcp-token <token>]`: the same over HTTP on this computer.
+    if args.len() >= 2 && args[1] == "--mcp" {
+        mcp::serve_stdio();
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--mcp-http" {
+        #[cfg(windows)]
+        unsafe {
+            // A windowed program has no console: use the terminal it was started from.
+            let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        }
+        let port = args[2].parse().unwrap_or(8765);
+        let token = args.iter().position(|a| a == "--mcp-token").and_then(|i| args.get(i + 1)).cloned();
+        mcp::serve_http(port, token);
         return Ok(());
     }
 
@@ -457,12 +477,29 @@ struct App {
     regions: [f32; 4],
     hsl: [[f32; 8]; 3],
     hsl_tab: usize,
+    /// Black & white, and its mix (how bright each colour becomes, -100..100).
+    mono: bool,
+    mono_mix: [f32; 8],
+    /// Develop presets, the name typed for a new one, and whether it takes white balance.
+    develop_presets: settings::Presets,
+    develop_preset_name: String,
+    preset_wb: bool,
+    /// The name typed for a new version, and a version shown as "before" in the A/B split.
+    version_name: String,
+    compare: Option<settings::Saved>,
+    /// A version to switch to once its photo has opened (clicked in the filmstrip).
+    pending_version: Option<(PathBuf, usize)>,
     curve_drag: Option<usize>,
     /// The white balance eyedropper is waiting for a click on the picture (W).
     wb_pick: bool,
     /// Scroll the edit panel to the Tone Curve and Color Mixer on the next frame (`--show-curve`,
     /// for testing).
     curve_reveal: bool,
+    /// Open the Presets and Versions sections on the next frame (`--open-sections`, testing).
+    sections_reveal: bool,
+    /// Command-line runs: apply the photo's saved settings (`--with-settings 1`, used by the
+    /// MCP server's previews and exports) without remembering anything.
+    with_settings: bool,
     lens: lens::LensSettings,
     lens_db: lens::Database,
     lens_auto: Option<usize>,
@@ -614,9 +651,19 @@ impl App {
             regions: [0.0; 4],
             hsl: [[0.0; 8]; 3],
             hsl_tab: 1,
+            mono: false,
+            mono_mix: [0.0; 8],
+            develop_presets: settings::Presets::load(),
+            develop_preset_name: String::new(),
+            preset_wb: false,
+            version_name: String::new(),
+            compare: None,
+            pending_version: None,
             curve_drag: None,
             wb_pick: false,
             curve_reveal: false,
+            sections_reveal: false,
+            with_settings: false,
             lens: lens::LensSettings::default(),
             lens_db: lens::Database::load(),
             lens_auto: None,
@@ -914,6 +961,9 @@ impl App {
                 self.curve = tone::identity_curve();
                 self.regions = [0.0; 4];
                 self.hsl = [[0.0; 8]; 3];
+                self.mono = false;
+                self.mono_mix = [0.0; 8];
+                self.compare = None;
                 self.curve_drag = None;
                 self.spots.clear();
                 self.spot_selected = None;
@@ -1087,6 +1137,15 @@ impl App {
                         "--spot-tool" => self.set_spot_tool(value > 0.5),
                         "--wb-pick" => self.wb_pick = value > 0.5,
                         "--show-curve" => self.curve_reveal = value > 0.5,
+                        // Black & white, for testing: `--mono 1 --mono-yellow 60`.
+                        "--mono" => self.mono = value > 0.5,
+                        other if other.starts_with("--mono-") => {
+                            if let Some(i) = tone::COLOURS.iter().position(|c| c.0.eq_ignore_ascii_case(other.trim_start_matches("--mono-"))) {
+                                self.mono_mix[i] = value.clamp(-100.0, 100.0);
+                            }
+                        }
+                        "--open-sections" => self.sections_reveal = value > 0.5,
+                        "--with-settings" => self.with_settings = value > 0.5,
                         // `--wb-x 0.3 --wb-y 0.6`: what a click there with the eyedropper sets
                         // (texture coordinates), for testing.
                         "--wb-x" => self.spot_brush.sx = value,
@@ -1142,8 +1201,11 @@ impl App {
                 // The camera's preview stands for the defaults; an edited photo's thumbnail
                 // is drawn again once it is open.
                 self.thumb_shows = self.defaults.clone();
-                if self.remember {
-                    let saved = self.loaded.as_ref().and_then(|l| self.store.get(&l.path)).cloned();
+                if self.remember || self.with_settings {
+                    let saved = match self.remember {
+                        true => self.loaded.as_ref().and_then(|l| self.store.get(&l.path)).cloned(),
+                        false => self.loaded.as_ref().and_then(|l| settings::read_sidecar(&l.path)),
+                    };
                     if let Some(saved) = saved {
                         self.apply_saved(&saved);
                         if saved.quarter_turns < 4 {
@@ -1172,6 +1234,50 @@ impl App {
     /// Keep the open photo's filmstrip thumbnail showing its edit: once the mouse is let go
     /// after a change, render the picture small with the current settings, show it in the
     /// strip and save it for next time. Back at the defaults, the camera's preview returns.
+    /// Render a thumbnail for one of the open photo's versions that has none yet (one a
+    /// frame), and save it for the filmstrip. The version's settings are put on the photo for
+    /// the render and the current edit is put straight back.
+    fn update_version_thumbs(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        if self.render.is_none() || self.loading.is_some() || self.pending_version.is_some() || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let versions = self.store.versions(&path).to_vec();
+        let Some(version) = versions.iter().find(|v| {
+            let key = settings::version_key(&path, v);
+            !self.filmstrip.has_version_thumb(&key) && !settings::version_thumb_file(&key).is_some_and(|f| f.is_file())
+        }) else {
+            return;
+        };
+        let key = settings::version_key(&path, version);
+        let current = self.snapshot();
+        self.restore_snapshot(&version.saved);
+        let rendered = self.loaded.as_ref().and_then(|loaded| {
+            let (width, height) = self.output_size(loaded);
+            let thumb_h = 200u32;
+            let thumb_w = ((width as f32 * thumb_h as f32 / height.max(1) as f32).round() as u32).max(1);
+            let uniforms = self.uniforms(loaded, [1.0, 1.0, 0.5, 0.5], true);
+            let rs = &self.render_state;
+            let renderer = rs.renderer.read();
+            renderer
+                .callback_resources
+                .get::<ImageRenderer>()
+                .and_then(|res| res.render_full(&rs.device, &rs.queue, &uniforms, thumb_w, thumb_h, self.crop_region()).ok())
+                .map(|rgb16| (rgb16, thumb_w, thumb_h))
+        });
+        self.restore_snapshot(&current);
+        let Some((rgb16, w, h)) = rendered else { return };
+        let rgb8: Vec<u8> = rgb16.iter().map(|&v| ((v as u32 * 255 + 32767) / 65535) as u8).collect();
+        if let Some(file) = settings::version_thumb_file(&key) {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = image::save_buffer_with_format(&file, &rgb8, w, h, image::ColorType::Rgb8, image::ImageFormat::Jpeg);
+        }
+        self.filmstrip.set_version_thumb(ctx, &key, egui::ColorImage::from_rgb([w as usize, h as usize], &rgb8));
+        ctx.request_repaint();
+    }
+
     fn update_thumbnail(&mut self, ctx: &egui::Context) {
         let (Some(loaded), Some(defaults)) = (&self.loaded, &self.defaults) else { return };
         if self.render.is_none() || self.loading.is_some() {
@@ -1235,6 +1341,8 @@ impl App {
         self.curve = saved.curve.clone();
         self.regions = saved.regions;
         self.hsl = saved.hsl;
+        self.mono = saved.mono;
+        self.mono_mix = saved.mono_mix;
         self.curve_drag = None;
         self.spots = saved.spots.clone();
         self.spot_selected = self.spot_selected.filter(|&i| i < self.spots.len());
@@ -1286,6 +1394,13 @@ impl App {
                 } else {
                     self.store.get(&path).cloned()
                 };
+                // Also put a line of text on the system clipboard. On Windows, Ctrl+V only
+                // reaches Develop when the clipboard holds text, so without this a paste after
+                // copying a screenshot (or with an empty clipboard) did nothing.
+                if self.clipboard.is_some() {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    ctx.output_mut(|o| o.copied_text = format!("Develop settings copied from {name}"));
+                }
             }
             Action::Paste(targets) => {
                 let Some(copied) = self.clipboard.clone() else { return };
@@ -1312,6 +1427,26 @@ impl App {
                     }
                 }
             }
+            Action::OpenVersion(path, n) => {
+                if open.as_ref() == Some(&path) {
+                    if let Some(v) = self.store.versions(&path).get(n).cloned() {
+                        self.restore_snapshot(&v.saved);
+                    }
+                } else {
+                    self.pending_version = Some((path.clone(), n));
+                    self.start_loading(path, ctx);
+                }
+            }
+            Action::DeleteVersion(path, n) => {
+                let mut versions = self.store.versions(&path).to_vec();
+                if n < versions.len() {
+                    if let Some(file) = settings::version_thumb_file(&settings::version_key(&path, &versions[n])) {
+                        let _ = std::fs::remove_file(file);
+                    }
+                    versions.remove(n);
+                    self.store.set_versions(&path, versions);
+                }
+            }
             Action::Rate(targets, stars) => {
                 for target in targets {
                     self.store.set_rating(&target, stars);
@@ -1332,6 +1467,8 @@ impl App {
             curve: self.curve.clone(),
             regions: self.regions,
             hsl: self.hsl,
+            mono: self.mono,
+            mono_mix: self.mono_mix,
             lens: self.lens.clone(),
             spots: self.spots.clone(),
             values: self.adjust.to_array(),
@@ -1411,6 +1548,12 @@ impl App {
             u.hsl = tone::hsl_uniform(&self.hsl);
             u.hsl_info[0] = 1.0;
         }
+        if self.mono {
+            u.mono_info[0] = 1.0;
+            for (i, v) in self.mono_mix.iter().enumerate() {
+                u.mono_mix[i / 4][i % 4] = v / 100.0;
+            }
+        }
         u
     }
 
@@ -1453,6 +1596,27 @@ impl App {
     /// The same picture with the photo's default sliders: the "before" of the A/B split.
     /// Profile, crop, rotation and denoise stay as they are.
     fn uniforms_before(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool) -> Uniforms {
+        // A version picked for comparison is the "before", with its colour treatment.
+        if let Some(v) = &self.compare {
+            let mut u = self.uniforms_with(loaded, view, shader_encodes_srgb, &Adjust::from_array(v.values), v.tint, v.sharpen, v.presence, &v.lens);
+            if !tone::curve_is_identity(&v.curve, &v.regions) {
+                for (i, x) in tone::lut(&v.curve, &v.regions).iter().enumerate() {
+                    u.curve_lut[i / 4][i % 4] = *x;
+                }
+                u.curve_info[0] = 1.0;
+            }
+            if v.hsl.iter().flatten().any(|x| x.abs() > 1e-3) {
+                u.hsl = tone::hsl_uniform(&v.hsl);
+                u.hsl_info[0] = 1.0;
+            }
+            if v.mono {
+                u.mono_info[0] = 1.0;
+                for (i, x) in v.mono_mix.iter().enumerate() {
+                    u.mono_mix[i / 4][i % 4] = x / 100.0;
+                }
+            }
+            return u;
+        }
         match &self.defaults {
             Some(d) => self.uniforms_with(loaded, view, shader_encodes_srgb, &Adjust::from_array(d.values), d.tint, d.sharpen, d.presence, &d.lens),
             None => self.uniforms(loaded, view, shader_encodes_srgb),
@@ -1549,6 +1713,8 @@ impl App {
             curve_info: [0.0; 4],
             hsl: [[0.0; 4]; 6],
             hsl_info: [0.0; 4],
+            mono_info: [0.0; 4],
+            mono_mix: [[0.0; 4]; 2],
             srgb_to_work: {
                 let inv = color::invert(&render.work_to_srgb).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
                 rows(&inv)
@@ -2386,7 +2552,12 @@ impl App {
     /// Put a recorded state back on the open photo.
     fn restore_snapshot(&mut self, saved: &settings::Saved) {
         self.apply_saved(saved);
-        self.quarter_turns = saved.quarter_turns % 4;
+        // 255 (settings saved in their stored form, as by the MCP server) means the camera's
+        // own orientation.
+        self.quarter_turns = match saved.quarter_turns {
+            q if q < 4 => q,
+            _ => self.defaults.as_ref().map_or(self.quarter_turns, |d| d.quarter_turns % 4),
+        };
         self.crop = saved.crop;
         self.crop_wish = saved.crop;
         self.angle = saved.angle;
@@ -2983,6 +3154,189 @@ impl App {
         }
     }
 
+    /// The "B&W Mix" section (black & white): how bright each colour becomes.
+    fn mono_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(ui::dim("Brighten or darken each colour's grey", 11.5));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let changed = self.mono_mix.iter().any(|v| v.abs() > 1e-3);
+                if ui.add_enabled_ui(changed, |ui| ui::button(ui, "Reset", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(11.5), None)).inner.clicked() {
+                    self.mono_mix = [0.0; 8];
+                }
+            });
+        });
+        ui.add_space(4.0);
+        for (i, (name, _, rgb)) in tone::COLOURS.iter().enumerate() {
+            let colour = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+            ui::pro_slider_with(ui, name, &mut self.mono_mix[i], -100.0..=100.0, 0.0, "", colour, 0, 1.0, false);
+        }
+    }
+
+    /// A photo's settings with nothing changed, for a photo that has never been edited (the
+    /// camera's white balance and rotation, Develop's defaults otherwise).
+    fn blank_saved(&self) -> settings::Saved {
+        settings::Saved {
+            values: Adjust { kelvin: 0.0, ..Adjust::default() }.to_array(),
+            quarter_turns: 255,
+            profile: String::new(),
+            denoise: false,
+            crop: crop::FULL,
+            angle: 0.0,
+            sharpen: settings::SHARPEN_DEFAULT,
+            tint: 0.0,
+            presence: [0.0; 3],
+            lens: lens::LensSettings::default(),
+            spots: Vec::new(),
+            curve: tone::identity_curve(),
+            regions: [0.0; 4],
+            hsl: [[0.0; 8]; 3],
+            mono: false,
+            mono_mix: [0.0; 8],
+        }
+    }
+
+    /// Apply a develop preset to `targets` (the open photo and/or others).
+    fn apply_preset(&mut self, name: &str, targets: &[PathBuf]) {
+        let Some(preset) = self.develop_presets.get(name).cloned() else { return };
+        let open = self.loaded.as_ref().map(|l| l.path.clone());
+        for target in targets {
+            if open.as_ref() == Some(target) {
+                let current = self.storable(self.snapshot());
+                self.apply_saved(&preset.apply_to(&current));
+            } else {
+                let base = self.store.get(target).cloned().unwrap_or_else(|| self.blank_saved());
+                self.store.put(target, preset.apply_to(&base));
+                if let Some(file) = settings::thumb_file(target) {
+                    let _ = std::fs::remove_file(file);
+                }
+                self.filmstrip.reload(target);
+            }
+        }
+    }
+
+    /// The "Presets" section.
+    fn presets_panel(&mut self, ui: &mut egui::Ui) {
+        let open = self.loaded.as_ref().map(|l| l.path.clone());
+        let targets = self.filmstrip.targets(open.as_deref());
+        let mut apply = None;
+        let mut remove = None;
+        if self.develop_presets.list.is_empty() {
+            ui.label(ui::dim("No presets yet. Save the current look below.", 11.5));
+        }
+        let hint = if targets.len() > 1 { format!("Apply to the {} selected photos", targets.len()) } else { "Apply to this photo".to_owned() };
+        for preset in &self.develop_presets.list {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("Delete this preset").clicked() {
+                        remove = Some(preset.name.clone());
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let label = if preset.white_balance { format!("{}  ·  WB", preset.name) } else { preset.name.clone() };
+                        let row = ui.add_enabled(!targets.is_empty(), egui::Label::new(egui::RichText::new(label).color(theme::TEXT)).sense(egui::Sense::click()).truncate(true));
+                        if row.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if row.on_hover_text(&hint).clicked() {
+                            apply = Some(preset.name.clone());
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(name) = apply {
+            self.apply_preset(&name, &targets);
+        }
+        if let Some(name) = remove {
+            self.develop_presets.remove(&name);
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let name = settings::clean_name(&self.develop_preset_name);
+                if ui.add_enabled_ui(!name.is_empty() && self.loaded.is_some(), |ui| ui::button(ui, "Save", egui::vec2(52.0, 22.0), ui::Look::bordered(), theme::font(11.5), None)).inner.on_hover_text("Save the current tone, presence, colour, curve, mixer, detail and profile settings (a preset with the same name is replaced)").clicked() {
+                    let saved = self.storable(self.snapshot());
+                    self.develop_presets.add(settings::Preset { name, white_balance: self.preset_wb, saved });
+                    self.develop_preset_name.clear();
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.develop_preset_name).hint_text("New preset name").desired_width(ui.available_width()));
+            });
+        });
+        ui.checkbox(&mut self.preset_wb, "Include white balance");
+    }
+
+    /// The "Versions" section.
+    fn versions_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else {
+            ui.label(ui::dim("Open a photo to save versions of its edit.", 11.5));
+            return;
+        };
+        let mut versions = self.store.versions(&path).to_vec();
+        let mut changed = false;
+        let mut restore = None;
+        if versions.is_empty() {
+            ui.label(ui::dim("No versions yet. Save one to come back to this edit later.", 11.5));
+        }
+        let mut remove = None;
+        for (i, v) in versions.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("Delete this version").clicked() {
+                        remove = Some(i);
+                    }
+                    if ui.small_button("Update").on_hover_text("Replace this version with the current edit").clicked() {
+                        v.saved = self.snapshot();
+                        v.time = settings::now_seconds();
+                        changed = true;
+                    }
+                    let comparing = self.compare.as_ref() == Some(&v.saved) && self.ab_split;
+                    if ui.selectable_label(comparing, "A/B").on_hover_text("Show this version as before in the A/B split").clicked() {
+                        if comparing {
+                            self.compare = None;
+                            self.ab_split = false;
+                        } else {
+                            self.compare = Some(v.saved.clone());
+                            self.ab_split = true;
+                        }
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let text = egui::RichText::new(format!("{}   ", v.name)).color(theme::TEXT);
+                        let row = ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate(true));
+                        ui.label(ui::dim(&when(v.time), 11.0));
+                        if row.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if row.on_hover_text("Switch to this version (Undo goes back)").clicked() {
+                            restore = Some(v.saved.clone());
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(i) = remove {
+            versions.remove(i);
+            changed = true;
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let default_name = format!("Version {}", versions.len() + 1);
+                if ui::button(ui, "Save", egui::vec2(52.0, 22.0), ui::Look::bordered(), theme::font(11.5), None).on_hover_text("Save the current edit as a version of this photo").clicked() {
+                    let name = settings::clean_name(&self.version_name);
+                    versions.push(settings::Version { name: if name.is_empty() { default_name.clone() } else { name }, time: settings::now_seconds(), saved: self.snapshot() });
+                    self.version_name.clear();
+                    changed = true;
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.version_name).hint_text(default_name).desired_width(ui.available_width()));
+            });
+        });
+        if changed {
+            self.store.set_versions(&path, versions);
+        }
+        if let Some(saved) = restore {
+            self.restore_snapshot(&saved);
+        }
+    }
+
     fn reset_all(&mut self) {
         // White balance goes back to what the camera recorded for this file (5500 K with no file).
         let kelvin = self.loaded.as_ref().map_or(KELVIN_DEFAULT, |l| l.color.as_shot_kelvin);
@@ -2993,6 +3347,8 @@ impl App {
         self.curve = tone::identity_curve();
         self.regions = [0.0; 4];
         self.hsl = [[0.0; 8]; 3];
+        self.mono = false;
+        self.mono_mix = [0.0; 8];
         self.spots.clear();
         self.spot_selected = None;
         self.lens = lens::LensSettings::default();
@@ -3200,7 +3556,24 @@ impl App {
         let amber = theme::ACCENT;
         // In the order most photos are worked on: profile, crop, white balance, tone, presence,
         // detail, lens. Retouching comes last, after the darkroom adjustments.
+        if std::mem::take(&mut self.sections_reveal) {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(egui::Id::new(("section", "Presets")), true);
+                d.insert_temp(egui::Id::new(("section", "Versions")), true);
+            });
+        }
+        ui::section(ui, "Presets", false, "Save the current look as a preset, and apply presets to the open or selected photos", |ui| self.presets_panel(ui));
+        ui::section(ui, "Versions", false, "Save versions of this photo's edit, switch between them, compare one with the current edit", |ui| self.versions_panel(ui));
         ui::section(ui, "Profile", true, "How the camera's colours and base tone are rendered", |ui| {
+            // Colour or black & white treatment.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Treatment").color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.mono, true, "Black & White").on_hover_text("Black and white, with a B&W mix that sets how bright each colour becomes");
+                    ui.selectable_value(&mut self.mono, false, "Color");
+                });
+            });
+            ui.add_space(2.0);
             let is_raw = self.input_mode != 2;
             ui.add_enabled_ui(is_raw, |ui| {
                 ui.horizontal(|ui| {
@@ -3286,15 +3659,22 @@ impl App {
             ui::pro_slider_with(ui, "Dehaze", dehaze, -100.0..=100.0, 0.0, "", amber, 0, 1.0, false);
             ui.add_space(8.0);
             let a = &mut self.adjust;
-            ui::pro_slider(ui, "Vibrance", &mut a.vibrance, -100.0..=100.0, 0.0, "", amber);
-            ui::pro_slider(ui, "Saturation", &mut a.saturation, -100.0..=100.0, 0.0, "", amber);
+            // No colour to adjust in black & white.
+            ui.add_enabled_ui(!self.mono, |ui| {
+                ui::pro_slider(ui, "Vibrance", &mut a.vibrance, -100.0..=100.0, 0.0, "", amber);
+                ui::pro_slider(ui, "Saturation", &mut a.saturation, -100.0..=100.0, 0.0, "", amber);
+            });
         });
 
         ui::section(ui, "Tone Curve", true, "Click the curve to add a point, drag points, double-click a point to remove it", |ui| self.curve_panel(ui));
         if std::mem::take(&mut self.curve_reveal) {
             ui.scroll_to_cursor(Some(egui::Align::Center));
         }
-        ui::section(ui, "Color Mixer", true, "Hue, saturation and luminance of eight colours", |ui| self.mixer_panel(ui));
+        if self.mono {
+            ui::section(ui, "B&W Mix", true, "How bright each colour becomes in black and white", |ui| self.mono_panel(ui));
+        } else {
+            ui::section(ui, "Color Mixer", true, "Hue, saturation and luminance of eight colours", |ui| self.mixer_panel(ui));
+        }
 
         ui::section(ui, "Detail", true, "", |ui| {
             let has_model = denoise::model_path(denoise::Model::Bayer).is_some() || denoise::model_path(denoise::Model::Linear).is_some();
@@ -3774,6 +4154,19 @@ impl eframe::App for App {
         self.export_windows(ctx);
         // Record finished edits in the open photo's undo history.
         self.track_history(ctx);
+        // A version clicked in the filmstrip, once its photo is open and its history has
+        // started (so Undo goes back to the edit it had).
+        if let Some((path, n)) = self.pending_version.clone() {
+            if self.loading.is_none() && self.loaded.as_ref().map(|l| &l.path) == Some(&path) {
+                self.pending_version = None;
+                if let Some(v) = self.store.versions(&path).get(n).cloned() {
+                    self.restore_snapshot(&v.saved);
+                }
+            } else if self.loading.is_none() && self.loading_path.is_none() && self.loaded.as_ref().map(|l| &l.path) != Some(&path) {
+                // Opening it failed or another photo was opened meanwhile.
+                self.pending_version = None;
+            }
+        }
 
         let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
         if let Some(path) = dropped {
@@ -3981,6 +4374,7 @@ impl eframe::App for App {
                 self.store.update(&loaded.path, &current, &defaults);
             }
             self.update_thumbnail(ctx);
+            self.update_version_thumbs(ctx);
             self.store.flush(false);
             if self.store.pending() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -4112,4 +4506,35 @@ impl SpotInput<'_> {
         self.spots.push(spots::Spot { x, y, sx: x + dx, sy: y + dy, path: points[1..].to_vec(), ..brush.clone() });
         *self.selected = Some(self.spots.len() - 1);
     }
+}
+
+/// When a version was saved, briefly: "14:32" today, "12 Nov" this year, else "12 Nov 2025".
+fn when(seconds: u64) -> String {
+    let now = settings::now_seconds();
+    // Local time is not needed to the minute here; UTC offset from the system is enough.
+    let days = |s: u64| s / 86_400;
+    let (y, m, d) = civil(days(seconds) as i64);
+    let (ny, _, _) = civil(days(now) as i64);
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    if days(seconds) == days(now) {
+        let t = seconds % 86_400;
+        format!("today {:02}:{:02} UTC", t / 3600, t / 60 % 60)
+    } else if y == ny {
+        format!("{d} {}", MONTHS[(m - 1) as usize])
+    } else {
+        format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+    }
+}
+
+/// Year, month, day from days since 1970 (Howard Hinnant's civil-from-days).
+fn civil(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
 }

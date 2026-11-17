@@ -28,6 +28,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the previous release tag is needed for the documentation check
+      # HARD RULE (RELEASING.md): every release updates all the documentation. No release is
+      # made unless the release notes match this version and the user documentation changed
+      # since the previous release.
+      - name: Check the documentation is updated for this release
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          fail() { echo "::error::$1 Every release must update the documentation: see RELEASING.md."; exit 1; }
+          [ "$(head -n 1 RELEASE_NOTES.md | tr -d '\r')" = "## Develop ${version}" ] || fail "RELEASE_NOTES.md must start with '## Develop ${version}'."
+          grep -q "^version = \"${version}\"" Cargo.toml || fail "Cargo.toml's version is not ${version}."
+          prev=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            changed=$(git diff --name-only "$prev" "$tag")
+            for f in RELEASE_NOTES.md README.md docs/USER-GUIDE.md; do
+              echo "$changed" | grep -qx "$f" || fail "$f was not updated since ${prev}."
+            done
+            if echo "$changed" | grep -qE '^src/(mcp|measure)\.rs$'; then
+              for f in docs/MCP.md docs/develop-skill/SKILL.md; do
+                echo "$changed" | grep -qx "$f" || fail "The MCP server changed since ${prev} but $f was not updated."
+              done
+            fi
+            echo "Documentation updated since ${prev}:"
+            echo "$changed" | grep -E '\.md$' || true
+          fi
       - name: Create the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}

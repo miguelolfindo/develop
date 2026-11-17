@@ -92,6 +92,9 @@ struct Params {
     srgb_to_work_0: vec4<f32>,
     srgb_to_work_1: vec4<f32>,
     srgb_to_work_2: vec4<f32>,
+    // Black & white: x = 1 when on; grey brightness per colour (-1..1), eight in two vec4.
+    mono_info: vec4<f32>,
+    mono_mix: array<vec4<f32>, 2>,
 };
 
 // The gamma the tone curve's 0..1 scale is on (measured on Lightroom's point curves).
@@ -266,6 +269,44 @@ fn color_mixer(work: vec3<f32>) -> vec3<f32> {
         dot(params.srgb_to_work_0.xyz, back),
         dot(params.srgb_to_work_1.xyz, back),
         dot(params.srgb_to_work_2.xyz, back),
+    );
+}
+
+// Black & white: grey at the colour's own luminance, made brighter or darker by how the B&W
+// mix sets the colour's band (blended between the two nearest bands as in the Color Mixer).
+// Up to about 1.2 stops at 100, more for saturated colours; greys stay as they are.
+fn mono_value(k: i32) -> f32 {
+    let i = k % 8;
+    return params.mono_mix[i / 4][i % 4];
+}
+
+fn black_and_white(work: vec3<f32>) -> vec3<f32> {
+    let srgb_raw = vec3<f32>(
+        dot(params.work_to_srgb_0.xyz, work),
+        dot(params.work_to_srgb_1.xyz, work),
+        dot(params.work_to_srgb_2.xyz, work),
+    );
+    let lin = clamp(srgb_raw, vec3<f32>(0.0), vec3<f32>(1.0));
+    let hsv = rgb_to_hsv(srgb_encode(lin));
+    var deg = hsv.x * 60.0;
+    if (deg >= mixer_centre(8)) {
+        deg -= 360.0;
+    }
+    var k = 0;
+    for (var j = 1; j < 8; j++) {
+        if (deg >= mixer_centre(j)) {
+            k = j;
+        }
+    }
+    let t = smoothstep(0.0, 1.0, (deg - mixer_centre(k)) / (mixer_centre(k + 1) - mixer_centre(k)));
+    let amount = mix(mono_value(k), mono_value(k + 1), t);
+    let strength = pow(clamp(hsv.y / 0.45, 0.0, 1.0), 0.6) * smoothstep(0.02, 0.15, hsv.y);
+    let y = dot(srgb_raw, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let grey = vec3<f32>(max(y, 0.0) * exp2(1.2 * amount * strength));
+    return vec3<f32>(
+        dot(params.srgb_to_work_0.xyz, grey),
+        dot(params.srgb_to_work_1.xyz, grey),
+        dot(params.srgb_to_work_2.xyz, grey),
     );
 }
 
@@ -1125,8 +1166,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = mix(by_luma, fitted_curve(color), 0.75);
     }
 
-    // 5b. Color Mixer, on the picture as displayed.
-    if (params.hsl_info.x > 0.5) {
+    // 5b. Color Mixer, or the black & white conversion, on the picture as displayed.
+    if (params.mono_info.x > 0.5) {
+        color = black_and_white(color);
+    } else if (params.hsl_info.x > 0.5) {
         color = color_mixer(color);
     }
 

@@ -69,9 +69,16 @@ struct Job {
     path: PathBuf,
     /// Saved thumbnail of the edited photo, used instead of the camera's preview if present.
     cache: Option<PathBuf>,
+    /// For a version's thumbnail, its key (see settings::version_key); only `cache` is read.
+    version: Option<String>,
 }
 
-type Done = (u64, usize, Option<egui::ColorImage>);
+type Done = (u64, usize, Option<String>, Option<egui::ColorImage>);
+
+/// Version cards are a little narrower than photo cards and sit this far apart inside their
+/// photo's group.
+const VERSION_CARD: f32 = 80.0;
+const GROUP_GAP: f32 = 4.0;
 
 pub struct Filmstrip {
     dir: Option<PathBuf>,
@@ -88,6 +95,9 @@ pub struct Filmstrip {
     min_stars: u8,
     sort: Sort,
     ascending: bool,
+    /// Thumbnails of saved versions, by version key. A version without a rendered thumbnail
+    /// yet shows its photo's thumbnail until the photo is opened.
+    version_thumbs: std::collections::HashMap<String, Thumb>,
 }
 
 impl Filmstrip {
@@ -110,18 +120,19 @@ impl Filmstrip {
                 if job.generation != generation.load(Ordering::Relaxed) {
                     continue;
                 }
-                let image = std::panic::catch_unwind(|| {
-                    job.cache.as_deref().and_then(cached_thumbnail).or_else(|| thumbnail(&job.path))
+                let image = std::panic::catch_unwind(|| match job.version {
+                    Some(_) => job.cache.as_deref().and_then(cached_thumbnail),
+                    None => job.cache.as_deref().and_then(cached_thumbnail).or_else(|| thumbnail(&job.path)),
                 })
                 .ok()
                 .flatten();
-                if done_tx.send((job.generation, job.index, image)).is_err() {
+                if done_tx.send((job.generation, job.index, job.version, image)).is_err() {
                     return;
                 }
                 ctx.request_repaint();
             });
         }
-        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, sort: Sort::CaptureDate, ascending: true }
+        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, sort: Sort::CaptureDate, ascending: true, version_thumbs: Default::default() }
     }
 
     /// Show `dir`'s raw files. Does nothing if that folder is already showing.
@@ -193,7 +204,15 @@ impl Filmstrip {
     /// Turn finished thumbnails into textures.
     pub fn poll(&mut self, ctx: &egui::Context) {
         let generation = self.generation.load(Ordering::Relaxed);
-        while let Ok((job_generation, index, image)) = self.done.try_recv() {
+        while let Ok((job_generation, index, version, image)) = self.done.try_recv() {
+            if let Some(key) = version {
+                let thumb = match image {
+                    Some(image) => Thumb::Ready(ctx.load_texture(format!("version {key}"), image, egui::TextureOptions::LINEAR)),
+                    None => Thumb::Failed,
+                };
+                self.version_thumbs.insert(key, thumb);
+                continue;
+            }
             if job_generation != generation {
                 continue;
             }
@@ -214,6 +233,17 @@ impl Filmstrip {
             let texture = ctx.load_texture(format!("thumb{index}"), image, egui::TextureOptions::LINEAR);
             self.items[index].thumb = Thumb::Ready(texture);
         }
+    }
+
+    /// Use a freshly rendered thumbnail for a version.
+    pub fn set_version_thumb(&mut self, ctx: &egui::Context, key: &str, image: egui::ColorImage) {
+        let texture = ctx.load_texture(format!("version {key}"), image, egui::TextureOptions::LINEAR);
+        self.version_thumbs.insert(key.to_owned(), Thumb::Ready(texture));
+    }
+
+    /// True when a version's thumbnail has been rendered (or is being read from disk).
+    pub fn has_version_thumb(&self, key: &str) -> bool {
+        matches!(self.version_thumbs.get(key), Some(Thumb::Ready(_)) | Some(Thumb::Pending))
     }
 
     /// Load a photo's thumbnail again (after its edit was reset).
@@ -369,6 +399,10 @@ impl Filmstrip {
                     if index >= self.items.len() {
                         break; // the folder was just read again
                     }
+                    let versions: Vec<crate::settings::Version> = store.versions(&self.items[index].path).to_vec();
+                    // A photo with versions and its version cards share one frame, drawn
+                    // behind them once their positions are known.
+                    let group_back = (!versions.is_empty()).then(|| ui.painter().add(egui::Shape::Noop));
                     let item = &mut self.items[index];
                     let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD, CARD + LABEL_HEIGHT), egui::Sense::click());
                     let card = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(CARD));
@@ -381,7 +415,7 @@ impl Filmstrip {
                     if ui.is_rect_visible(rect) {
                         if matches!(item.thumb, Thumb::None) {
                             let cache = if is_edited { crate::settings::thumb_file(&item.path) } else { None };
-                            let job = Job { generation, index, path: item.path.clone(), cache };
+                            let job = Job { generation, index, path: item.path.clone(), cache, version: None };
                             item.thumb = if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed };
                         }
                         let painter = ui.painter().with_clip_rect(rect.expand(2.0).intersect(ui.clip_rect()));
@@ -428,6 +462,17 @@ impl Filmstrip {
                                 painter.circle_filled(egui::pos2(c.x + knob, y), 1.7, theme::ACCENT);
                             }
                         }
+                        if !versions.is_empty() {
+                            // Versions mark, bottom right: two stacked frames and the count.
+                            let galley = painter.layout_no_wrap(format!("{}", versions.len() + 1), theme::bold(9.5), theme::TEAL);
+                            let size = egui::vec2(galley.size().x + 20.0, galley.size().y + 4.0);
+                            let back = egui::Rect::from_min_size(card.right_bottom() - size - egui::vec2(5.0, 5.0), size);
+                            painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.5)));
+                            let icon = egui::Rect::from_min_size(back.min + egui::vec2(4.0, 3.5), egui::vec2(8.0, 6.0));
+                            painter.rect_stroke(icon.translate(egui::vec2(2.5, -1.5)), 1.0, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.6)));
+                            painter.rect(icon, 1.0, egui::Color32::from_rgb(0x11, 0x13, 0x17), egui::Stroke::new(1.0_f32, theme::TEAL));
+                            painter.galley(egui::pos2(back.min.x + 15.0, back.min.y + 2.0), galley, theme::TEAL);
+                        }
                         let rating = store.rating(&item.path);
                         if rating > 0 {
                             let galley = painter.layout_no_wrap(stars(rating), theme::font(10.0), theme::ACCENT);
@@ -466,12 +511,99 @@ impl Filmstrip {
                         }
                     }
                     let path = &self.items[index].path;
-                    response.on_hover_text(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).context_menu(|ui| {
+                    let hover = match versions.len() {
+                        0 => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        n => format!("{}  ·  the current edit, and {n} saved version{}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), if n == 1 { "" } else { "s" }),
+                    };
+                    response.on_hover_text(hover).context_menu(|ui| {
                         let targets = if is_selected && selection_paths.len() > 1 { selection_paths.clone() } else { vec![path.clone()] };
                         if let Some(picked) = edit_menu(ui, path, &targets, is_current || is_edited, can_paste) {
                             action = Some(picked);
                         }
                     });
+
+                    // The photo's saved versions, as smaller cards linked to it in one frame.
+                    if let Some(back) = group_back {
+                        let photo = self.items[index].path.clone();
+                        let main_thumb = match &self.items[index].thumb {
+                            Thumb::Ready(t) => Some(t.clone()),
+                            _ => None,
+                        };
+                        let mut group = rect;
+                        for (vi, version) in versions.iter().enumerate() {
+                            ui.add_space(GROUP_GAP - ui.spacing().item_spacing.x);
+                            let (vrect, vresponse) = ui.allocate_exact_size(egui::vec2(VERSION_CARD, CARD + LABEL_HEIGHT), egui::Sense::click());
+                            group = group.union(vrect);
+                            if !ui.is_rect_visible(vrect) {
+                                continue;
+                            }
+                            let key = crate::settings::version_key(&photo, version);
+                            if !self.version_thumbs.contains_key(&key) {
+                                // Read a thumbnail rendered earlier; there is none until the
+                                // photo has been opened once since the version was saved.
+                                let file = crate::settings::version_thumb_file(&key).filter(|f| f.is_file());
+                                let state = match file {
+                                    Some(file) => {
+                                        let job = Job { generation, index, path: photo.clone(), cache: Some(file), version: Some(key.clone()) };
+                                        if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed }
+                                    }
+                                    None => Thumb::Failed,
+                                };
+                                self.version_thumbs.insert(key.clone(), state);
+                            }
+                            let texture = match self.version_thumbs.get(&key) {
+                                Some(Thumb::Ready(t)) => Some((t.clone(), true)),
+                                _ => main_thumb.clone().map(|t| (t, false)),
+                            };
+                            let painter = ui.painter().with_clip_rect(vrect.expand(2.0).intersect(ui.clip_rect()));
+                            let vcard = egui::Rect::from_min_size(vrect.min + egui::vec2(0.0, 6.0), egui::vec2(VERSION_CARD, CARD - 12.0));
+                            let (fill, border) = if vresponse.hovered() {
+                                (egui::Color32::from_rgb(0x17, 0x1A, 0x20), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.8)))
+                            } else {
+                                (theme::WELL, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.35)))
+                            };
+                            painter.rect(vcard, 5.0, fill, border);
+                            let inner = vcard.shrink(5.0);
+                            if let Some((texture, rendered)) = texture {
+                                let size = texture.size_vec2();
+                                let scale = (inner.width() / size.x).min(inner.height() / size.y);
+                                let picture = egui::Rect::from_center_size(inner.center(), size * scale);
+                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                                // Not rendered yet: the photo's own thumbnail, dimmed.
+                                let tint = if rendered { egui::Color32::WHITE } else { egui::Color32::from_gray(110) };
+                                painter.image(texture.id(), picture, uv, tint);
+                            }
+                            // "V1", "V2"... top left, in the versions' colour.
+                            let label = painter.layout_no_wrap(format!("V{}", vi + 1), theme::bold(9.0), theme::TEAL);
+                            let badge = egui::Rect::from_min_size(vcard.min + egui::vec2(4.0, 4.0), label.size() + egui::vec2(8.0, 3.0));
+                            painter.rect(badge, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.45)));
+                            painter.galley(badge.min + egui::vec2(4.0, 1.5), label, theme::TEAL);
+                            // The version's name under it.
+                            let mut job = egui::text::LayoutJob::single_section(version.name.clone(), egui::TextFormat { font_id: theme::font(10.5), color: theme::tint(theme::TEAL, 0.9), ..Default::default() });
+                            job.wrap = egui::text::TextWrapping { max_width: VERSION_CARD, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                            let galley = ui.fonts(|f| f.layout_job(job));
+                            painter.galley(egui::pos2(vcard.center().x - galley.size().x * 0.5, vrect.min.y + CARD + 4.0), galley, theme::TEAL);
+                            if vresponse.clicked() {
+                                action = Some(Action::OpenVersion(photo.clone(), vi));
+                            }
+                            vresponse.on_hover_text(format!("{}  ·  version {} of {}: {}\nClick to open the photo at this version", photo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), vi + 1, versions.len(), version.name)).context_menu(|ui| {
+                                if ui.button("Open this version").clicked() {
+                                    action = Some(Action::OpenVersion(photo.clone(), vi));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Delete this version").clicked() {
+                                    action = Some(Action::DeleteVersion(photo.clone(), vi));
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        // The shared frame: a tinted panel behind the photo and its versions,
+                        // with a line along the bottom joining them.
+                        let frame = group.expand2(egui::vec2(3.0, 2.0));
+                        ui.painter().set(back, egui::Shape::rect_filled(frame, 8.0, egui::Color32::from_rgba_unmultiplied(0x2A, 0x9D, 0x8F, 18)));
+                        let y = rect.min.y + CARD + 1.5;
+                        ui.painter().line_segment([egui::pos2(rect.center().x, y), egui::pos2(group.max.x - VERSION_CARD * 0.5, y)], egui::Stroke::new(1.5_f32, theme::tint(theme::TEAL, 0.5)));
+                    }
                 }
             });
         });
@@ -492,6 +624,10 @@ pub enum Action {
     Export(Vec<PathBuf>),
     /// Convert these raw photos to DNG; `true` also embeds the original raw file.
     ToDng(Vec<PathBuf>, bool),
+    /// Open this photo at its saved version number n (0-based).
+    OpenVersion(PathBuf, usize),
+    /// Delete this photo's saved version number n.
+    DeleteVersion(PathBuf, usize),
 }
 
 pub fn stars(count: u8) -> String {

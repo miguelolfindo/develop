@@ -43,6 +43,27 @@ pub struct Saved {
     pub regions: [f32; 4],
     /// Color Mixer: hue, saturation, luminance per colour (-100..100), see tone::COLOURS.
     pub hsl: [[f32; 8]; 3],
+    /// Black & white, and how bright each colour becomes in grey (-100..100, see tone::COLOURS).
+    pub mono: bool,
+    pub mono_mix: [f32; 8],
+}
+
+/// A saved version of a photo's edit: a name, when it was saved (seconds since 1970), and the
+/// settings. Versions live in the photo's sidecar, so they travel with it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Version {
+    pub name: String,
+    pub time: u64,
+    pub saved: Saved,
+}
+
+/// A name made safe for the tab-separated files (no tabs or line breaks), at most 60 characters.
+pub fn clean_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().chars().take(60).collect()
+}
+
+pub fn now_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Sharpening a photo starts with (Lightroom's defaults for raw files).
@@ -55,6 +76,8 @@ pub struct Store {
     photos: HashMap<PathBuf, Saved>,
     /// Star ratings, 1 to 5 (unrated photos are absent).
     ratings: HashMap<PathBuf, u8>,
+    /// Saved versions of each photo's edit (photos without any are absent).
+    versions: HashMap<PathBuf, Vec<Version>>,
     /// Photos whose data is in the central file rather than a sidecar.
     central: HashSet<PathBuf>,
     central_changed: bool,
@@ -159,7 +182,29 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     let regions = fields.next().map(|f| crate::tone::numbers_from_field::<4>(f, -100.0, 100.0)).unwrap_or_default();
     let hsl_flat = fields.next().map(|f| crate::tone::numbers_from_field::<24>(f, -100.0, 100.0)).unwrap_or([0.0; 24]);
     let hsl = std::array::from_fn(|k| std::array::from_fn(|i| hsl_flat[k * 8 + i]));
-    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl }))
+    let mono = fields.next() == Some("1");
+    let mono_mix = fields.next().map(|f| crate::tone::numbers_from_field::<8>(f, -100.0, 100.0)).unwrap_or_default();
+    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix }))
+}
+
+/// What identifies a version's thumbnail: the photo, the version's name and when it was saved
+/// (updating a version gives it a new time, so its thumbnail is drawn again).
+pub fn version_key(photo: &Path, version: &Version) -> String {
+    format!("{}|{}|{}", photo.display(), version.name, version.time)
+}
+
+/// Where a version's thumbnail is kept (beside the photos' own thumbnails).
+pub fn version_thumb_file(key: &str) -> Option<PathBuf> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.to_lowercase().bytes() {
+        hash = (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(store_file()?.parent()?.join("thumbs").join(format!("v{hash:016x}.jpg")))
+}
+
+/// The settings saved in `photo`'s sidecar, read directly (command-line and MCP use).
+pub fn read_sidecar(photo: &Path) -> Option<Saved> {
+    std::fs::read_to_string(sidecar_path(photo)).ok().and_then(|text| parse_sidecar(&text).0)
 }
 
 /// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.dvlp` beside it.
@@ -183,7 +228,7 @@ const SIDECAR_HEADER: &str = "Develop settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -205,21 +250,32 @@ fn saved_fields(s: &Saved) -> String {
         crate::spots::to_field(&s.spots),
         crate::tone::curve_to_field(&s.curve),
         crate::tone::numbers_to_field(&s.regions),
-        crate::tone::numbers_to_field(&s.hsl.concat())
+        crate::tone::numbers_to_field(&s.hsl.concat()),
+        s.mono as u8,
+        crate::tone::numbers_to_field(&s.mono_mix)
     )
 }
 
-fn parse_sidecar(text: &str) -> (Option<Saved>, u8) {
+fn parse_sidecar(text: &str) -> (Option<Saved>, u8, Vec<Version>) {
     let mut saved = None;
     let mut rating = 0;
+    let mut versions = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("settings\t") {
             saved = parse_line(&format!("photo\t{rest}")).map(|(_, s)| s);
         } else if let Some(stars) = line.strip_prefix("rating\t") {
             rating = stars.trim().parse::<u8>().unwrap_or(0).min(5);
+        } else if let Some(rest) = line.strip_prefix("version\t") {
+            // version <tab> name <tab> time <tab> settings fields
+            let mut parts = rest.splitn(3, '\t');
+            if let (Some(name), Some(time), Some(fields)) = (parts.next(), parts.next(), parts.next()) {
+                if let Some((_, saved)) = parse_line(&format!("photo\t{fields}")) {
+                    versions.push(Version { name: clean_name(name), time: time.trim().parse().unwrap_or(0), saved });
+                }
+            }
         }
     }
-    (saved, rating)
+    (saved, rating, versions)
 }
 
 /// Write a file by writing a temporary one and swapping it in, so a crash mid-write cannot
@@ -256,7 +312,7 @@ impl Store {
             }
         }
         let central = photos.keys().chain(ratings.keys()).cloned().collect();
-        Self { file, photos, ratings, central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None }
+        Self { file, photos, ratings, versions: HashMap::new(), central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None }
     }
 
     /// Read the sidecars of a folder (once), and move any settings the central file still
@@ -283,7 +339,11 @@ impl Store {
                 self.touch(&photo);
             }
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let (saved, rating) = parse_sidecar(&text);
+            let (saved, rating, versions) = parse_sidecar(&text);
+            match versions.is_empty() {
+                true => self.versions.remove(&photo),
+                false => self.versions.insert(photo.clone(), versions),
+            };
             match saved {
                 Some(saved) => self.photos.insert(photo.clone(), saved),
                 None => self.photos.remove(&photo),
@@ -335,6 +395,23 @@ impl Store {
         }
     }
 
+    /// The photo's saved versions, oldest first.
+    pub fn versions(&self, photo: &Path) -> &[Version] {
+        self.versions.get(photo).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Replace the photo's saved versions.
+    pub fn set_versions(&mut self, photo: &Path, versions: Vec<Version>) {
+        if versions.as_slice() == self.versions(photo) {
+            return;
+        }
+        match versions.is_empty() {
+            true => self.versions.remove(photo),
+            false => self.versions.insert(photo.to_path_buf(), versions),
+        };
+        self.touch(photo);
+    }
+
     pub fn contains(&self, photo: &Path) -> bool {
         self.photos.contains_key(photo)
     }
@@ -367,7 +444,8 @@ impl Store {
             let sidecar = sidecar_path(&photo);
             let (saved, rating) = (self.photos.get(&photo), self.rating(&photo));
             let legacy = sidecar_with(&photo, LEGACY_SIDECAR_EXTENSION);
-            if saved.is_none() && rating == 0 {
+            let versions = self.versions(&photo);
+            if saved.is_none() && rating == 0 && versions.is_empty() {
                 // Nothing left to remember: no sidecar, no central entry.
                 let _ = std::fs::remove_file(&sidecar);
                 let _ = std::fs::remove_file(&legacy);
@@ -380,6 +458,9 @@ impl Store {
             }
             if rating > 0 {
                 text.push_str(&format!("rating\t{rating}\n"));
+            }
+            for v in versions {
+                text.push_str(&format!("version\t{}\t{}\t{}\n", clean_name(&v.name), v.time, saved_fields(&v.saved)));
             }
             if write_whole(&sidecar, &text) {
                 self.central_changed |= self.central.remove(&photo);
@@ -553,5 +634,131 @@ impl CropPresets {
     pub fn remove(&mut self, name: &str) {
         self.list.retain(|(n, _, _)| n != name);
         self.save();
+    }
+}
+
+/// A develop preset: a name, whether it carries white balance, and the settings it applies.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Preset {
+    pub name: String,
+    /// Apply the preset's white balance (temperature and tint) too.
+    pub white_balance: bool,
+    pub saved: Saved,
+}
+
+/// The user's develop presets, kept in `develop-presets.tsv` in the settings folder.
+pub struct Presets {
+    file: Option<PathBuf>,
+    pub list: Vec<Preset>,
+}
+
+impl Presets {
+    pub fn load() -> Self {
+        let file = settings_dir().map(|d| d.join("develop-presets.tsv"));
+        let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        let list = text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, '\t');
+                let (name, wb, fields) = (parts.next()?, parts.next()?, parts.next()?);
+                let (_, saved) = parse_line(&format!("photo\t{fields}"))?;
+                Some(Preset { name: clean_name(name), white_balance: wb == "1", saved })
+            })
+            .collect();
+        Self { file, list }
+    }
+
+    fn save(&self) {
+        let Some(file) = &self.file else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text: String = self.list.iter().map(|p| format!("{}\t{}\t{}\n", clean_name(&p.name), p.white_balance as u8, saved_fields(&p.saved))).collect();
+        write_whole(file, &text);
+    }
+
+    /// Add a preset, replacing one with the same name.
+    pub fn add(&mut self, preset: Preset) {
+        self.list.retain(|p| !p.name.eq_ignore_ascii_case(&preset.name));
+        self.list.push(preset);
+        self.list.sort_by_key(|p| p.name.to_lowercase());
+        self.save();
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.list.retain(|p| p.name != name);
+        self.save();
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Preset> {
+        self.list.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+    }
+}
+
+impl Preset {
+    /// `target` with this preset applied: the tone, presence, colour, curve, mixer, detail and
+    /// profile settings (and white balance if the preset carries it). Crop, rotation, lens
+    /// correction, retouching and AI denoise stay as they are.
+    pub fn apply_to(&self, target: &Saved) -> Saved {
+        let p = &self.saved;
+        let mut out = target.clone();
+        for i in 1..VALUES {
+            out.values[i] = p.values[i];
+        }
+        if self.white_balance {
+            out.values[0] = p.values[0];
+            out.tint = p.tint;
+        }
+        if !p.profile.is_empty() {
+            out.profile = p.profile.clone();
+        }
+        out.sharpen = p.sharpen;
+        out.presence = p.presence;
+        out.curve = p.curve.clone();
+        out.regions = p.regions;
+        out.hsl = p.hsl;
+        out.mono = p.mono;
+        out.mono_mix = p.mono_mix;
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Saved {
+        let line = format!("photo\t{}", "5500\t0.5\t1\t0\t0\t0\t0\t0\t0\t0\tStandard");
+        parse_line(&line).map(|(_, s)| s).expect("sample settings")
+    }
+
+    #[test]
+    fn versions_round_trip() {
+        let mut a = sample();
+        a.values[1] = 1.25;
+        a.mono = true;
+        a.mono_mix[2] = 40.0;
+        let text = format!("{SIDECAR_HEADER}\nsettings\t{}\nversion\tWarm look\t1700000000\t{}\n", saved_fields(&a), saved_fields(&a));
+        let (saved, _, versions) = parse_sidecar(&text);
+        assert_eq!(saved.as_ref(), Some(&a));
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].name, "Warm look");
+        assert_eq!(versions[0].time, 1_700_000_000);
+        assert_eq!(versions[0].saved, a);
+    }
+
+    #[test]
+    fn preset_keeps_crop_and_spots() {
+        let mut look = sample();
+        look.values[1] = 2.0;
+        look.crop = [0.1, 0.1, 0.9, 0.9];
+        let preset = Preset { name: "Look".into(), white_balance: false, saved: look };
+        let mut target = sample();
+        target.crop = [0.0, 0.2, 1.0, 0.8];
+        target.values[0] = 3200.0;
+        let out = preset.apply_to(&target);
+        assert_eq!(out.values[1], 2.0);
+        assert_eq!(out.crop, [0.0, 0.2, 1.0, 0.8]);
+        assert_eq!(out.values[0], 3200.0, "white balance only when the preset carries it");
     }
 }

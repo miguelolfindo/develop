@@ -78,6 +78,10 @@ pub struct Uniforms {
     pub hsl_info: [f32; 4],
     /// Linear sRGB -> working space (the inverse of work_to_srgb), for the Color Mixer.
     pub srgb_to_work: [[f32; 4]; 3],
+    /// Black & white: x = 1 when on; and how bright each colour becomes in grey (-1..1, eight
+    /// values in two vec4).
+    pub mono_info: [f32; 4],
+    pub mono_mix: [[f32; 4]; 2],
 }
 
 /// Export renders into half floats and converts on the CPU, so 16-bit output is real 16-bit.

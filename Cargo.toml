@@ -1,6 +1,6 @@
 [package]
 name = "develop"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Develop: a GPU raw photo processor"
 license = "GPL-3.0-or-later"
@@ -35,7 +35,7 @@ embed-resource = "3"
 ort = { version = "=2.0.0-rc.15", features = ["directml"] }
 # HEIC pictures are decoded by Windows' own codec (Windows Imaging Component); WNet lists
 # the computers and shares on the network.
-windows = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_NetworkManagement_WNet"] }
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_NetworkManagement_WNet", "Win32_System_Console"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["coreml"] }
