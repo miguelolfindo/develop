@@ -50,10 +50,11 @@ non-destructive and the original raw file is never touched.
   call measures for about 35 seconds; measurements are kept), read the bursts marked `check`,
   then call it again with `apply: true` to save the ratings. Use this for culling, not
   `check_photos`.
-- `auto_white_balance(paths)`: Develop sets white balance itself, from the neutral areas when there
-  are enough, else from skin when there are faces
-  (right for firelight and tungsten) or from the neutral areas; temperature and tint only, never
-  exposure. Use it instead of adjusting temperature by hand; look at the photos it marks `check`.
+- `auto_white_balance(paths)`: Develop sets white balance itself: from the neutral areas when there
+  are enough, else from skin when there are faces (right for firelight and tungsten). Temperature
+  and tint only, never exposure. Use it instead of adjusting temperature by hand; look at the
+  photos it marks `check`. `from: "skin"` goes by the faces only (temperature for skin colour
+  strength, tint for skin hue), for portraits where the people matter more than the room.
 - `check_focus(path)`: focus of one photo at full size, plus a 100% crop of its sharpest area
   (pass `include_crop: false` if you cannot see images).
 - `render_preview(path, long_edge)`: see the photo as edited (1024 px is usually enough).
@@ -153,7 +154,8 @@ Make one or two changes, preview, and repeat. Three small rounds beat one big gu
 1. `auto_white_balance` on the photos (a list of paths; call again while `remaining` is above 0).
    It needs no numbers from you and never changes exposure.
 2. Look only at the photos with a `check` note, and at any the user cares most about; adjust by
-   hand there if needed (`check_photo` shows the readings).
+   hand there if needed (`check_photo` shows the readings). For portraits where the people look
+   off but the room reads neutral (mixed light), try `auto_white_balance` with `from: "skin"`.
 3. Then fix clipping and exposure photo by photo with `check_photo` and `set_settings`.
 
 ### A look for a whole shoot

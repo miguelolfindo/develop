@@ -1,52 +1,32 @@
-## Develop 0.3.4
+## Develop 0.3.5
 
-### Auto white balance
-- A new **Auto** button in the White Balance panel sets the white balance for you. When enough
-  of the picture is grey or white, it makes those parts neutral.
-- When there is almost nothing grey, as under **firelight, candles and tungsten**, it goes by
-  people's **skin**: it finds the faces, judges their skin as if they were correctly exposed, and
-  cools the picture until the skin's colour is natural rather than orange, stopping before skin
-  turns pink. That is what makes those photos come out right, where the camera leaves everything
-  orange.
-- With neither grey nor faces, it leaves the photo alone and says so.
-- Only temperature (and tint, from grey areas) changes, never exposure. A note under the button
-  says what it went by, and **Undo** goes back. Running it again gives the same answer.
+### Skin white balance
+- A new **Skin** button next to **Auto** in the White Balance panel sets the white balance so the
+  **people** look natural, whatever the rest of the picture shows: useful when a face in shade
+  sits beside a sunlit white wall, or whenever the people matter more than the room.
+- Temperature sets how strongly coloured the skin is (cooling it under orange light, never
+  warming pale skin), and tint turns its hue to natural: a little green when skin looks pink, a
+  little magenta when it looks green-yellow.
+- It needs a face; without one, it changes nothing and says so. Exposure is never changed, and
+  **Undo** goes back.
 
-### Edits from other programs show at once
-- While a folder is open, Develop notices when another program changes a photo's edit (an AI
-  assistant, or a second copy of Develop): new ratings and versions appear in the filmstrip, and
-  the photo you have open updates, with a note saying so. **Undo** brings back what you had.
-- The newest change wins, so neither program saves an old copy over the other's. Develop is told
-  by the system when files change, so it does not keep checking the folder.
+### Auto white balance fixes
+- Faces too dark to judge (night scenes, backlight) are now brightened for measuring, instead of
+  being treated as if there were no faces.
+- Faces lit by strongly coloured light (blue or purple stage and LED light) are left alone, with a
+  note saying the light is too coloured for white balance to make skin natural. Before, the note
+  wrongly said there were no faces.
+- Whether a photo has enough grey to go by is now judged at the photo's own brightness. A wall
+  that only looked grey in the brightened measuring render could make Auto change a photo it
+  should have left alone.
 
 ### AI assistants (MCP)
-- **Rate a shoot by focus:** the new `cull_photos` tool measures every photo's focus at full
-  size, groups bursts by when they were taken, and suggests 4 stars for the sharpest frame of
-  each burst, 3 for frames nearly as sharp and 1 for the rest. A 400-photo folder takes minutes
-  instead of hours, and measurements are remembered, so nothing is measured twice.
-- **Focus checks:** `check_focus` measures one photo's focus at full size and shows the
-  assistant its sharpest area at 100%; `check_photos` can add focus measurements to every row,
-  and now says when each photo was taken.
-- **Auto white balance for assistants:** `auto_white_balance` does what the Auto button does,
-  for a list of photos, four at a time.
-- **Better colour readings:** `check_photo` now reports the photo's own (as-shot) white balance,
-  so an assistant can make changes relative to it, and a **skin** reading for photos with
-  people.
-- **No more windows:** checks and previews are rendered without opening a Develop window, so
-  nothing flashes up on screen while an assistant works, and each is about a second faster.
-- Long checks stop after about 35 seconds and say where to continue, so assistants with a
-  60-second tool limit no longer time out.
-- The guide for assistants (`docs/develop-skill`) has new workflows for culling and correcting
-  colour, and a rule of thumb for white balance steps.
-
-### Fixes
-- An assistant's edits could be overwritten by Develop when it was open on the same photo, and
-  the other way round. Both now read the latest edit before saving.
+- `auto_white_balance` takes `from: "skin"` to do what the Skin button does.
 
 ### Installing
-- **Windows:** run `develop_0.3.4_x64-setup.exe`. It installs over an earlier version and
+- **Windows:** run `develop_0.3.5_x64-setup.exe`. It installs over an earlier version and
   keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.4_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.3.5_aarch64.dmg`, see below.
 
 #### macOS
 

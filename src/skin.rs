@@ -143,13 +143,23 @@ pub struct Reading {
 pub enum NoReading {
     NoFace,
     TooSmall(usize),
+    /// Faces found, but too dark to measure: how many, and their brightness (linear, 0-1), so
+    /// the picture can be brightened for measuring.
+    TooDark(usize, f32),
     Failed(String),
+}
+
+fn linear(encoded_0_255: f32) -> f32 {
+    let e = encoded_0_255 / 255.0;
+    if e <= 0.04045 { e / 12.92 } else { ((e + 0.055) / 1.055).powf(2.4) }
 }
 
 /// Find the faces in an 8-bit RGB picture and measure their skin.
 pub fn read(rgb: &[u8], width: usize, height: usize) -> Result<Reading, NoReading> {
     let found = faces(rgb, width, height).map_err(NoReading::Failed)?;
     let (mut hues, mut chromas, mut lumas, mut used) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+    // Every pixel of the faces' middles, to tell dark faces from small ones.
+    let mut all_lumas = Vec::new();
     for f in found.iter().filter(|f| f.w >= 16.0 && f.h >= 16.0) {
         // Cheeks and forehead: the middle of the box, away from hair, background and the edges.
         let (x0, x1) = ((f.x + 0.2 * f.w).max(0.0) as usize, ((f.x + 0.8 * f.w) as usize).min(width));
@@ -159,6 +169,7 @@ pub fn read(rgb: &[u8], width: usize, height: usize) -> Result<Reading, NoReadin
             for x in x0..x1 {
                 let i = (y * width + x) * 3;
                 let (h, c, l) = ycc(rgb[i] as f32, rgb[i + 1] as f32, rgb[i + 2] as f32);
+                all_lumas.push(l);
                 // Skin-coloured in any light (pink to orange-yellow), not grey, not blown or black.
                 if (75.0..=185.0).contains(&h) && c >= 4.0 && (35.0..=240.0).contains(&l) {
                     hues.push(h);
@@ -175,13 +186,18 @@ pub fn read(rgb: &[u8], width: usize, height: usize) -> Result<Reading, NoReadin
         return Err(NoReading::NoFace);
     }
     if hues.len() < 200 {
+        if all_lumas.len() >= 200 {
+            let brightness = linear(median(&mut all_lumas));
+            if brightness < 0.08 {
+                return Err(NoReading::TooDark(found.len(), brightness));
+            }
+        }
         return Err(NoReading::TooSmall(found.len()));
     }
     let hue = median(&mut hues);
     let saturation = median(&mut chromas);
     // Face brightness as linear reflectance: the encoded luma through the sRGB curve.
-    let encoded = median(&mut lumas) / 255.0;
-    let brightness = if encoded <= 0.04045 { encoded / 12.92 } else { ((encoded + 0.055) / 1.055).powf(2.4) };
+    let brightness = linear(median(&mut lumas));
     Ok(Reading { faces: used, hue, off: hue - SKIN_LINE, saturation, brightness })
 }
 
@@ -196,7 +212,16 @@ pub fn measure(rgb: &[u8], width: usize, height: usize) -> Value {
         Ok(r) => r,
         Err(NoReading::Failed(e)) => return json!({"faces": 0, "note": e}),
         Err(NoReading::NoFace) => return json!({"faces": 0, "note": "No face found, so there is no skin to judge white balance by."}),
-        Err(NoReading::TooSmall(n)) => return json!({"faces": n, "note": "Faces are too small or too dark to judge skin tone."}),
+        Err(NoReading::TooSmall(n)) => return json!({"faces": n, "note": "Faces are too small to judge skin tone."}),
+        Err(NoReading::TooDark(n, b)) => {
+            // check_photo brightens the picture for measuring and asks again (see mcp.rs).
+            return json!({
+                "faces": n,
+                "note": "Faces are too dark to judge skin tone at this brightness.",
+                "face_brightness_percent": (b * 1000.0).round() / 10.0,
+                "exposure_to_target_stops": ((FACE_TARGET / b.max(1e-4)).log2() * 100.0).round() / 100.0,
+            });
+        }
     };
     let (hue, saturation, linear, used) = (r.hue, r.saturation, r.brightness, r.faces);
     let to_target = stops_to_target(&r);

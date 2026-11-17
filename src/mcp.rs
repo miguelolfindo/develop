@@ -644,6 +644,11 @@ impl Server {
                 // Develop finds each photo's white balance itself (see autowb.rs), four photos at a
                 // time, and the result goes into the photo's AI version like any other edit.
                 let paths = self.photos(args)?;
+                let skin_only = match args["from"].as_str().unwrap_or("auto") {
+                    "auto" => false,
+                    "skin" => true,
+                    other => return Err(format!("from must be auto or skin, not {other}")),
+                };
                 let started = std::time::Instant::now();
                 let mut results: Vec<(PathBuf, Result<Value, String>)> = Vec::new();
                 for (n, group) in paths.chunks(4).enumerate() {
@@ -651,7 +656,7 @@ impl Server {
                         break;
                     }
                     let found: Vec<Result<Value, String>> = std::thread::scope(|s| {
-                        let handles: Vec<_> = group.iter().enumerate().map(|(i, p)| s.spawn(move || auto_wb(p, n * 4 + i + 1))).collect();
+                        let handles: Vec<_> = group.iter().enumerate().map(|(i, p)| s.spawn(move || auto_wb(p, n * 4 + i + 1, skin_only))).collect();
                         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("measuring failed".into()))).collect()
                     });
                     results.extend(group.iter().cloned().zip(found));
@@ -848,7 +853,7 @@ curve is a list of [x, y] points 0..1; hsl_hue / hsl_saturation / hsl_luminance 
          "inputSchema": {"type": "object", "properties": {"folder": {"type": "string"}, "apply": {"type": "boolean"}, "replace_ratings": {"type": "boolean"}, "gap_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Frames taken within this many seconds of the one before are one burst (default 60)"}, "sharp_px": {"type": "number", "description": "A 3-star frame must be at most this wide (default 3.5)"}, "near_px": {"type": "number", "description": "and within this much of the keeper (default 0.5)"}, "soft_px": {"type": "number", "description": "A burst whose sharpest frame is wider than this is all rejects (default 5.5)"}}, "required": ["folder"]}},
         {"name": "auto_white_balance", "title": "Auto white balance",
          "description": "Let Develop set the white balance of photos itself, by measuring renders: from the grey and white parts of the picture when there are enough, otherwise (firelight, tungsten) from people's skin when there are faces (measured as if the faces were at 20%, cooled to a natural colour strength without turning pink). Changes temperature (and tint when going by neutral areas) only, never exposure, and saves into the photo's AI version. Returns, per photo, the temperature set, the method, readings before and after, and anything worth a look. Several seconds per photo; for many photos it may return early with remaining above 0: call again with the rest. Prefer this to adjusting temperature by hand.",
-         "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path}}},
+         "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path, "from": {"type": "string", "enum": ["auto", "skin"], "description": "auto (default): neutral areas when there are enough, else skin; skin: go by the faces only (the Skin button), setting temperature for skin colour strength and tint for skin hue"}}}},
         {"name": "check_focus", "title": "Check focus",
          "description": "Measure focus on the full-size photo: the edge width in pixels of its sharpest area (about 2.7 at best; crisp detail reads 2.5-3.5; bigger is softer), across and down (a big difference can mean motion blur), where that area is, the typical edge width of the whole picture, and a verdict. Also returns a 100% crop (512 x 512 px) of the sharpest area so you can see whether the subject is in focus; pass include_crop: false if you cannot see images. For many photos use check_photos with focus: true.",
          "inputSchema": {"type": "object", "properties": {"path": path, "include_crop": {"type": "boolean"}}, "required": ["path"]}},
@@ -1077,13 +1082,13 @@ fn free_name(dir: &Path, stem: &str, ext: &str) -> PathBuf {
 /// (see `focus.rs`): the report gains `focus`, and the 100% crop of the sharpest area is returned
 /// as JPEG bytes. `slot` keeps the temporary files of parallel renders apart.
 /// Run Develop's own auto white balance on a photo with its edit (see autowb.rs).
-fn auto_wb(photo: &Path, slot: usize) -> Result<Value, String> {
+fn auto_wb(photo: &Path, slot: usize, skin_only: bool) -> Result<Value, String> {
     let out = std::env::temp_dir().join(format!("develop-mcp-autowb-{}-{slot}.json", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let status = std::process::Command::new(exe)
         .arg(photo)
-        .args(["--with-settings", "1", "--auto-wb"])
+        .args(["--with-settings", "1", "--auto-wb-skin", if skin_only { "1" } else { "0" }, "--auto-wb"])
         .arg(&out)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -70,9 +70,9 @@ you choose to, you can also connect an AI assistant of your own through the
     and Vibrance and Saturation are switched off.
   - **Crop:** crop, straighten and aspect ratio.
   - **White Balance:** temperature and tint, an eyedropper (W): click something that
-    should be neutral and the white balance is set to make it so, and **Auto**, which makes the
+    should be neutral and the white balance is set to make it so, **Auto**, which makes the
     grey parts of the picture neutral, or, when there is almost nothing grey (firelight,
-    tungsten), goes by people's skin.
+    tungsten), goes by people's skin, and **Skin**, which goes by the people only.
   - **Tone:** Exposure, Contrast, Highlights, Shadows, Whites, Blacks, on Lightroom's
     scales. Highlights, Shadows and Whites adapt to each photo's own brightness, as
     Lightroom's do.

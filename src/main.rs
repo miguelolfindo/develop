@@ -519,6 +519,8 @@ struct App {
     wb_pick: bool,
     /// The last Auto white balance's result, shown under the buttons.
     auto_wb_note: Option<String>,
+    /// `--auto-wb-skin 1`: with `--auto-wb`, go by skin only (the Skin button).
+    auto_wb_skin: bool,
     /// `--auto-wb <file>`: find the white balance, write the result there as JSON, and quit
     /// (with `--with-settings 1`; for the MCP server).
     pending_auto_wb: Option<PathBuf>,
@@ -710,6 +712,7 @@ impl App {
             curve_drag: None,
             wb_pick: false,
             auto_wb_note: None,
+            auto_wb_skin: std::env::args().collect::<Vec<_>>().windows(2).any(|w| w[0] == "--auto-wb-skin" && w[1] == "1"),
             pending_auto_wb: {
                 let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
                 args.iter().position(|a| a == "--auto-wb").and_then(|i| args.get(i + 1)).map(PathBuf::from)
@@ -1373,8 +1376,17 @@ impl App {
         let Some((rgb, w, h)) = picture else { return autowb::Probe::default() };
         let report = measure::measure(&rgb, w, h);
         let num = |v: &serde_json::Value| v.as_f64().unwrap_or(0.0) as f32;
+        let skin = skin::read(&rgb, w, h);
+        let (faces_found, dark_faces) = match &skin {
+            Ok(r) => (r.faces, None),
+            Err(skin::NoReading::TooDark(n, b)) => (*n, Some(*b)),
+            Err(skin::NoReading::TooSmall(n)) => (*n, None),
+            Err(_) => (0, None),
+        };
         autowb::Probe {
-            skin: skin::read(&rgb, w, h).ok(),
+            skin: skin.ok(),
+            faces_found,
+            dark_faces,
             blue_minus_red: num(&report["neutral_areas"]["blue_minus_red_half"]),
             green_minus_magenta: num(&report["neutral_areas"]["green_minus_magenta"]),
             neutral_share: num(&report["neutral_areas"]["share_percent"]),
@@ -1383,7 +1395,7 @@ impl App {
 
     /// Auto white balance for the open photo (see autowb.rs): sets temperature (and, without
     /// faces, tint); exposure is left as it is. One Undo step goes back.
-    fn auto_white_balance(&mut self) -> Option<autowb::Outcome> {
+    fn auto_white_balance(&mut self, skin_only: bool) -> Option<autowb::Outcome> {
         if self.loaded.is_none() || self.loading.is_some() {
             return None;
         }
@@ -1391,12 +1403,16 @@ impl App {
         // the sliders happen to be (a photo already pushed far off has nothing left to measure).
         let kelvin = self.loaded.as_ref().map_or(self.adjust.kelvin, |l| l.color.as_shot_kelvin);
         let tint = 0.0;
-        let outcome = autowb::solve(kelvin, tint, |k, t, s| self.wb_probe(k, t, s));
+        let outcome = match skin_only {
+            false => autowb::solve(kelvin, tint, |k, t, s| self.wb_probe(k, t, s)),
+            true => autowb::solve_skin(kelvin, tint, |k, t, s| self.wb_probe(k, t, s)),
+        };
         self.adjust.kelvin = outcome.kelvin;
         self.tint = outcome.tint;
         self.render_key = None;
         self.sync_profile();
         let how = match outcome.method {
+            autowb::Method::Skin if skin_only => format!("From skin: {:.0} K, tint {:.0}", outcome.kelvin, outcome.tint),
             autowb::Method::Skin => format!("From skin: {:.0} K", outcome.kelvin),
             autowb::Method::Neutral => format!("From neutral areas: {:.0} K, tint {:.0}", outcome.kelvin, outcome.tint),
             autowb::Method::Unchanged => "Nothing to measure: unchanged".to_owned(),
@@ -3834,14 +3850,30 @@ impl App {
                 self.set_wb_pick(on);
             }
             ui.add_space(4.0);
-            let width = ui.available_width();
-            if ui
-                .add_enabled_ui(self.loaded.is_some() && self.loading.is_none(), |ui| ui::button(ui, "Auto", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None))
-                .inner
-                .on_hover_text("Set the white balance from the grey and white parts of the picture, or, when there is almost nothing grey (firelight, tungsten), from people's skin. Exposure is not changed; Undo goes back.")
-                .clicked()
-            {
-                self.auto_white_balance();
+            let ready = self.loaded.is_some() && self.loading.is_none();
+            let mut run = None;
+            ui.columns(2, |columns| {
+                let width = columns[0].available_width();
+                if columns[0]
+                    .add_enabled_ui(ready, |ui| ui::button(ui, "Auto", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None))
+                    .inner
+                    .on_hover_text("Set the white balance from the grey and white parts of the picture, or, when there is almost nothing grey (firelight, tungsten), from people's skin. Exposure is not changed; Undo goes back.")
+                    .clicked()
+                {
+                    run = Some(false);
+                }
+                let width = columns[1].available_width();
+                if columns[1]
+                    .add_enabled_ui(ready, |ui| ui::button(ui, "Skin", egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None))
+                    .inner
+                    .on_hover_text("Set the white balance so the people's skin looks natural, whatever the rest of the picture shows: temperature for how strongly coloured the skin is, tint for its hue. Needs a face. Exposure is not changed; Undo goes back.")
+                    .clicked()
+                {
+                    run = Some(true);
+                }
+            });
+            if let Some(skin_only) = run {
+                self.auto_white_balance(skin_only);
             }
             if let Some(note) = &self.auto_wb_note {
                 ui.add(egui::Label::new(egui::RichText::new(note).font(theme::font(11.0)).color(theme::TEXT_HEADER)).wrap(true));
@@ -4609,7 +4641,8 @@ impl App {
         // `--auto-wb <file>`: once the picture is ready, find the white balance, write it, quit.
         if self.loaded.is_some() && self.render.is_some() && self.loading.is_none() {
             if let Some(path) = self.pending_auto_wb.take() {
-                let result = self.auto_white_balance().map_or_else(|| serde_json::json!({"error": "the photo could not be measured"}), |o| o.to_json());
+                let skin_only = self.auto_wb_skin;
+                let result = self.auto_white_balance(skin_only).map_or_else(|| serde_json::json!({"error": "the photo could not be measured"}), |o| o.to_json());
                 let _ = std::fs::write(&path, result.to_string());
                 if self.pending_export.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

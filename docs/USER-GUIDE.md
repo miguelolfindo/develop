@@ -258,8 +258,17 @@ The viewer shows the cropped size in pixels and the angle while you crop.
   faces, judges their skin as if the faces were correctly exposed, and cools the picture until the
   skin's colour is natural rather than orange, stopping before skin turns pink. That is what makes
   those photos come out right, where the camera leaves everything orange. With neither grey nor
-  faces it changes nothing. Only temperature (and tint, from grey areas) is
-  changed, never exposure; a note under the button says what it went by, and **Undo** goes back.
+  faces it changes nothing. Faces lit by strongly coloured light (a blue or purple stage or LED
+  light) are left alone too, with a note saying so: no white balance can make that skin natural.
+  Only temperature (and tint, from grey areas) is changed, never exposure; a note under the button
+  says what it went by, and **Undo** goes back.
+- **Skin:** goes by the people only, whatever the rest of the picture shows, for when you care
+  more about how the people look than about the walls (a face in shade beside a sunlit white
+  wall, say). Temperature sets how strongly coloured the skin is (cooling it when the light is
+  orange, never warming pale skin), and tint turns its hue to natural (a little green when skin
+  looks pink, a little magenta when it looks green-yellow). It needs a face; without one, or under
+  strongly coloured light, it changes nothing and says why. Exposure is never changed, and
+  **Undo** goes back.
 - **Tint:** -150 (green) to +150 (magenta), relative to the as-shot white balance.
 
 ### Tone
