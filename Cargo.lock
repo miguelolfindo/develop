@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "develop"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "crc32fast",

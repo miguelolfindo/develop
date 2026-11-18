@@ -294,8 +294,12 @@ which returns an image.
 
 | Tool | What it does | Main arguments |
 |---|---|---|
-| `list_photos` | The photos in a folder, with rating, whether edited, and how many versions | `folder`, `min_rating` (0-5) |
-| `get_settings` | One photo's whole edit, on the sliders' own scales | `path` |
+| `list_photos` | The photos in a folder, with rating, whether edited, how many versions, keywords and people | `folder`, `min_rating` (0-5) |
+| `get_settings` | One photo's whole edit, on the sliders' own scales, with its keywords and people | `path` |
+| `search_photos` | Find photos by keyword, person's name, file name, or by describing what is in them ("red car at night"). Searches the user's library (the folders they added in Develop), or one folder with `folder`. Photos whose keywords, people or file name contain every word come first (`matched: "keyword, person or file name"`), then the photos whose content fits the description best (`matched: "content"`, best first; suggestions to check) | `query`, `folder`, `min_rating` (0-5), `limit` (1-200, default 40) |
+| `set_keywords` | Add or remove keywords on photos (kept in each photo's `.dvlp` file) | `path`/`paths`, `add`, `remove` (lists), or `replace` (the whole list) |
+| `suggest_keywords` | Keywords that fit what is in each photo (dog, beach, restaurant…), from an image-understanding model on this computer, best first, without the ones the photo has. Suggestions only: add the right ones with `set_keywords` | `path`/`paths` |
+| `list_people` | The people the user has named in Develop, with how many photos each is in, and how many groups are still unnamed. Naming is done by the user in Develop | |
 | `set_settings` | Change some settings on one or more photos; anything not named stays as it is | `path`/`paths`, `settings`, `new_version` |
 | `reset_settings` | Back to Develop's defaults (ratings and versions are kept) | `path`/`paths` |
 | `list_presets` | The user's develop presets, with their settings | |
@@ -346,6 +350,24 @@ Export the four- and five-star photos for the web:
 ```
 
 → `{"exported": ["D:\\Shoot\\web\\DSC0101.jpg", ...], "failed": []}`
+
+Find the beach photos in the library and keyword them:
+
+```json
+{"name": "search_photos", "arguments": {"query": "surfboard on the sand"}}
+```
+
+→ `{"query": "surfboard on the sand", "searched": "library", "count": 2, "photos": [{"path":
+"D:\\Photos\\DSC05790.ARW", "matched": "content"}, ...]}`. Content matches are suggestions:
+check them (`render_preview`) before acting on them.
+
+```json
+{"name": "suggest_keywords", "arguments": {"path": "D:\\Photos\\DSC05790.ARW"}}
+{"name": "set_keywords", "arguments": {"path": "D:\\Photos\\DSC05790.ARW", "add": ["beach", "surfing"]}}
+```
+
+→ `{"updated": 1, "photos": [{"path": "...", "keywords": ["beach", "surfing"]}]}`. The keywords are
+searchable at once, in Develop and through `search_photos`.
 
 A mistake comes back as an error the assistant can read and fix, for example:
 
@@ -529,10 +551,13 @@ For people and for assistants:
 ## Privacy and safety
 
 - **What the assistant can see:** the folders and files you point it at, their names and paths,
-  ratings and edit settings. `render_preview` sends a picture of the photo to the assistant. With a
+  ratings, edit settings, keywords and the names of the people in them; `search_photos` and
+  `list_people` also reach the library folders you added in Develop. It never receives face
+  fingerprints. `render_preview` sends a picture of the photo to the assistant. With a
   cloud AI (Claude, ChatGPT, Gemini and others) that picture leaves your computer, as anything you
   paste into the chat would. With a local model (LM Studio and similar) nothing leaves it.
-- **What it can change:** edits (`.dvlp` files), ratings, versions and presets. It can create new
+- **What it can change:** edits (`.dvlp` files), ratings, keywords, versions and presets. It
+  cannot name people or change who is in a photo; that is done in Develop. It can create new
   files with `export` and `convert_to_dng`. It cannot delete photos, and it never changes the
   original raw files.
 - **No network access by default.** `--mcp` talks only to the app that started it. `--mcp-http`

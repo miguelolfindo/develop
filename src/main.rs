@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clip;
 mod color;
 mod autowb;
 mod crop;
@@ -14,14 +15,18 @@ mod dcp;
 mod denoise;
 mod explorer;
 mod export;
+mod faces;
 mod filmstrip;
 mod focus;
 mod headless;
 mod heic;
 mod lens;
+mod library;
 mod mcp;
 mod measure;
 mod network;
+mod people;
+mod pictures;
 mod pipeline;
 mod profile;
 mod raw;
@@ -117,6 +122,74 @@ fn main() -> eframe::Result<()> {
             }
         }
         let _ = std::fs::write(&args[2], text);
+        return Ok(());
+    }
+    // Diagnostic: `app --dump-clip "<phrase>" <photos...>`: the CLIP models' inputs and outputs,
+    // the phrase's tokens, and for each photo its suggested keywords and its score for the phrase.
+    if args.len() >= 3 && args[1] == "--dump-clip" {
+        print!("{}", clip::describe());
+        println!("tokens of {:?}: {:?}", args[2], clip::tokens(&args[2]));
+        let phrase = clip::text_embedding(&args[2]);
+        for file in &args[3..] {
+            let path = PathBuf::from(file);
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let Some(pic) = filmstrip::preview(&path, 448) else {
+                println!("{name}: no preview");
+                continue;
+            };
+            let started = std::time::Instant::now();
+            match clip::image_embedding(&pic) {
+                Ok(e) => {
+                    let took = started.elapsed().as_millis();
+                    let score = phrase.as_ref().map(|p| clip::similarity(p, &e)).unwrap_or(0.0);
+                    let words: Vec<String> = clip::suggest(&e).unwrap_or_default().iter().map(|(w, s)| format!("{w} {s:.3}")).collect();
+                    let mut all: Vec<(String, f32)> = clip::vocabulary_embeddings().unwrap_or_default().iter().map(|(w, v)| (w.clone(), clip::similarity(v, &e))).collect();
+                    all.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let mut sorted: Vec<f32> = all.iter().map(|x| x.1).collect();
+                    sorted.sort_by(f32::total_cmp);
+                    println!("   median {:.3}; top: {}", sorted[sorted.len() / 2], all.iter().take(8).map(|(w, s)| format!("{w} {s:.3}")).collect::<Vec<_>>().join(", "));
+                    println!("{name} ({took} ms): phrase {score:.3} | {}", words.join(", "));
+                }
+                Err(e) => println!("{name}: {e}"),
+            }
+        }
+        return Ok(());
+    }
+    // Diagnostic: `app --dump-faces <folder for face crops> <photos...>` finds the faces in each
+    // photo's preview, saves each lined-up face, and prints how alike every pair is.
+    if args.len() >= 4 && args[1] == "--dump-faces" {
+        let out = PathBuf::from(&args[2]);
+        let _ = std::fs::create_dir_all(&out);
+        let mut all: Vec<(String, Vec<f32>)> = Vec::new();
+        for file in &args[3..] {
+            let path = PathBuf::from(file);
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let Some(pic) = filmstrip::preview(&path, 1600) else {
+                println!("{name}: no preview");
+                continue;
+            };
+            let (w, h) = (pic.width() as usize, pic.height() as usize);
+            match skin::faces(pic.as_raw(), w, h) {
+                Ok(found) => {
+                    println!("{name}: {w}x{h}, {} faces", found.len());
+                    for (i, f) in found.iter().enumerate() {
+                        let crop = faces::align(pic.as_raw(), w, h, &f.landmarks);
+                        let _ = image::save_buffer(out.join(format!("{name}-{i}.png")), &crop, 112, 112, image::ColorType::Rgb8);
+                        match faces::fingerprint(pic.as_raw(), w, h, &f.landmarks) {
+                            Ok(fp) => all.push((format!("{name}-{i}"), fp)),
+                            Err(e) => println!("  {i}: {e}"),
+                        }
+                        println!("  {i}: box {:.0},{:.0} {:.0}x{:.0} score {:.2}", f.x, f.y, f.w, f.h, f.score);
+                    }
+                }
+                Err(e) => println!("{name}: {e}"),
+            }
+        }
+        for (i, (a, fa)) in all.iter().enumerate() {
+            for (b, fb) in &all[i + 1..] {
+                println!("{a} ~ {b}: {:.3}", faces::similarity_of(fa, fb));
+            }
+        }
         return Ok(());
     }
     if args.len() >= 4 && args[1] == "--dump-raw" {
@@ -241,6 +314,143 @@ impl Adjust {
 }
 
 /// The base rendering applied underneath the sliders.
+/// Time left, in words ("under a minute", "4 min", "1.5 hours").
+fn time_left(seconds: f32) -> String {
+    let seconds = seconds.ceil() as usize;
+    match seconds {
+        0..=59 => "under a minute".to_owned(),
+        60..=5399 => format!("{} min", (seconds + 30) / 60),
+        _ => format!("{:.1} hours", seconds as f32 / 3600.0),
+    }
+}
+
+/// A photo being dragged out of the People view onto another person.
+struct DragFace {
+    /// Each photo with the person (group) it is taken from.
+    items: Vec<(u32, PathBuf)>,
+}
+
+/// The corner button of a photo card in the People view.
+#[derive(Clone, Copy, PartialEq)]
+enum CardButton {
+    /// × on hover: take the photo out of this person.
+    Remove,
+    /// ✓ always: yes, this is them.
+    Confirm,
+}
+
+/// Pick with a click (one), Ctrl-click (add or remove) or Shift-click (a run from `anchor`).
+fn pick(selected: &mut std::collections::BTreeSet<PathBuf>, anchor: &mut Option<PathBuf>, list: &[PathBuf], index: usize, m: egui::Modifiers) {
+    let photo = list[index].clone();
+    if m.command {
+        if !selected.remove(&photo) {
+            selected.insert(photo.clone());
+        }
+        *anchor = Some(photo);
+    } else if m.shift {
+        let from = anchor.as_ref().and_then(|a| list.iter().position(|p| p == a)).unwrap_or(index);
+        let (a, b) = (from.min(index), from.max(index));
+        *selected = list[a..=b].iter().cloned().collect();
+    } else {
+        *selected = std::iter::once(photo.clone()).collect();
+        *anchor = Some(photo);
+    }
+}
+
+/// Card size for rows that run edge to edge (about `wish` wide), unless too few to fill a row.
+fn justified(width: f32, count: usize, wish: f32, gap: f32) -> f32 {
+    let columns = (((width + gap) / (wish + gap)).floor() as usize).max(1);
+    if count >= columns { (width - gap * (columns - 1) as f32) / columns as f32 - 0.05 } else { wish }
+}
+
+/// One photo card in the People view: the photo with the face outlined, a caption under it and
+/// a corner button. Returns the card's response and whether the corner button was clicked.
+#[allow(clippy::too_many_arguments)]
+fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Path, area: [f32; 4], card: f32, picked: bool, dimmed: bool, button: CardButton, caption: &str, id: egui::Id) -> (egui::Response, bool) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(card, card + 18.0), egui::Sense::click_and_drag());
+    let tile = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(card));
+    if !ui.is_rect_visible(rect) {
+        return (response, false);
+    }
+    let hovered = ui.rect_contains_pointer(rect);
+    let painter = ui.painter().clone();
+    let border = if picked {
+        egui::Stroke::new(2.0_f32, theme::ACCENT)
+    } else if hovered {
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(60))
+    } else {
+        theme::hairline()
+    };
+    painter.rect(tile, 6.0, if picked { egui::Color32::from_rgb(0x1C, 0x1F, 0x26) } else { theme::WELL }, border);
+    let inner = tile.shrink(6.0);
+    if let Some(t) = pictures.thumb(photo) {
+        let size = t.size_vec2();
+        let scale = (inner.width() / size.x).min(inner.height() / size.y);
+        let pic = egui::Rect::from_center_size(inner.center(), size * scale);
+        let tint = if dimmed { egui::Color32::from_gray(90) } else { egui::Color32::WHITE };
+        painter.image(t.id(), pic, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+        let [x, y, w, h] = area;
+        let face_rect = egui::Rect::from_min_size(pic.min + egui::vec2(x * pic.width(), y * pic.height()), egui::vec2(w * pic.width(), h * pic.height())).expand(3.0);
+        let outline = if button == CardButton::Confirm { theme::TEAL } else { theme::ACCENT };
+        painter.rect_stroke(face_rect, 3.0, egui::Stroke::new(1.5_f32, outline));
+    }
+    let mut job = egui::text::LayoutJob::single_section(caption.to_owned(), egui::TextFormat { font_id: theme::font(11.0), color: theme::FADED, ..Default::default() });
+    job.wrap = egui::text::TextWrapping { max_width: card, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    let galley = ui.fonts(|f| f.layout_job(job));
+    painter.galley(egui::pos2(tile.center().x - galley.size().x / 2.0, tile.bottom() + 3.0), galley, theme::FADED);
+    let b_rect = egui::Rect::from_center_size(tile.right_top() + egui::vec2(-15.0, 15.0), egui::Vec2::splat(22.0));
+    let (tip, sense) = match button {
+        CardButton::Remove => ("Not this person: take this photo out of the set", egui::Sense::click()),
+        CardButton::Confirm => ("Yes, this is them: add the photo to this person", egui::Sense::click()),
+    };
+    let b = ui.interact(b_rect, id.with("corner"), sense).on_hover_text(tip);
+    // Magnifying glass, top left: hover it to see the boxed face up close.
+    let m_rect = egui::Rect::from_center_size(tile.left_top() + egui::vec2(15.0, 15.0), egui::Vec2::splat(22.0));
+    let m = ui.interact(m_rect, id.with("zoom"), egui::Sense::hover());
+    let m_fill = if m.hovered() { theme::ELEVATED } else { egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xD0) };
+    painter.circle(m_rect.center(), 11.0, m_fill, egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(if m.hovered() { 120 } else { 50 })));
+    let (c, glass) = (m_rect.center() + egui::vec2(-1.5, -1.5), egui::Stroke::new(1.5_f32, theme::TEXT_BRIGHT));
+    painter.circle_stroke(c, 4.5, glass);
+    painter.line_segment([c + egui::vec2(3.3, 3.3), c + egui::vec2(7.0, 7.0)], egui::Stroke::new(2.0_f32, theme::TEXT_BRIGHT));
+    if m.hovered() {
+        m.on_hover_ui(|ui| {
+            const SIDE: f32 = 280.0;
+            match pictures.face(photo, area) {
+                Some(t) => {
+                    ui.add(egui::Image::new(&t).fit_to_exact_size(egui::Vec2::splat(SIDE)).rounding(6.0));
+                }
+                None => {
+                    let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(SIDE), egui::Sense::hover());
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Loading…", theme::font(12.0), theme::FADED);
+                }
+            }
+        });
+    }
+    match button {
+        CardButton::Remove if hovered => {
+            let fill = if b.hovered() { egui::Color32::from_rgb(0xB9, 0x3B, 0x3B) } else { egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0) };
+            painter.circle(b_rect.center(), 11.0, fill, egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(60)));
+            painter.text(b_rect.center(), egui::Align2::CENTER_CENTER, "×", theme::font(15.0), theme::TEXT_BRIGHT);
+        }
+        CardButton::Confirm => {
+            let fill = if b.hovered() { theme::TEAL } else { egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0) };
+            let mark = if b.hovered() { egui::Color32::from_rgb(0x11, 0x12, 0x14) } else { theme::TEAL };
+            painter.circle(b_rect.center(), 11.0, fill, egui::Stroke::new(1.5_f32, theme::TEAL));
+            let c = b_rect.center();
+            painter.add(egui::Shape::line(vec![c + egui::vec2(-5.0, 0.5), c + egui::vec2(-1.5, 4.0), c + egui::vec2(5.0, -3.5)], egui::Stroke::new(2.0_f32, mark)));
+        }
+        _ => {}
+    }
+    (response, b.clicked())
+}
+
+/// What the left panel shows.
+#[derive(Clone, Copy, PartialEq)]
+enum LeftTab {
+    Folders = 0,
+    FacesMetadata = 1,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Profile {
     /// Scene-linear straight to the display: flat and dark, nothing added.
@@ -350,6 +560,8 @@ struct Loaded {
     info: String,
     /// For the header and the telemetry bar.
     camera: String,
+    /// When it was taken ("18 Nov 2026, 21:42"), if the file records it.
+    taken: Option<String>,
     ext: String,
     full_size: (u32, u32),
     bits: u8,
@@ -490,6 +702,12 @@ struct App {
     /// (0..1 across the canvas), the clipping warning, and the small app icon in the top bar.
     show_left: bool,
     show_right: bool,
+    /// What the left panel shows (Folders or Faces & Metadata), and the window layout saved
+    /// between runs.
+    left_tab: LeftTab,
+    layout: settings::Layout,
+    /// The name box of a person being named should take the keyboard (once, when it opens).
+    rename_focus: bool,
     ab_split: bool,
     ab_pos: f32,
     clipping: bool,
@@ -517,6 +735,37 @@ struct App {
     curve_drag: Option<usize>,
     /// The white balance eyedropper is waiting for a click on the picture (W).
     wb_pick: bool,
+    /// The person being named in the People list, and the name typed so far.
+    person_rename: Option<(u32, String)>,
+    /// Faces' small pictures for the People list, by file.
+    face_textures: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// The person shown in the main pane (the People view), its pictures, and the People list's
+    /// filter and whether it shows everyone.
+    person_view: Option<u32>,
+    people_pictures: pictures::Pictures,
+    people_filter: String,
+    people_show_all: bool,
+    /// The person a dragged photo would go to (the face under the pointer), for the drag label.
+    drop_hint: Option<String>,
+    /// Closing while faces are being read: the question is showing, or the user said quit.
+    quit_asked: bool,
+    quit_ok: bool,
+    /// Photos picked in the People view (click, Ctrl-click, Shift-click), to drag or take out
+    /// together, and the one Shift-click counts from.
+    person_selected: std::collections::BTreeSet<PathBuf>,
+    person_anchor: Option<PathBuf>,
+    /// The same for the possible matches under the divider.
+    maybe_selected: std::collections::BTreeSet<PathBuf>,
+    maybe_anchor: Option<PathBuf>,
+    /// Library folders and their index (search across folders).
+    library: library::Library,
+    /// Whether the library was indexing on the last frame (to search again when it finishes).
+    library_was_indexing: bool,
+    /// Keyword suggestions for the open photo (CLIP), worked out in the background.
+    suggestions: Option<(PathBuf, Vec<(String, f32)>)>,
+    suggest_job: Option<(PathBuf, Receiver<Vec<(String, f32)>>)>,
+    /// The keyword being typed in the Keywords section.
+    keyword_draft: String,
     /// The last Auto white balance's result, shown under the buttons.
     auto_wb_note: Option<String>,
     /// `--auto-wb-skin 1`: with `--auto-wb`, go by skin only (the Skin button).
@@ -669,7 +918,7 @@ impl App {
             // leave the remembered settings alone.
             remember: {
                 let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-                args.len() <= 2 || (args.len() == 4 && args[2] == "--export-dialog")
+                args.len() <= 2 || (args.len() == 4 && (args[2] == "--export-dialog" || args[2] == "--search" || args[2] == "--person"))
             },
             folder_watch: None,
             outside: Default::default(),
@@ -693,6 +942,9 @@ impl App {
             maker_baseline: 0.0,
             show_left: true,
             show_right: true,
+            left_tab: LeftTab::Folders,
+            layout: settings::Layout::load(),
+            rename_focus: false,
             ab_split: false,
             ab_pos: 0.5,
             clipping: false,
@@ -712,6 +964,24 @@ impl App {
             curve_drag: None,
             wb_pick: false,
             auto_wb_note: None,
+            keyword_draft: String::new(),
+            suggestions: None,
+            suggest_job: None,
+            library: library::Library::load(),
+            person_rename: None,
+            face_textures: std::collections::HashMap::new(),
+            person_view: None,
+            people_pictures: pictures::Pictures::new(egui_ctx),
+            people_filter: String::new(),
+            people_show_all: false,
+            drop_hint: None,
+            quit_asked: false,
+            quit_ok: false,
+            person_selected: Default::default(),
+            person_anchor: None,
+            maybe_selected: Default::default(),
+            maybe_anchor: None,
+            library_was_indexing: false,
             auto_wb_skin: std::env::args().collect::<Vec<_>>().windows(2).any(|w| w[0] == "--auto-wb-skin" && w[1] == "1"),
             pending_auto_wb: {
                 let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -826,7 +1096,14 @@ impl App {
                 });
             }
         }
+        if app.remember {
+            // The layout of the last run.
+            app.left_tab = if app.layout.left_tab == 1 { LeftTab::FacesMetadata } else { LeftTab::Folders };
+            app.filmstrip.grid_card = app.layout.grid_card.clamp(filmstrip::GRID_MIN, filmstrip::GRID_MAX);
+            app.filmstrip.set_grid(app.layout.grid);
+        }
         if let Some(path) = initial {
+            app.filmstrip.set_grid(false);
             app.start_loading(path, egui_ctx);
         } else if app.remember {
             // Started without a file: come back to the photo and folder of the last session.
@@ -835,6 +1112,19 @@ impl App {
             }
             if let Some(folder) = app.session.folder.clone().filter(|p| p.is_dir()) {
                 app.filmstrip.set_folder(Some(&folder));
+            }
+        }
+        // `--search <words>` (or `library:<words>`): start with the filmstrip searched (tests and
+        // screenshots), after the photo's folder is showing.
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(words) = args.iter().position(|a| a == "--search").and_then(|i| args.get(i + 1)) {
+            app.filmstrip.set_search(words);
+        }
+        // `--person <n>`: start with the n-th person of the People list open (tests and screenshots).
+        if let Some(n) = args.iter().position(|a| a == "--person").and_then(|i| args.get(i + 1)).and_then(|n| n.parse::<usize>().ok()) {
+            let id = app.library.people.lock().ok().and_then(|p| p.list().get(n).map(|e| e.0));
+            if let Some(id) = id {
+                app.open_person(id);
             }
         }
         // Look for a newer release in the background, except in scripted runs
@@ -969,7 +1259,10 @@ impl App {
             return;
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.filmstrip.set_folder(path.parent());
+        // Opening a library search result keeps the results showing.
+        if !(self.filmstrip.showing_results() && self.filmstrip.shows(&path)) {
+            self.filmstrip.set_folder(path.parent());
+        }
         self.loading_path = Some(path.clone());
         self.store.flush(true);
         let (tx, rx) = mpsc::channel();
@@ -1243,6 +1536,7 @@ impl App {
                         image.camera, image.full_width, image.full_height, reduced, color.as_shot_kelvin, seconds
                     ),
                     camera: image.camera.clone(),
+                    taken: filmstrip::taken_text(&path),
                     ext: filmstrip::extension_of(&path),
                     full_size: (image.full_width, image.full_height),
                     bits: image.bits,
@@ -3570,9 +3864,6 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if ui::icon_button(ui, ui::Icon::Sidebar, 22.0, ui::Look::ghost()).on_hover_text("Show or hide the folder panel  [").clicked() {
-                self.show_left = !self.show_left;
-            }
             if let Some(icon) = &self.icon {
                 ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 18.0)));
             }
@@ -3601,9 +3892,6 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui::icon_button(ui, ui::Icon::Sidebar, 22.0, ui::Look::ghost()).on_hover_text("Show or hide the inspector  ]").clicked() {
-                    self.show_right = !self.show_right;
-                }
                 // Which graphics API the picture is being drawn with.
                 let backend = match self.render_state.adapter.get_info().backend {
                     wgpu::Backend::Metal => "Metal",
@@ -3621,7 +3909,19 @@ impl App {
                         ui.label(egui::RichText::new(format!("{backend} Active")).font(theme::mono(11.5)).color(theme::TEAL));
                     });
                 });
-                if ui.available_width() > 330.0 {
+                // Faces being read in the background: visible from any tab; click to see them.
+                if let Some((read, total, _)) = self.library.reading() {
+                    let text = format!("Finding faces  {read} of {total}");
+                    let r = ui::pill(ui, theme::tint(theme::ACCENT, 0.10), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.45)), 5.0, egui::Margin::symmetric(8.0, 2.0), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
+                            ui.label(egui::RichText::new(text).font(theme::mono(11.5)).color(theme::ACCENT));
+                        });
+                    });
+                    let _ = r;
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                } else if ui.available_width() > 330.0 {
                     ui.label(ui::dim("Double-click label to reset • Drag canvas to pan", 11.5));
                 }
             });
@@ -3631,8 +3931,59 @@ impl App {
     /// Right pane, pinned at the top: what is open, Reset All, then View and the scopes.
     fn pane_top(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.y = 3.0;
+        // The file name, with the whole width of the pane.
         ui.horizontal(|ui| {
             ui.set_height(24.0);
+            if let Some((name, _)) = &self.loading {
+                ui.spinner();
+                let text = match denoise::progress() {
+                    Some((done, total)) => format!("Denoising {name}… {done} of {total}"),
+                    None => format!("Opening {name}…"),
+                };
+                ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).truncate(true));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            } else if let Some(loaded) = &self.loaded {
+                let room = (ui.available_width() - 44.0).max(40.0);
+                ui.allocate_ui_with_layout(egui::vec2(room, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(&loaded.name).font(theme::bold(14.0)).color(theme::TEXT_BRIGHT)).truncate(true))
+                        .on_hover_text(loaded.path.display().to_string());
+                });
+                ui::badge(ui, &loaded.ext, theme::ACCENT);
+            } else {
+                ui.label(egui::RichText::new("No file open").color(theme::FADED));
+            }
+        });
+        if self.loading.is_none() {
+            if let Some(loaded) = &self.loaded {
+                if let Some(taken) = &loaded.taken {
+                    ui.add(egui::Label::new(egui::RichText::new(format!("Taken {taken}")).font(theme::font(12.0)).color(theme::TEXT)).truncate(true))
+                        .on_hover_text("When the photo was taken, from the camera");
+                }
+                let line = format!("{} • {}×{} • {:.0} K", loaded.camera, loaded.full_size.0, loaded.full_size.1, loaded.color.as_shot_kelvin);
+                ui.add(egui::Label::new(egui::RichText::new(line).font(theme::font(11.5)).color(theme::TEXT_HEADER)).truncate(true))
+                    .on_hover_text(&loaded.info);
+            }
+        }
+        // Undo and Redo on the left, Reset All on the right.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.set_height(24.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (redo_key, undo_key) = if cfg!(target_os = "macos") { ("Shift+Cmd+Z", "Cmd+Z") } else { ("Ctrl+Shift+Z or Ctrl+Y", "Ctrl+Z") };
+            let can_undo = self.can_undo();
+            if ui.add_enabled_ui(can_undo, |ui| ui::button(ui, "Undo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
+                .on_hover_text(format!("Undo the last change on this photo ({undo_key})"))
+                .clicked()
+            {
+                self.step_history(true);
+            }
+            let can_redo = self.can_redo();
+            if ui.add_enabled_ui(can_redo, |ui| ui::button(ui, "Redo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
+                .on_hover_text(format!("Redo the last change undone on this photo ({redo_key})"))
+                .clicked()
+            {
+                self.step_history(false);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui::button(ui, "Reset All", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)
                     .on_hover_text("All sliders, crop and sharpening back to their defaults")
@@ -3640,49 +3991,8 @@ impl App {
                 {
                     self.reset_all();
                 }
-                let (redo_key, undo_key) = if cfg!(target_os = "macos") { ("Shift+Cmd+Z", "Cmd+Z") } else { ("Ctrl+Shift+Z or Ctrl+Y", "Ctrl+Z") };
-                let can_redo = self.can_redo();
-                if ui.add_enabled_ui(can_redo, |ui| ui::button(ui, "Redo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
-                    .on_hover_text(format!("Redo the last change undone on this photo ({redo_key})"))
-                    .clicked()
-                {
-                    self.step_history(false);
-                }
-                let can_undo = self.can_undo();
-                if ui.add_enabled_ui(can_undo, |ui| ui::button(ui, "Undo", egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None)).inner
-                    .on_hover_text(format!("Undo the last change on this photo ({undo_key})"))
-                    .clicked()
-                {
-                    self.step_history(true);
-                }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if let Some((name, _)) = &self.loading {
-                        ui.spinner();
-                        let text = match denoise::progress() {
-                            Some((done, total)) => format!("Denoising {name}… {done} of {total}"),
-                            None => format!("Opening {name}…"),
-                        };
-                        ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).truncate(true));
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                    } else if let Some(loaded) = &self.loaded {
-                        let room = (ui.available_width() - 44.0).max(40.0);
-                        ui.allocate_ui_with_layout(egui::vec2(room, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.add(egui::Label::new(egui::RichText::new(&loaded.name).font(theme::bold(14.0)).color(theme::TEXT_BRIGHT)).truncate(true));
-                        });
-                        ui::badge(ui, &loaded.ext, theme::ACCENT);
-                    } else {
-                        ui.label(egui::RichText::new("No file open").color(theme::FADED));
-                    }
-                });
             });
         });
-        if self.loading.is_none() {
-            if let Some(loaded) = &self.loaded {
-                let line = format!("{} • {}×{} • {:.0} K", loaded.camera, loaded.full_size.0, loaded.full_size.1, loaded.color.as_shot_kelvin);
-                ui.add(egui::Label::new(egui::RichText::new(line).font(theme::font(11.5)).color(theme::TEXT_HEADER)).truncate(true))
-                    .on_hover_text(&loaded.info);
-            }
-        }
         if let (Some((photo, at)), Some(loaded)) = (&self.outside_note, &self.loaded) {
             if *photo == loaded.path && at.elapsed() < OUTSIDE_NOTE_TIME {
                 ui.add(egui::Label::new(egui::RichText::new("Edited by another program. Undo reverts.").font(theme::font(11.5)).color(theme::TEAL)).truncate(true))
@@ -3768,6 +4078,875 @@ impl App {
     }
 
     /// Right pane, scrolling middle: the editing sections.
+    /// The Library list under the folder tree: folders searched by the filmstrip's Library
+    /// scope. Returns a folder clicked to open.
+    fn library_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let mut open = None;
+        let ctx = ui.ctx().clone();
+        ui::hairline(ui);
+        ui.horizontal(|ui| {
+            ui.set_height(24.0);
+            ui.label(egui::RichText::new("LIBRARY").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui::icon_button(ui, ui::Icon::Refresh, 22.0, ui::Look::ghost()).on_hover_text("Index the library again").clicked() {
+                    self.library.reindex(&ctx);
+                }
+                if ui::button(ui, "+ Add", egui::vec2(0.0, 22.0), ui::Look::ghost(), theme::font(11.5), None).on_hover_text("Add a folder (and its subfolders) to the library").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().set_title("Add a folder to the library").pick_folder() {
+                        self.library.add_folder(folder, &ctx);
+                    }
+                }
+            });
+        });
+        let mut remove = None;
+        if self.library.folders().is_empty() {
+            ui.label(ui::dim("Add folders to search them all at once.", 11.5));
+        }
+        for f in self.library.folders().to_vec() {
+            let name = f.file_name().map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into_owned());
+            let row = ui.add(egui::Label::new(egui::RichText::new(name).font(theme::font(12.0)).color(theme::TEXT)).sense(egui::Sense::click()).truncate(true)).on_hover_text(f.display().to_string());
+            if row.clicked() {
+                open = Some(f.clone());
+            }
+            row.context_menu(|ui| {
+                if ui.button("Remove from Library").clicked() {
+                    remove = Some(f.clone());
+                    ui.close_menu();
+                }
+            });
+        }
+        if let Some(f) = remove {
+            self.library.remove_folder(&f, &ctx);
+        }
+        let (indexing, seen, found, count) = self.library.status();
+        if indexing {
+            let text = match self.library.reading() {
+                Some(_) => "Reading new photos (progress above)".to_owned(),
+                None => format!("Checking the library… {seen} of {found}"),
+            };
+            ui.label(ui::dim(&text, 11.0));
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        } else if !self.library.folders().is_empty() {
+            ui.label(ui::dim(&format!("{count} photos indexed"), 11.0));
+        }
+        ui.add_space(4.0);
+        open
+    }
+
+    /// The Faces & Metadata panel: the open photo's keywords, people and suggestions; the people
+    /// found across the library; the library's folders. Returns a library folder clicked.
+    fn faces_metadata_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let mut open = None;
+        egui::ScrollArea::vertical().id_source("faces_metadata").auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(egui::RichText::new("KEYWORDS").font(theme::bold(11.5)).color(theme::TEXT_HEADER))
+                .on_hover_text("Words to find photos by: type and press Enter to add (commas for several), click × to remove one. With several photos selected, changes apply to all of them.");
+            ui.add_space(4.0);
+            self.keywords_panel(ui);
+            ui.add_space(10.0);
+            ui::hairline(ui);
+            ui.add_space(6.0);
+            if let Some((read, total, left)) = self.library.reading() {
+                ui.label(egui::RichText::new("Finding faces and reading content").font(theme::font(12.0)).color(theme::TEXT));
+                ui.add_space(3.0);
+                ui.add(egui::ProgressBar::new(read as f32 / total.max(1) as f32).desired_height(8.0).fill(theme::TEAL));
+                ui.add_space(2.0);
+                ui.label(ui::dim(&format!("{read} of {total} new photos  •  {} left", time_left(left)), 11.0));
+                ui.add_space(8.0);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            if self.library.people.lock().map(|p| p.list().is_empty()).unwrap_or(true) {
+                ui.label(egui::RichText::new("PEOPLE").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
+                ui.label(ui::dim("Faces found in the library's photos are grouped here, for you to name.", 11.5));
+            } else {
+                self.people_list(ui);
+            }
+            ui.add_space(8.0);
+            open = self.library_panel(ui);
+        });
+        open
+    }
+
+    /// The bar above the panels: Folders and Faces & Metadata choose the left panel (clicking
+    /// the one showing hides it), Inspector shows or hides the right panel.
+    fn view_bar(&mut self, ui: &mut egui::Ui) {
+        // The whole bar, margins included, for the line along its bottom.
+        let bar = ui.max_rect().expand2(egui::vec2(8.0, 0.0));
+        // Where the active tabs are: the line breaks under them, so each joins the panel below.
+        let gaps = std::cell::RefCell::new(Vec::<egui::Rangef>::new());
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let tab = |ui: &mut egui::Ui, text: &str, on: bool, tip: &str| -> bool {
+                let font = if on { theme::bold(12.5) } else { theme::font(12.5) };
+                let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT);
+                // Full height of the bar, so the tab sits on the panels below it.
+                let height = ui.available_height();
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(galley.size().x + 32.0, height), egui::Sense::click());
+                let tab = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 4.0), rect.max);
+                let top_only = egui::Rounding { nw: 6.0, ne: 6.0, sw: 0.0, se: 0.0 };
+                let painter = ui.painter();
+                let hovered = response.hovered();
+                if on {
+                    painter.rect_filled(tab, top_only, theme::PANEL);
+                    gaps.borrow_mut().push(tab.x_range());
+                } else if hovered {
+                    painter.rect_filled(tab, top_only, egui::Color32::from_rgb(0x13, 0x15, 0x18));
+                }
+                let color = if on { theme::TEXT_BRIGHT } else if hovered { theme::TEXT } else { theme::TEXT_HEADER };
+                painter.text(tab.center(), egui::Align2::CENTER_CENTER, text, font, color);
+                response.on_hover_text(tip).clicked()
+            };
+            let folders = self.show_left && self.left_tab == LeftTab::Folders;
+            let faces = self.show_left && self.left_tab == LeftTab::FacesMetadata;
+            if tab(ui, "Folders", folders, "The folders on this computer  [") {
+                self.show_left = !folders;
+                self.left_tab = LeftTab::Folders;
+            }
+            if tab(ui, "Faces & Metadata", faces, "Keywords, people and the library, for culling and finding photos") {
+                self.show_left = !faces;
+                self.left_tab = LeftTab::FacesMetadata;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let inspector = self.show_right;
+                if tab(ui, "Inspector", inspector, "The editing controls  ]") {
+                    self.show_right = !inspector;
+                }
+            });
+        });
+        let mut gaps = gaps.into_inner();
+        gaps.sort_by(|a, b| a.min.total_cmp(&b.min));
+        // Lighter than the other dividers: the bar is already the dark tone, so a dark line
+        // would vanish.
+        let (y, stroke) = (bar.bottom() - 0.5, egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(30)));
+        let mut x = bar.left();
+        for g in gaps {
+            if g.min > x {
+                ui.painter().hline(x..=g.min, y, stroke);
+            }
+            x = x.max(g.max);
+        }
+        if bar.right() > x {
+            ui.painter().hline(x..=bar.right(), y, stroke);
+        }
+    }
+
+    /// Closing the window while faces are still being read asks first. Quitting keeps what is
+    /// done; the rest is read the next time Develop opens.
+    fn quit_guard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && self.library.reading().is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_asked = true;
+        }
+        if !self.quit_asked {
+            return;
+        }
+        let Some((read, total, left)) = self.library.reading() else {
+            // Finished while the question was up.
+            self.quit_asked = false;
+            return;
+        };
+        let (mut keep, mut quit) = (false, false);
+        egui::Window::new("Still finding faces")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.label(format!("Develop is still finding faces and reading what is in your library's new photos: {read} of {total} done, {} left.", time_left(left)));
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(read as f32 / total.max(1) as f32).desired_height(8.0).fill(theme::TEAL));
+                ui.add_space(6.0);
+                ui.label(ui::dim("If you quit now, what is done is kept and the rest is read the next time you open Develop.", 12.0));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui::button(ui, "Keep running", egui::vec2(0.0, 28.0), ui::Look::primary(), theme::font(12.5), None).clicked() {
+                        keep = true;
+                    }
+                    if ui::button(ui, "Quit now", egui::vec2(0.0, 28.0), ui::Look::bordered(), theme::font(12.5), None).clicked() {
+                        quit = true;
+                    }
+                });
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        if keep {
+            self.quit_asked = false;
+        }
+        if quit {
+            self.library.save_progress();
+            self.store.flush(true);
+            self.quit_ok = true;
+            self.quit_asked = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Write the people's names Develop knows for `photo` into its `.dvlp`.
+    fn apply_names(&mut self, photo: &Path, names: Vec<String>) {
+        if let Some(dir) = photo.parent() {
+            self.store.load_folder(dir);
+        }
+        self.store.set_people(photo, names);
+        self.library.note(photo, self.store.rating(photo), self.store.keywords(photo), self.store.people(photo));
+    }
+
+    /// Bring the `.dvlp` names of these photos up to date with the people store.
+    fn refresh_names(&mut self, photos: Vec<PathBuf>) {
+        for photo in photos {
+            let names = self.library.people.lock().map(|p| p.names_in(&photo)).unwrap_or_default();
+            self.apply_names(&photo, names);
+        }
+    }
+
+    /// The face picture of a People list entry (a small saved crop).
+    fn face_texture(&mut self, ctx: &egui::Context, face: Option<&(String, u8)>) -> Option<egui::TextureHandle> {
+        let file = face.and_then(|(k, n)| people::face_thumb(k, *n))?;
+        self.face_textures
+            .entry(file.clone())
+            .or_insert_with(|| {
+                image::open(&file).ok().map(|i| {
+                    let rgb = i.to_rgb8();
+                    ctx.load_texture(file.display().to_string(), egui::ColorImage::from_rgb([rgb.width() as usize, rgb.height() as usize], rgb.as_raw()), egui::TextureOptions::LINEAR)
+                })
+            })
+            .clone()
+    }
+
+    /// The People list: a grid of faces, named people first, then unnamed groups, largest first.
+    /// Click one to see and name them in the main pane; drop a photo from the People view on one
+    /// to move it to them. Long lists show their first rows until "Show all".
+    fn people_list(&mut self, ui: &mut egui::Ui) {
+        let list = self.library.people.lock().map(|p| p.list()).unwrap_or_default();
+        if list.is_empty() {
+            return;
+        }
+        let named = list.iter().filter(|(_, n, ..)| n.is_some()).count();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("PEOPLE").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
+            ui.label(ui::dim(&format!("{named} named, {} to name", list.len() - named), 11.0));
+        });
+        ui.add_space(4.0);
+        ui.add(egui::TextEdit::singleline(&mut self.people_filter).hint_text("Find a person").desired_width(f32::INFINITY));
+        ui.add_space(6.0);
+        let filter = self.people_filter.trim().to_lowercase();
+        let shown: Vec<_> = list
+            .iter()
+            .filter(|(_, name, ..)| filter.is_empty() || name.as_ref().is_some_and(|n| n.to_lowercase().contains(&filter)))
+            .cloned()
+            .collect();
+        if shown.is_empty() {
+            ui.label(ui::dim("No one by that name.", 11.5));
+            return;
+        }
+        const CELL: f32 = 62.0;
+        const FACE: f32 = 50.0;
+        let columns = ((ui.available_width() + 4.0) / (CELL + 4.0)).floor().max(1.0) as usize;
+        let limit = if self.people_show_all || !filter.is_empty() { shown.len() } else { (columns * 3).min(shown.len()) };
+        let dragging = egui::DragAndDrop::has_payload_of_type::<DragFace>(ui.ctx());
+        // Where the pointer is, tested directly: while dragging, egui's hover is off for everything.
+        let pointer = ui.ctx().pointer_latest_pos().filter(|p| ui.clip_rect().contains(*p));
+        let released = ui.input(|i| i.pointer.any_released());
+        self.drop_hint = None;
+        let mut open = None;
+        let mut show_photos = None;
+        let mut dropped = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 6.0);
+            for (id, name, count, face) in shown.iter().take(limit) {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, FACE + 30.0), egui::Sense::click());
+                let circle = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + FACE / 2.0 + 2.0), egui::Vec2::splat(FACE));
+                let texture = self.face_texture(ui.ctx(), face.as_ref());
+                let drop_here = dragging && pointer.is_some_and(|p| rect.contains(p));
+                if drop_here {
+                    self.drop_hint = Some(name.clone().unwrap_or_else(|| "this person".to_owned()));
+                    if released {
+                        if let Some(drag) = egui::DragAndDrop::take_payload::<DragFace>(ui.ctx()) {
+                            dropped = Some((drag.items.clone(), *id));
+                        }
+                    }
+                }
+                let selected = self.person_view == Some(*id);
+                if ui.is_rect_visible(rect) {
+                    let painter = ui.painter();
+                    match texture {
+                        Some(t) => {
+                            egui::Image::new(&t).rounding(FACE / 2.0).paint_at(ui, circle);
+                        }
+                        None => {
+                            painter.circle_filled(circle.center(), FACE / 2.0, theme::WELL);
+                        }
+                    }
+                    let ring = if drop_here {
+                        Some(egui::Stroke::new(3.0_f32, theme::TEAL))
+                    } else if selected {
+                        Some(egui::Stroke::new(2.5_f32, theme::ACCENT))
+                    } else if response.hovered() {
+                        Some(egui::Stroke::new(1.5_f32, egui::Color32::from_white_alpha(90)))
+                    } else {
+                        None
+                    };
+                    if let Some(ring) = ring {
+                        painter.circle_stroke(circle.center(), FACE / 2.0 + 1.5, ring);
+                    }
+                    let (label, color) = match name {
+                        Some(n) => (n.clone(), if selected { theme::ACCENT } else { theme::TEXT }),
+                        None => ("Unnamed".to_owned(), theme::FADED),
+                    };
+                    let mut job = egui::text::LayoutJob::single_section(label, egui::TextFormat { font_id: theme::font(11.0), color, ..Default::default() });
+                    job.wrap = egui::text::TextWrapping { max_width: CELL, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    painter.galley(egui::pos2(rect.center().x - galley.size().x / 2.0, circle.bottom() + 3.0), galley, color);
+                    let n = painter.layout_no_wrap(format!("{count}"), theme::font(10.0), theme::FADED);
+                    painter.galley(egui::pos2(rect.center().x - n.size().x / 2.0, circle.bottom() + 16.0), n, theme::FADED);
+                }
+                if response.clicked() {
+                    open = Some(*id);
+                }
+                let tip = match name {
+                    Some(n) => format!("{n}: {count} photos. Click to see them; drop a photo here to move it to {n}"),
+                    None => format!("Someone in {count} photos. Click to see them and name them"),
+                };
+                response.on_hover_text(tip).context_menu(|ui| {
+                    if ui.button("Open").clicked() {
+                        open = Some(*id);
+                        ui.close_menu();
+                    }
+                    if ui.button("Show their photos in the filmstrip").clicked() {
+                        show_photos = Some((*id, name.clone().unwrap_or_else(|| "Unnamed".to_owned())));
+                        ui.close_menu();
+                    }
+                });
+            }
+        });
+        if shown.len() > columns * 3 && filter.is_empty() {
+            let text = if self.people_show_all { "Show fewer".to_owned() } else { format!("Show all {}", shown.len()) };
+            if ui::button(ui, &text, egui::vec2(0.0, 22.0), ui::Look::ghost(), theme::font(11.5), None).clicked() {
+                self.people_show_all = !self.people_show_all;
+            }
+        }
+        if let Some(id) = open {
+            self.open_person(id);
+        }
+        if let Some((items, to)) = dropped {
+            let touched = self.library.people.lock().map(|mut p| {
+                let t: Vec<PathBuf> = items.iter().flat_map(|(from, photo)| p.move_photo(*from, photo, to)).collect();
+                p.save();
+                t
+            });
+            self.refresh_names(touched.unwrap_or_default());
+            self.person_selected.clear();
+            self.maybe_selected.clear();
+        }
+        if let Some((id, label)) = show_photos {
+            let photos = self.library.photos_of(id);
+            self.filmstrip.show_results(photos, format!("People: {label}"));
+        }
+    }
+
+    /// Show a person in the main pane.
+    fn open_person(&mut self, id: u32) {
+        if self.person_view != Some(id) {
+            self.person_selected.clear();
+            self.person_anchor = None;
+            self.maybe_selected.clear();
+            self.maybe_anchor = None;
+        }
+        self.person_view = Some(id);
+        self.person_rename = None;
+    }
+
+    /// The People view: a big close-up of the person's face with their name, then every photo
+    /// they are in. × takes a photo out of the set; a photo dragged onto a face in the People
+    /// list moves to that person; double-click opens a photo.
+    fn person_view_ui(&mut self, ui: &mut egui::Ui) {
+        self.people_pictures.poll(ui.ctx());
+        let Some(id) = self.person_view else { return };
+        let Some((faces, best, name, others, maybe)) = self.library.people.lock().ok().map(|p| {
+            // Only named people who look somewhat like them.
+            let others = p.similar_named(id);
+            (p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id))
+        }) else {
+            return;
+        };
+        if faces.is_empty() {
+            self.person_view = None;
+            return;
+        }
+        if self.person_rename.as_ref().map(|(i, _)| *i) != Some(id) {
+            self.person_rename = Some((id, name.clone().unwrap_or_default()));
+            self.rename_focus = name.is_none();
+        }
+        let ctx = ui.ctx().clone();
+        let (mut back, mut rename, mut remove, mut open): (bool, Option<String>, Vec<PathBuf>, Option<PathBuf>) = (false, None, Vec::new(), None);
+        // Only photos still in the set stay picked.
+        self.person_selected.retain(|p| faces.iter().any(|f| &f.photo == p));
+        self.maybe_selected.retain(|p| maybe.iter().any(|(f, _)| &f.photo == p));
+        let mut click: Option<(usize, egui::Modifiers)> = None;
+        let mut drag_start: Option<usize> = None;
+        let mut maybe_click: Option<(usize, egui::Modifiers)> = None;
+        let mut maybe_drag: Option<usize> = None;
+        // Possible matches to add to this person: (from person, photo).
+        let mut confirm: Vec<(u32, PathBuf)> = Vec::new();
+        let who = name.clone().unwrap_or_else(|| "this person".to_owned());
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui::button(ui, "Back to the photo", egui::vec2(0.0, 24.0), ui::Look::bordered(), theme::font(12.0), None).on_hover_text("Esc").clicked() {
+                back = true;
+            }
+            ui.add_space(6.0);
+            let title = name.clone().unwrap_or_else(|| "Who is this?".to_owned());
+            ui.label(egui::RichText::new(title).font(theme::bold(16.0)).color(theme::TEXT_BRIGHT));
+            ui.label(ui::dim(&format!("{} photo{}", faces.len(), if faces.len() == 1 { "" } else { "s" }), 12.0));
+            let picked = self.person_selected.len();
+            if picked > 1 {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(format!("{picked} selected")).font(theme::font(12.0)).color(theme::ACCENT));
+                if ui::button(ui, &format!("Take {picked} out of this set"), egui::vec2(0.0, 24.0), ui::Look::bordered(), theme::font(12.0), None).on_hover_text("Not this person (Delete)").clicked() {
+                    remove = self.person_selected.iter().cloned().collect();
+                }
+                if ui::button(ui, "Clear selection", egui::vec2(0.0, 24.0), ui::Look::ghost(), theme::font(12.0), None).clicked() {
+                    self.person_selected.clear();
+                }
+            }
+            let maybe_picked = self.maybe_selected.len();
+            if maybe_picked > 1 {
+                ui.add_space(10.0);
+                if ui::button(ui, &format!("Add {maybe_picked} possible matches to {who}"), egui::vec2(0.0, 24.0), ui::Look::teal(), theme::font(12.0), None).clicked() {
+                    confirm = maybe.iter().filter(|(f, _)| self.maybe_selected.contains(&f.photo)).map(|(f, _)| (f.person, f.photo.clone())).collect();
+                }
+            }
+        });
+        ui.add_space(12.0);
+        ui.horizontal_top(|ui| {
+            // The close-up.
+            const SIDE: f32 = 220.0;
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(SIDE), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 10.0, theme::WELL);
+            match best.as_ref().and_then(|f| self.people_pictures.face(&f.photo, f.area)) {
+                Some(t) => {
+                    egui::Image::new(&t).rounding(10.0).paint_at(ui, rect);
+                }
+                None => {
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Loading…", theme::font(12.0), theme::FADED);
+                }
+            }
+            ui.add_space(18.0);
+            ui.vertical(|ui| {
+                ui.set_max_width(420.0);
+                ui.label(egui::RichText::new("Name").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
+                ui.add_space(4.0);
+                if let Some((_, text)) = self.person_rename.as_mut() {
+                    let field = ui.add(egui::TextEdit::singleline(text).hint_text("Type their name, then Enter").font(theme::font(16.0)).desired_width(300.0));
+                    if std::mem::take(&mut self.rename_focus) {
+                        field.request_focus();
+                    }
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        rename = Some(text.trim().to_owned());
+                    }
+                }
+                if !others.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(ui::dim("Could this be one of them? (They look alike.) Click to put these photos with theirs.", 11.5));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for other in others.iter().take(16) {
+                            if ui::button(ui, other, egui::vec2(0.0, 22.0), ui::Look::bordered(), theme::font(12.0), None).clicked() {
+                                rename = Some(other.clone());
+                            }
+                        }
+                    });
+                }
+                ui.add_space(10.0);
+                ui.label(ui::dim("Click a photo to pick it; Ctrl-click or Shift-click to pick several. Drag them onto a face under People to move them to that person. × takes a photo out of this set. Double-click to open a photo.", 11.5));
+            });
+        });
+        ui.add_space(14.0);
+        ui::hairline(ui);
+        ui.add_space(10.0);
+        // Photos being dragged (onto a person in the People list, or up into this set).
+        let dragged = egui::DragAndDrop::payload::<DragFace>(ui.ctx());
+        let pointer = ui.ctx().pointer_latest_pos();
+        let released = ui.input(|i| i.pointer.any_released());
+        let mut set_rect = egui::Rect::NOTHING;
+        let photos: Vec<PathBuf> = faces.iter().map(|f| f.photo.clone()).collect();
+        let maybe_photos: Vec<PathBuf> = maybe.iter().map(|(f, _)| f.photo.clone()).collect();
+        egui::ScrollArea::vertical().id_source("person_photos").auto_shrink([false, false]).show(ui, |ui| {
+            const GAP: f32 = 10.0;
+            // Their photos: rows filling the width, the face outlined.
+            let card = justified(ui.available_width(), faces.len(), 170.0, GAP);
+            let top = ui.cursor().min;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(GAP, 12.0);
+                for (index, face) in faces.iter().enumerate() {
+                    let card_id = egui::Id::new(("person-photo", id, face.photo.clone()));
+                    let pictures = &mut self.people_pictures;
+                    let dimmed = dragged.as_ref().is_some_and(|d| d.items.iter().any(|(_, p)| p == &face.photo));
+                    let picked = self.person_selected.contains(&face.photo);
+                    let caption = face.photo.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    // Allocated through the wrapping row first, so each card wraps as a whole.
+                    ui.allocate_ui_with_layout(egui::vec2(card, card + 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Remove, &caption, card_id);
+                        if response.drag_started() {
+                            drag_start = Some(index);
+                        }
+                        if corner {
+                            remove = vec![face.photo.clone()];
+                        } else if response.double_clicked() {
+                            open = Some(face.photo.clone());
+                        } else if response.clicked() {
+                            click = Some((index, ui.input(|i| i.modifiers)));
+                        }
+                        response.on_hover_text(format!("{}\nClick to pick, Ctrl or Shift for several; drag onto a person under People to move; double-click to open", face.photo.display()));
+                    });
+                }
+            });
+            set_rect = egui::Rect::from_min_max(top, egui::pos2(top.x + ui.available_width(), ui.cursor().min.y));
+            if maybe.is_empty() {
+                return;
+            }
+            // The possible matches, under a thin divider.
+            ui.add_space(18.0);
+            ui::hairline(ui);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("POSSIBLE MATCHES").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
+                ui.label(ui::dim(&format!("Is this {who}? Click the tick on the right ones, or pick several and drag them up above the line."), 11.5));
+            });
+            ui.add_space(8.0);
+            let card = justified(ui.available_width(), maybe.len(), 150.0, GAP);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(GAP, 12.0);
+                for (index, (face, alike)) in maybe.iter().enumerate() {
+                    let card_id = egui::Id::new(("maybe-photo", id, face.photo.clone()));
+                    let pictures = &mut self.people_pictures;
+                    let dimmed = dragged.as_ref().is_some_and(|d| d.items.iter().any(|(_, p)| p == &face.photo));
+                    let picked = self.maybe_selected.contains(&face.photo);
+                    // Most alike first; the scores alone can't tell a likely match from a wrong one.
+                    let _ = alike;
+                    let caption = face.photo.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    ui.allocate_ui_with_layout(egui::vec2(card, card + 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Confirm, &caption, card_id);
+                        if response.drag_started() {
+                            maybe_drag = Some(index);
+                        }
+                        if corner {
+                            confirm = vec![(face.person, face.photo.clone())];
+                        } else if response.double_clicked() {
+                            open = Some(face.photo.clone());
+                        } else if response.clicked() {
+                            maybe_click = Some((index, ui.input(|i| i.modifiers)));
+                        }
+                        response.on_hover_text(format!("{}\nClick the tick if this is them. Click to pick, Ctrl or Shift for several, then drag up above the line", face.photo.display()));
+                    });
+                }
+            });
+        });
+        // Picking: click picks one, Ctrl-click adds or removes, Shift-click picks a run.
+        if let Some((index, m)) = click {
+            pick(&mut self.person_selected, &mut self.person_anchor, &photos, index, m);
+            self.maybe_selected.clear();
+        }
+        if let Some((index, m)) = maybe_click {
+            pick(&mut self.maybe_selected, &mut self.maybe_anchor, &maybe_photos, index, m);
+            self.person_selected.clear();
+        }
+        // Dragging a picked photo takes all the picked ones; another photo goes alone.
+        if let Some(index) = drag_start {
+            if !self.person_selected.contains(&photos[index]) {
+                pick(&mut self.person_selected, &mut self.person_anchor, &photos, index, egui::Modifiers::NONE);
+            }
+            let items = photos.iter().filter(|p| self.person_selected.contains(*p)).map(|p| (id, p.clone())).collect();
+            egui::DragAndDrop::set_payload(ui.ctx(), DragFace { items });
+        }
+        if let Some(index) = maybe_drag {
+            if !self.maybe_selected.contains(&maybe_photos[index]) {
+                pick(&mut self.maybe_selected, &mut self.maybe_anchor, &maybe_photos, index, egui::Modifiers::NONE);
+            }
+            let items = maybe.iter().filter(|(f, _)| self.maybe_selected.contains(&f.photo)).map(|(f, _)| (f.person, f.photo.clone())).collect();
+            egui::DragAndDrop::set_payload(ui.ctx(), DragFace { items });
+        }
+        // Possible matches dropped above the line join this person.
+        let incoming = dragged.as_ref().is_some_and(|d| d.items.iter().any(|(from, _)| *from != id));
+        let over_set = incoming && pointer.is_some_and(|p| set_rect.contains(p) && ui.clip_rect().contains(p));
+        if over_set {
+            ui.painter().rect_stroke(set_rect.expand(4.0), 8.0, egui::Stroke::new(2.0_f32, theme::TEAL));
+            self.drop_hint = Some(who.clone());
+            if released {
+                if let Some(drag) = egui::DragAndDrop::take_payload::<DragFace>(ui.ctx()) {
+                    confirm = drag.items.iter().filter(|(from, _)| *from != id).cloned().collect();
+                }
+            }
+        }
+        if !ui.ctx().wants_keyboard_input() && !self.person_selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            remove = self.person_selected.iter().cloned().collect();
+        }
+        // While dragging: a small copy of the photo beside the pointer (not under it, so the
+        // pointer stays visible), saying where it will go.
+        if let (Some(drag), Some(pos)) = (&dragged, pointer) {
+            let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("person-drag"));
+            let painter = ui.ctx().layer_painter(layer);
+            let corner = pos + egui::vec2(18.0, 14.0);
+            let mut size = egui::vec2(72.0, 72.0);
+            let first = drag.items.first().map(|(_, p)| p.clone()).unwrap_or_default();
+            if let Some(t) = self.people_pictures.thumb(&first) {
+                let s = t.size_vec2();
+                size = s * (72.0 / s.x.max(s.y));
+                let pic = egui::Rect::from_min_size(corner, size);
+                painter.rect_filled(pic.expand(3.0), 5.0, theme::ELEVATED);
+                painter.image(t.id(), pic, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::from_white_alpha(230));
+            }
+            let what = if drag.items.len() == 1 { String::new() } else { format!("{} photos  ·  ", drag.items.len()) };
+            let text = match &self.drop_hint {
+                Some(name) => format!("{what}Move to {name}"),
+                None if incoming => format!("{what}Drop above the line, or on a face under People"),
+                None => format!("{what}Drop on a face under People"),
+            };
+            let galley = painter.layout_no_wrap(text, theme::font(12.0), theme::TEXT_BRIGHT);
+            let label = egui::Rect::from_min_size(corner + egui::vec2(0.0, size.y + 6.0), galley.size() + egui::vec2(12.0, 6.0));
+            painter.rect_filled(label, 4.0, if self.drop_hint.is_some() { theme::tint(theme::TEAL, 0.85) } else { theme::ELEVATED });
+            painter.galley(label.min + egui::vec2(6.0, 3.0), galley, theme::TEXT_BRIGHT);
+        }
+        if !confirm.is_empty() {
+            let touched = self.library.people.lock().map(|mut p| {
+                let t: Vec<PathBuf> = confirm.iter().flat_map(|(from, photo)| p.move_photo(*from, photo, id)).collect();
+                p.save();
+                t
+            });
+            self.refresh_names(touched.unwrap_or_default());
+            self.maybe_selected.clear();
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().wants_keyboard_input() {
+            back = true;
+        }
+        if let Some(new_name) = rename.filter(|n| !n.is_empty()) {
+            let (touched, now) = self
+                .library
+                .people
+                .lock()
+                .map(|mut p| {
+                    let t = p.rename(id, &new_name);
+                    p.save();
+                    // Naming them as someone else merged them into that person: follow along.
+                    let now = p.list().into_iter().find(|(_, n, ..)| n.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&crate::settings::clean_name(&new_name)))).map(|(i, ..)| i);
+                    (t, now)
+                })
+                .unwrap_or_default();
+            self.refresh_names(touched);
+            if let Some(now) = now {
+                self.person_view = Some(now);
+            }
+            self.person_rename = None;
+        }
+        if !remove.is_empty() {
+            let touched = self.library.people.lock().map(|mut p| {
+                let t: Vec<PathBuf> = remove.iter().flat_map(|photo| p.not_this_person(id, photo)).collect();
+                p.save();
+                t
+            });
+            self.refresh_names(touched.unwrap_or_default());
+            self.person_selected.clear();
+        }
+        // The hint is set by the People list each frame while something is dragged over it.
+        self.drop_hint = None;
+        if back {
+            self.person_view = None;
+        }
+        if let Some(photo) = open {
+            // The filmstrip shows this person's photos, with the one opened.
+            let photos = self.library.photos_of(id);
+            let label = name.unwrap_or_else(|| "Unnamed".to_owned());
+            self.filmstrip.show_results(photos, format!("People: {label}"));
+            self.person_view = None;
+            self.start_loading(photo, &ctx);
+        }
+    }
+
+    /// Who is in the open photo, by name; × takes a person off it (a wrong match).
+    fn photo_people(&mut self, ui: &mut egui::Ui, photo: &Path) {
+        let photo = photo.to_path_buf();
+        let names = self.store.people(&photo).to_vec();
+        if names.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(ui::dim("People", 11.5));
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for n in &names {
+                if ui::button(ui, &format!("{n}  ×"), egui::vec2(0.0, 20.0), ui::Look::bordered(), theme::font(11.5), None).on_hover_text("Not this person: take them off this photo").clicked() {
+                    remove = Some(n.clone());
+                }
+            }
+        });
+        if let Some(name) = remove {
+            let touched = self.library.people.lock().map(|mut p| {
+                let ids: Vec<u32> = p.list().into_iter().filter(|(_, n, _, _)| n.as_deref() == Some(name.as_str())).map(|(id, ..)| id).collect();
+                let mut t = Vec::new();
+                for id in ids {
+                    t.extend(p.not_this_person(id, &photo));
+                }
+                p.save();
+                t
+            });
+            let touched: Vec<PathBuf> = touched.unwrap_or_default();
+            match touched {
+                t if !t.is_empty() => self.refresh_names(t),
+                // A name typed by hand (not from faces): just take it off.
+                _ => {
+                    let kept: Vec<String> = names.iter().filter(|n| **n != name).cloned().collect();
+                    self.apply_names(&photo, kept);
+                }
+            }
+        }
+    }
+
+    /// Keywords of the open photo, or of every selected photo: add words, remove them.
+    fn keywords_panel(&mut self, ui: &mut egui::Ui) {
+        let targets = self.keyword_targets();
+        if targets.is_empty() {
+            ui.label(ui::dim("Open or select a photo to add keywords.", 12.0));
+            return;
+        }
+        // Which photos the keywords below belong to.
+        let which = match targets.len() {
+            1 => targets[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            n => format!("{n} photos picked"),
+        };
+        ui.label(egui::RichText::new(which).font(theme::font(11.5)).color(theme::ACCENT));
+        ui.add_space(3.0);
+        // Every keyword among the targets, with how many of them have it.
+        let mut words: Vec<(String, usize)> = Vec::new();
+        for t in &targets {
+            for w in self.store.keywords(t) {
+                match words.iter_mut().find(|(x, _)| x.eq_ignore_ascii_case(w)) {
+                    Some((_, n)) => *n += 1,
+                    None => words.push((w.clone(), 1)),
+                }
+            }
+        }
+        let mut remove = None;
+        if words.is_empty() {
+            ui.label(ui::dim("No keywords yet.", 12.0));
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (w, n) in &words {
+                    let text = if targets.len() > 1 && *n < targets.len() { format!("{w} ({n} of {})  ×", targets.len()) } else { format!("{w}  ×") };
+                    if ui::button(ui, &text, egui::vec2(0.0, 20.0), ui::Look::bordered(), theme::font(11.5), None).on_hover_text("Remove this keyword").clicked() {
+                        remove = Some(w.clone());
+                    }
+                }
+            });
+        }
+        if let Some(w) = remove {
+            for t in &targets {
+                let kept: Vec<String> = self.store.keywords(t).iter().filter(|x| !x.eq_ignore_ascii_case(&w)).cloned().collect();
+                self.store.set_keywords(t, kept);
+                self.library.note(t, self.store.rating(t), self.store.keywords(t), self.store.people(t));
+            }
+        }
+        ui.add_space(4.0);
+        let hint = if targets.len() > 1 { format!("Add to the {} selected photos", targets.len()) } else { "Add a keyword".to_owned() };
+        let add_people = targets.len() == 1;
+        let response = ui.add(egui::TextEdit::singleline(&mut self.keyword_draft).hint_text(hint).desired_width(f32::INFINITY));
+        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let new: Vec<String> = self.keyword_draft.split(',').map(|w| w.trim().to_owned()).filter(|w| !w.is_empty()).collect();
+            if !new.is_empty() {
+                for t in &targets {
+                    let mut all = self.store.keywords(t).to_vec();
+                    all.extend(new.iter().cloned());
+                    self.store.set_keywords(t, all);
+                    self.library.note(t, self.store.rating(t), self.store.keywords(t), self.store.people(t));
+                }
+            }
+            self.keyword_draft.clear();
+            response.request_focus();
+        }
+        if add_people {
+            self.keyword_suggestions(ui, &targets[0]);
+            self.photo_people(ui, &targets[0]);
+        }
+    }
+
+    /// The photos the Keywords section works on: those picked in the People view while it is
+    /// open, otherwise the filmstrip's selection or the open photo.
+    fn keyword_targets(&mut self) -> Vec<PathBuf> {
+        if self.person_view.is_some() && !self.person_selected.is_empty() {
+            let picked: Vec<PathBuf> = self.person_selected.iter().cloned().collect();
+            // Their folders' settings (keywords, people) may not be read yet.
+            for dir in picked.iter().filter_map(|p| p.parent()) {
+                self.store.load_folder(dir);
+            }
+            return picked;
+        }
+        let open = self.loaded.as_ref().map(|l| l.path.clone());
+        self.filmstrip.targets(open.as_deref())
+    }
+
+    /// Keywords Develop suggests from the photo's content (CLIP): click one to add it.
+    fn keyword_suggestions(&mut self, ui: &mut egui::Ui, photo: &Path) {
+        if !clip::available() {
+            return;
+        }
+        // Start working them out for this photo if not done yet.
+        if let Some((p, rx)) = &self.suggest_job {
+            if let Ok(found) = rx.try_recv() {
+                self.suggestions = Some((p.clone(), found));
+                self.suggest_job = None;
+            }
+        }
+        let have_for_photo = self.suggestions.as_ref().is_some_and(|(p, _)| p == photo);
+        let running_for_photo = self.suggest_job.as_ref().is_some_and(|(p, _)| p == photo);
+        if !have_for_photo && !running_for_photo {
+            let (tx, rx) = mpsc::channel();
+            let (photo_owned, have, ctx) = (photo.to_path_buf(), self.store.keywords(photo).to_vec(), ui.ctx().clone());
+            let pictures = self.library.pictures.clone();
+            std::thread::spawn(move || {
+                let k = people::key(&photo_owned);
+                let cached = pictures.lock().ok().and_then(|p| p.get(&k).cloned());
+                let found = cached
+                    .or_else(|| clip::embed_photo(&photo_owned).ok())
+                    .map(|e| clip::suggest(&e).unwrap_or_default())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(w, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(w)))
+                    .collect();
+                let _ = tx.send(found);
+                ctx.request_repaint();
+            });
+            self.suggest_job = Some((photo.to_path_buf(), rx));
+        }
+        let have = self.store.keywords(photo).to_vec();
+        let list: Vec<(String, f32)> = match &self.suggestions {
+            Some((p, s)) if p == photo => s.iter().filter(|(w, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(w))).cloned().collect(),
+            _ => Vec::new(),
+        };
+        if running_for_photo {
+            ui.label(ui::dim("Looking at the photo for suggestions…", 11.0));
+            return;
+        }
+        if list.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(ui::dim("Suggested (click to add)", 11.5));
+        let mut add = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for (w, _) in &list {
+                if ui::button(ui, &format!("+ {w}"), egui::vec2(0.0, 20.0), ui::Look::ghost(), theme::font(11.5), None).on_hover_text("Add this keyword").clicked() {
+                    add = Some(w.clone());
+                }
+            }
+        });
+        if let Some(w) = add {
+            let mut all = self.store.keywords(photo).to_vec();
+            all.push(w);
+            self.store.set_keywords(photo, all);
+            self.library.note(photo, self.store.rating(photo), self.store.keywords(photo), self.store.people(photo));
+        }
+    }
+
     fn pane_middle(&mut self, ui: &mut egui::Ui) {
         let amber = theme::ACCENT;
         // In the order most photos are worked on: profile, crop, white balance, tone, presence,
@@ -4400,6 +5579,7 @@ impl eframe::App for App {
 impl App {
     /// One frame of the app: in a window, or run without one for exports (headless.rs).
     fn frame(&mut self, ctx: &egui::Context) {
+        self.quit_guard(ctx);
         self.poll_loader();
         self.sync_heal();
         self.update_dialog(ctx);
@@ -4459,11 +5639,36 @@ impl App {
                 self.keep_view = Some((zoom, center));
             }
         }
+        // Library: keep the index fresh, and search it when the filmstrip asks.
+        if self.remember {
+            self.library.tick(ctx);
+            let indexing = self.library.status().0;
+            if self.library_was_indexing && !indexing {
+                self.filmstrip.requery();
+            }
+            self.library_was_indexing = indexing;
+            for (photo, names) in self.library.take_names_due() {
+                self.apply_names(&photo, names);
+            }
+            if let Some(query) = self.filmstrip.library_query() {
+                let (hits, by_words) = self.library.search(&query, self.filmstrip.min_stars());
+                let by_content = hits.len() - by_words;
+                let how = match (by_words, by_content) {
+                    (_, 0) => String::new(),
+                    (0, n) => format!(" ({n} by content)"),
+                    (w, n) => format!(" ({w} by keyword, {n} by content)"),
+                };
+                self.filmstrip.show_results(hits, format!("Library: \u{201c}{query}\u{201d}{how}"));
+            }
+        }
         // Read the settings saved beside the photos of the folder on show (once per folder),
         // then watch it for changes made by another program.
         if self.remember {
             if let Some(dir) = self.filmstrip.dir().map(Path::to_path_buf) {
                 self.store.load_folder(&dir);
+                for d in self.filmstrip.result_dirs() {
+                    self.store.load_folder(&d);
+                }
                 if self.folder_watch.as_ref().map(|w| w.dir()) != Some(dir.as_path()) {
                     self.folder_watch = watch::FolderWatch::new(&dir, ctx);
                     self.outside.clear();
@@ -4495,15 +5700,31 @@ impl App {
             .exact_height(34.0)
             .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10.0, 0.0)))
             .show(ctx, |ui| self.top_bar(ui));
-        egui::TopBottomPanel::bottom("filmstrip")
-            .exact_height(filmstrip::PANEL_HEIGHT)
-            .resizable(false)
+        if browsing {
+            egui::TopBottomPanel::top("view_bar")
+                .exact_height(32.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::none().fill(theme::CANVAS).inner_margin(egui::Margin::symmetric(8.0, 0.0)))
+                .show(ctx, |ui| self.view_bar(ui));
+        }
+        let people_view = browsing && self.person_view.is_some();
+        let grid = browsing && (self.filmstrip.grid() || people_view);
+        let strip_height = if self.layout.strip_height > 0.0 { self.layout.strip_height } else { filmstrip::PANEL_HEIGHT };
+        let strip = egui::TopBottomPanel::bottom("filmstrip")
+            .resizable(true)
+            .default_height(strip_height.clamp(filmstrip::MIN_HEIGHT, filmstrip::MAX_HEIGHT))
+            .height_range(filmstrip::MIN_HEIGHT..=filmstrip::MAX_HEIGHT)
             .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10.0, 0.0)))
-            .show_animated(ctx, browsing, |ui| {
+            .show_animated(ctx, browsing && !grid, |ui| {
             if let Some(action) = self.filmstrip.show(ui, current.as_deref(), &self.store, can_paste) {
                 pick = Some(action);
             }
         });
+        // Remember the sizes the user dragged the panels to (not while they slide in or out).
+        let settled = |id: &str, shown: bool| ctx.animate_bool(egui::Id::new(id).with("animation"), shown) >= 1.0;
+        if let Some(r) = strip.filter(|_| browsing && settled("filmstrip", browsing && !grid)) {
+            self.layout.strip_height = r.response.rect.height().round();
+        }
         if pick.is_none() && self.loading.is_none() && !self.export_open && ctx.memory(|m| m.focused().is_none()) {
             let step = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight) as isize - i.key_pressed(egui::Key::ArrowLeft) as isize);
             if step != 0 {
@@ -4541,31 +5762,97 @@ impl App {
         // Folder tree: clicking a folder shows its photos in the filmstrip.
         if browsing {
             let mut folder = None;
-            egui::SidePanel::left("explorer").exact_width(240.0).resizable(false).frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(8.0, 6.0))).show_animated(ctx, self.show_left, |ui| {
-                folder = self.explorer.show(ui, self.filmstrip.dir());
-            });
+            let mut library_open = None;
+            let left = egui::SidePanel::left("explorer")
+                .resizable(true)
+                .default_width(self.layout.left_width.clamp(180.0, 560.0))
+                .width_range(180.0..=560.0)
+                .frame(egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(8.0, 6.0)))
+                .show_animated(ctx, self.show_left, |ui| match self.left_tab {
+                    LeftTab::Folders => {
+                        self.explorer.library = self.library.folders().to_vec();
+                        folder = self.explorer.show(ui, self.filmstrip.dir());
+                        if let Some((f, add)) = self.explorer.library_change.take() {
+                            if add {
+                                self.library.add_folder(f, ui.ctx());
+                            } else {
+                                self.library.remove_folder(&f, ui.ctx());
+                            }
+                        }
+                    }
+                    LeftTab::FacesMetadata => library_open = self.faces_metadata_panel(ui),
+                });
+            if let Some(r) = left.filter(|_| settled("explorer", self.show_left)) {
+                self.layout.left_width = r.response.rect.width().round();
+            }
+            if library_open.is_some() {
+                folder = library_open;
+            }
             if let Some(folder) = folder {
                 self.filmstrip.set_folder(Some(&folder));
+                self.person_view = None;
             }
             self.session.remember(self.filmstrip.dir(), self.loaded.as_ref().map(|l| l.path.as_path()));
         }
 
         // Right pane: View and the scopes pinned at the top, Export pinned at the bottom,
         // the editing sections scrolling between them.
-        egui::SidePanel::right("controls").exact_width(300.0).resizable(false).frame(egui::Frame::none().fill(theme::PANEL)).show_animated(ctx, self.show_right, |ui| {
+        let right = egui::SidePanel::right("controls")
+            .resizable(true)
+            .default_width(if browsing { self.layout.right_width.clamp(260.0, 600.0) } else { 300.0 })
+            .width_range(260.0..=600.0)
+            .frame(egui::Frame::none().fill(theme::PANEL))
+            .show_animated(ctx, self.show_right, |ui| {
             let side = egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 0.0 });
             let footer = egui::Frame::none().fill(theme::PANEL).inner_margin(egui::Margin::same(12.0));
-            egui::TopBottomPanel::top("pane_top").frame(side).show_separator_line(false).show_inside(ui, |ui| self.pane_top(ui));
+            // The fixed part (name, View, scopes) ends in a dark band right across the pane, so
+            // it is clear where the scrolling sections start.
+            const BAND: f32 = 7.0;
+            let top_frame = side.inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: BAND + 2.0 });
+            let top = egui::TopBottomPanel::top("pane_top").frame(top_frame).show_separator_line(false).show_inside(ui, |ui| self.pane_top(ui));
+            let r = top.response.rect;
+            let band = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - BAND), r.right_bottom());
             egui::TopBottomPanel::bottom("pane_bottom").frame(footer).show_inside(ui, |ui| self.pane_bottom(ui));
             egui::CentralPanel::default().frame(side.inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 0.0, bottom: 0.0 })).show_inside(ui, |ui| {
+                // The sections stay inside the scrolling area, never drawn over the band.
+                ui.visuals_mut().clip_rect_margin = 0.0;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.pane_middle(ui));
             });
+            // Painted last, so nothing scrolling can cover it: one thick line in the main pane's
+            // dark tone.
+            ui.painter().with_clip_rect(band).rect_filled(band, 0.0, theme::CANVAS);
         });
+        if let Some(r) = right.filter(|_| browsing && settled("controls", self.show_right)) {
+            self.layout.right_width = r.response.rect.width().round();
+        }
         self.sync_profile();
         self.feed_scopes();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme::CANVAS))
-            .show(ctx, |ui| self.viewport(ui));
+        if people_view {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(theme::CANVAS).inner_margin(egui::Margin::symmetric(16.0, 0.0)))
+                .show(ctx, |ui| self.person_view_ui(ui));
+        } else if grid {
+            // Grid view: the thumbnails take the main window.
+            let mut grid_pick = None;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(theme::CANVAS).inner_margin(egui::Margin::symmetric(12.0, 0.0)))
+                .show(ctx, |ui| grid_pick = self.filmstrip.show(ui, current.as_deref(), &self.store, can_paste));
+            if let Some(action) = grid_pick {
+                self.apply_action(action, ctx);
+            }
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(theme::CANVAS))
+                .show(ctx, |ui| self.viewport(ui));
+        }
+        if browsing {
+            self.layout.left_tab = self.left_tab as u8;
+            self.layout.grid = self.filmstrip.grid();
+            self.layout.grid_card = self.filmstrip.grid_card.round();
+            if !ctx.input(|i| i.pointer.any_down()) {
+                self.layout.save_if_changed();
+            }
+        }
 
         // R switches crop mode on and off.
         if self.loaded.is_some() && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::R) && !i.modifiers.any()) {

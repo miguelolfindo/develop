@@ -35,8 +35,17 @@ non-destructive and the original raw file is never touched.
 
 ## The tools in one line each
 
-- `list_photos(folder, min_rating)`: what is in a folder, ratings, edited or not, version count.
-- `get_settings(path)`: a photo's full edit.
+- `list_photos(folder, min_rating)`: what is in a folder, ratings, edited or not, version count,
+  keywords and people.
+- `get_settings(path)`: a photo's full edit, with its keywords and people.
+- `search_photos(query, folder?)`: find photos across the user's library (or one folder) by
+  keyword, person's name, file name, or a description ("people eating noodles"). Word matches
+  come first; then photos matched by `content`, best first, which are suggestions to check.
+- `suggest_keywords(path|paths)`: words that fit what is in the photo, best first. Only add the
+  right ones, with `set_keywords`.
+- `set_keywords(path|paths, add, remove, replace)`: keywords, kept in the photo's `.dvlp` file.
+- `list_people()`: the people the user has named, with photo counts. To find someone's photos,
+  `search_photos` with their name. You cannot name people; the user does that in Develop.
 - `set_settings(path|paths, settings)`: change only the settings you name.
 - `check_photo(path)`: measure the photo as edited: histogram, clipping, contrast, colour cast,
   colours, brightness grid, sharpness, and plain-language notes.
@@ -193,6 +202,15 @@ Ask where to and what for if the user did not say. Sensible defaults:
 
 Report the folder and the number of files written, and list any failures.
 
+### Finding and keywording photos
+Use `search_photos` to find photos for a request ("the beach photos", "the ones with Talia",
+"the dinner shots"); without `folder` it searches the library the user set up in Develop. Treat
+`content` matches as suggestions: look at them (`render_preview`) or ask before acting on many.
+To keyword a shoot, call `suggest_keywords` on the photos, keep the suggestions that are right
+(check with a preview if unsure), and add them with `set_keywords`. Keep keywords short, plain and
+consistent (`beach`, not `Beach!` or `at the beach`); do not remove the user's own keywords
+unless asked.
+
 ### Archiving raw files as DNG
 `convert_to_dng` writes lossless DNG copies beside the originals (or into `folder`). It does not
 delete the originals. Offer `embed_original: true` only if the user wants the original file kept
@@ -200,6 +218,6 @@ inside the DNG (bigger files).
 
 ## What you cannot do here
 
-Retouching (heal and clone), AI noise reduction and crop by eye are done in the Develop app;
-tell the user when a request needs them. `get_settings` shows whether a photo has retouch spots
+Retouching (heal and clone), AI noise reduction, crop by eye, naming people and correcting who is
+in a photo are done in the Develop app; tell the user when a request needs them. `get_settings` shows whether a photo has retouch spots
 or AI denoise, so you can avoid undoing their work: `reset_settings` clears those too.

@@ -1,2 +1,6 @@
 /target
 /dist
+# Large models, fetched by the release build (see models/README.md).
+models/face_recognition_sface_2021dec.onnx
+models/clip_vision_quantized.onnx
+models/clip_text_quantized.onnx

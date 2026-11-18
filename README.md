@@ -7,9 +7,9 @@ moving a slider in Develop looks much like moving the same slider in Lightroom.
 
 ## Documentation
 
-- **[User guide](docs/USER-GUIDE.md):** every feature, step by step: browsing, editing, presets,
-  versions, retouching, exporting, DNG, keyboard shortcuts, where edits are kept, and
-  troubleshooting.
+- **[User guide](docs/USER-GUIDE.md):** every feature, step by step: browsing, searching,
+  keywords, people, editing, presets, versions, retouching, exporting, DNG, keyboard shortcuts,
+  where edits are kept, and troubleshooting.
 - **[AI assistants (MCP)](docs/MCP.md):** connecting an AI app, every tool and setting, good
   practice and privacy; plus a ready-made [assistant guide](docs/develop-skill/SKILL.md).
 - **[Release notes](RELEASE_NOTES.md)** for the current version, and the
@@ -32,20 +32,23 @@ of 255) of Lightroom on average.
 Tone, Presence and Color sliders, a tone curve and colour mixer, a white balance eyedropper,
 AI noise reduction, lens corrections, crop and straighten, spot healing and cloning (circles or
 painted strokes), black & white, develop presets, saved versions of an edit, undo and redo,
-copying settings between photos, ratings and filters, exporting one photo or a whole
-selection to JPEG, PNG or TIFF, and an MCP server so AI assistants can help with your work.
+copying settings between photos, ratings and filters, keywords (with suggestions from what is
+in each photo), face recognition, search across a library of folders (including by
+description), exporting one photo or a whole selection to JPEG, PNG or TIFF, and an MCP server so
+AI assistants can help with your work.
 
 **What it does not have (Lightroom does):**
-- A catalog: no keywords, collections, face recognition, map or search across your library.
+- A full catalog: no collections, smart collections, map or import; the library is a list of
+  folders, and keywords and names live in each photo's `.dvlp` file.
 - Local adjustments: no masks, brushes, gradients, or AI subject and sky selection.
 - Content-aware fill and AI object removal: retouching copies from a source you can
   move (heal or clone), it does not invent content.
 - A colour grading panel and per-channel (red, green, blue) curves.
 - HDR and panorama merge, printing, mobile apps and cloud sync.
 
-Develop's own AI does one thing only: noise reduction, running on your own computer. If
-you choose to, you can also connect an AI assistant of your own through the
-[MCP server](#ai-assistants-mcp).
+Develop's own AI runs entirely on your own computer: noise reduction, face recognition, and
+reading what is in your photos for keyword suggestions and search. If you choose to, you can
+also connect an AI assistant of your own through the [MCP server](#ai-assistants-mcp).
 
 ## Features
 
@@ -101,6 +104,15 @@ you choose to, you can also connect an AI assistant of your own through the
     series).
 - **Camera profiles:** uses the Adobe camera profiles (`.dcp`) installed with Lightroom
   or Camera Raw when they are present, including an approximation of Adobe Color.
+- **Layout:** tabs for **Folders**, **Faces & Metadata** and the **Inspector**; drag the panels
+  and the filmstrip to the size you like; a **grid view** fills the window with thumbnails.
+- **Keywords and search:** add keywords (Develop suggests them from what is in the photo; you
+  click to accept), and search a folder or your whole library by keyword, person, file name or a
+  description such as "people eating noodles".
+- **Library and people:** add folders to the library; Develop recognises faces across it and
+  groups them into people you name. A People view shows each person's photos with their face
+  outlined, lets you fix mistakes by dragging, and offers possible matches to confirm. Names go
+  into the photos' `.dvlp` files; face fingerprints stay on your computer.
 - **Filmstrip** with ratings, sorting and filtering, a photo's saved versions grouped with it,
   **histogram and scopes**, **before/after split** (against the original or any saved version),
   and clipping warnings.
@@ -134,7 +146,7 @@ Develop includes an [MCP](https://modelcontextprotocol.io) server, so any AI ass
 speaks MCP (Claude, Gemini, ChatGPT-based tools, local models in LM Studio, Cursor, VS Code
 Copilot, Codex, Continue and others) can help with your photos: list a folder, read and change
 edits, apply presets, rate, save and restore versions, look at a rendered preview or measure it with numbers (for AIs that cannot see images), export,
-and convert to DNG. Develop also does the arithmetic-heavy jobs itself, so even small local
+convert to DNG, search your library (by keyword, person or description) and add keywords. Develop also does the arithmetic-heavy jobs itself, so even small local
 models handle a whole shoot quickly: **rate a folder by focus** (the sharpest frame of each
 burst), **measure focus** at full size, and **set white balance automatically** (from skin or
 neutral areas). Renders for the assistant happen without opening a window. It works with the photos' `.dvlp` files exactly as the app does and never
@@ -225,8 +237,11 @@ cargo build --release
 The program is `target/release/develop` (`develop.exe` on Windows).
 
 **AI noise reduction** uses the two RawNIND model files in `models/`, which come with the
-repository, so a fresh clone has AI denoise for every supported format. See
-[models/README.md](models/README.md) for where they come from and their license.
+repository, so a fresh clone has AI denoise for every supported format. **Face recognition**
+(SFace) and **image understanding** (CLIP) need three larger model files that are not in the
+repository: download them into `models/` as described in [models/README.md](models/README.md),
+which also says where every model comes from and its license. Without them, Develop works but
+has no People, suggestions or search by description.
 
 **Installers** are built with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager):
 
@@ -276,8 +291,13 @@ full text.
   3.0 (see `lensfun/README.md`).
 - AI noise reduction model: RawNIND (Brummer & De Vleeschouwer), GPL-3.0, as packaged
   by [darktable-ai](https://github.com/darktable-org/darktable-ai).
-- Face detector for the skin-tone reading: YuNet (Shiqi Yu and others), MIT, from
+- Face detector: YuNet (Shiqi Yu and others), MIT, from
   [opencv_zoo](https://github.com/opencv/opencv_zoo) (see `models/LICENSE-YuNet.txt`).
+- Face recognition: SFace (Yaoyao Zhong and others), Apache-2.0, from
+  [opencv_zoo](https://github.com/opencv/opencv_zoo) (see `models/LICENSE-SFace.txt`).
+- Image understanding for keywords and search: CLIP ViT-B/32 (OpenAI), MIT, as converted by
+  [Xenova/clip-vit-base-patch32](https://huggingface.co/Xenova/clip-vit-base-patch32) (see
+  `models/LICENSE-CLIP.txt`).
 - User interface: [egui / eframe](https://github.com/emilk/egui); GPU:
   [wgpu](https://github.com/gfx-rs/wgpu); ONNX inference:
   [ort](https://github.com/pykeio/ort).

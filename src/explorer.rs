@@ -28,6 +28,10 @@ struct Loaded {
 }
 
 pub struct Explorer {
+    /// The library's folders (set by the app before drawing), and a folder the user asked to
+    /// add to or take out of the library with the right-click menu (taken by the app).
+    pub library: Vec<PathBuf>,
+    pub library_change: Option<(PathBuf, bool)>,
     roots: Vec<PathBuf>,
     /// Sub-entries of each entry opened so far.
     children: HashMap<PathBuf, Vec<PathBuf>>,
@@ -159,6 +163,8 @@ impl Explorer {
     pub fn new() -> Self {
         let (roots, labels) = roots();
         Self {
+            library: Vec::new(),
+            library_change: None,
             roots,
             children: HashMap::new(),
             labels: labels.into_iter().collect(),
@@ -385,11 +391,27 @@ impl Explorer {
         if response.double_clicked() && !on_chevron && is_open && !container_only {
             self.set_open(path, false);
         }
-        if is_network || computer.is_some() || network::is_remote(path) {
+        // A real folder (not Network or a computer, nor a share not opened yet) can go into the
+        // library.
+        let folder = if container_only { None } else if network::is_unmounted_share(path) { real.clone() } else { Some(path.to_path_buf()) };
+        let in_library = folder.as_ref().is_some_and(|f| self.library.iter().any(|l| key(l) == key(f)));
+        let networked = is_network || computer.is_some() || network::is_remote(path);
+        if networked || folder.is_some() {
             let saved_host = computer.as_ref().filter(|h| self.places.list.iter().any(|l| network::parse_address(l).is_some_and(|(x, _)| x.eq_ignore_ascii_case(h))));
             let mut forget = false;
             let mut remove = None;
+            let mut change = None;
             response.context_menu(|ui| {
+                if let Some(f) = &folder {
+                    let (text, add) = if in_library { ("Remove from Library", false) } else { ("Add to Library", true) };
+                    if ui.button(text).on_hover_text("The library is the folders searched together, with their faces and keywords (Faces & Metadata)").clicked() {
+                        change = Some((f.clone(), add));
+                        ui.close_menu();
+                    }
+                }
+                if !networked {
+                    return;
+                }
                 if ui.button("Read again").clicked() {
                     forget = true;
                     ui.close_menu();
@@ -401,6 +423,9 @@ impl Explorer {
                     }
                 }
             });
+            if change.is_some() {
+                self.library_change = change;
+            }
             if forget {
                 self.forget(path);
             }

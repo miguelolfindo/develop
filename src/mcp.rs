@@ -306,6 +306,8 @@ impl Server {
                         "rating": self.store.rating(p),
                         "edited": self.store.contains(p),
                         "versions": self.store.versions(p).len(),
+                        "keywords": self.store.keywords(p),
+                        "people": self.store.people(p),
                     }))
                     .collect();
                 text(json!({"folder": folder.display().to_string(), "count": list.len(), "photos": list}))
@@ -315,6 +317,8 @@ impl Server {
                 let saved = self.store.get(&path).cloned();
                 text(json!({
                     "path": path.display().to_string(),
+                    "keywords": self.store.keywords(&path),
+                    "people": self.store.people(&path),
                     "edited": saved.is_some(),
                     "rating": self.store.rating(&path),
                     "settings": to_json(saved.as_ref().unwrap_or(&blank())),
@@ -692,6 +696,140 @@ impl Server {
                     "how_to_read": "Develop set each photo's temperature (and, from neutral areas, tint) itself; exposure is unchanged. method says what it went by: skin (faces, measured as if at 20% brightness, brought to natural saturation without turning pink), neutral areas (grey and white parts made neutral) or unchanged (nothing to measure). before and after show the readings. check says why a photo is worth a look. If remaining is above 0, call again with the photos not yet done.",
                 }))
             }
+            "search_photos" => {
+                let query = args["query"].as_str().ok_or("query is required")?.trim().to_owned();
+                if query.is_empty() {
+                    return Err("query is empty".into());
+                }
+                let min_rating = args["min_rating"].as_u64().unwrap_or(0).min(5) as u8;
+                let limit = args["limit"].as_u64().unwrap_or(40).clamp(1, 200) as usize;
+                let (found, by_words, scope) = match args["folder"].as_str() {
+                    Some(folder) => {
+                        // One folder: words from its sidecars; content from the library's saved
+                        // CLIP numbers where it has them, else worked out now.
+                        let folder = PathBuf::from(folder);
+                        if !folder.is_dir() {
+                            return Err(format!("{} is not a folder", folder.display()));
+                        }
+                        self.store.load_folder_fresh(&folder);
+                        let mut photos: Vec<PathBuf> = std::fs::read_dir(&folder)
+                            .map_err(|e| e.to_string())?
+                            .filter_map(|e| e.ok().map(|e| e.path()))
+                            .filter(|p| crate::filmstrip::is_raw(p) || is_picture(p))
+                            .filter(|p| self.store.rating(p) >= min_rating)
+                            .collect();
+                        photos.sort();
+                        let mut found: Vec<PathBuf> = photos.iter().filter(|p| crate::filmstrip::matches_search(&query, p, &self.store)).cloned().collect();
+                        let by_words = found.len();
+                        if crate::clip::available() {
+                            let library = crate::library::Library::load();
+                            let cache = library.pictures.lock().map(|p| p.all()).unwrap_or_default();
+                            let started = std::time::Instant::now();
+                            let mut pictures = Vec::new();
+                            for p in &photos {
+                                let k = crate::people::key(p);
+                                let cached = library.pictures.lock().ok().and_then(|c| c.get(&k).cloned());
+                                match cached {
+                                    Some(e) => pictures.push((p.clone(), e)),
+                                    None if started.elapsed().as_secs() < BATCH_SECONDS => {
+                                        if let Ok(e) = crate::clip::embed_photo(p) {
+                                            pictures.push((p.clone(), e));
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            let _ = cache;
+                            if let Ok(phrase) = crate::clip::text_embedding(&query) {
+                                for (p, _) in crate::clip::rank(&phrase, &pictures) {
+                                    if !found.contains(&p) {
+                                        found.push(p);
+                                    }
+                                }
+                            }
+                        }
+                        (found, by_words, folder.display().to_string())
+                    }
+                    None => {
+                        let library = crate::library::Library::load();
+                        if library.folders().is_empty() {
+                            return Err("The library has no folders yet. The user adds them in Develop (Faces & Metadata tab, Library, + Add; or right-click a folder, Add to Library); or pass folder to search one folder.".into());
+                        }
+                        library.refresh_tags();
+                        let (found, by_words) = library.search(&query, min_rating);
+                        (found, by_words, "library".to_owned())
+                    }
+                };
+                let rows: Vec<Value> = found
+                    .iter()
+                    .take(limit)
+                    .enumerate()
+                    .map(|(i, p)| json!({"path": p.display().to_string(), "matched": if i < by_words { "keyword, person or file name" } else { "content" }}))
+                    .collect();
+                text(json!({
+                    "query": query,
+                    "searched": scope,
+                    "count": found.len(),
+                    "shown": rows.len(),
+                    "photos": rows,
+                    "how_to_read": "Photos whose keywords, people or file name contain every word come first (matched: keyword, person or file name); then photos whose content fits the description best, by an image-understanding model (matched: content), best first. Content matches are suggestions: check them with render_preview if you can see images.",
+                }))
+            }
+            "set_keywords" => {
+                let paths = self.photos(args)?;
+                let words = |key: &str| -> Vec<String> { args[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default() };
+                let (add, remove, replace) = (words("add"), words("remove"), args.get("replace").map(|_| words("replace")));
+                if add.is_empty() && remove.is_empty() && replace.is_none() {
+                    return Err("give add, remove or replace (lists of keywords)".into());
+                }
+                let mut rows = Vec::new();
+                for path in &paths {
+                    let mut kw: Vec<String> = match &replace {
+                        Some(r) => r.clone(),
+                        None => self.store.keywords(path).to_vec(),
+                    };
+                    kw.retain(|k| !remove.iter().any(|r| r.eq_ignore_ascii_case(k)));
+                    kw.extend(add.iter().cloned());
+                    self.store.set_keywords(path, kw);
+                    rows.push(json!({"path": path.display().to_string(), "keywords": self.store.keywords(path)}));
+                }
+                self.store.flush(true);
+                text(json!({"updated": rows.len(), "photos": rows}))
+            }
+            "suggest_keywords" => {
+                if !crate::clip::available() {
+                    return Err("The image-understanding model (CLIP) is not installed.".into());
+                }
+                let paths = self.photos(args)?;
+                let library = crate::library::Library::load();
+                let started = std::time::Instant::now();
+                let mut rows = Vec::new();
+                for path in &paths {
+                    if started.elapsed().as_secs() >= BATCH_SECONDS {
+                        break;
+                    }
+                    let have = self.store.keywords(path).to_vec();
+                    let words: Vec<Value> = library.suggestions(path, &have).into_iter().map(|(w, s)| json!({"keyword": w, "score": (s * 1000.0).round() / 1000.0})).collect();
+                    rows.push(json!({"path": path.display().to_string(), "keywords": have, "suggested": words}));
+                }
+                text(json!({
+                    "done": rows.len(),
+                    "remaining": paths.len() - rows.len(),
+                    "photos": rows,
+                    "how_to_read": "suggested: keywords the photo's content fits, best first, not yet on the photo (an image-understanding model's guess; occasionally wrong). Add the right ones with set_keywords. The user can keep their own vocabulary in keyword-vocabulary.txt in Develop's settings folder.",
+                }))
+            }
+            "list_people" => {
+                let library = crate::library::Library::load();
+                let people = library.people.lock().map(|p| p.list()).unwrap_or_default();
+                let named: Vec<Value> = people.iter().filter_map(|(_, name, count, _)| name.as_ref().map(|n| json!({"name": n, "photos": count}))).collect();
+                let unnamed = people.iter().filter(|(_, name, ..)| name.is_none()).count();
+                text(json!({
+                    "people": named,
+                    "unnamed_groups": unnamed,
+                    "how_to_read": "People the user has named in Develop, with how many photos each is in. To find a person's photos, use search_photos with their name. Faces are grouped by Develop and named by the user (Faces & Metadata tab, People); names are stored in the photos' .dvlp files.",
+                }))
+            }
             "check_focus" => {
                 let path = self.photo(args)?;
                 let (report, crop) = measure_photo(&path, 512, 0, true, false)?;
@@ -805,7 +943,7 @@ const BATCH_SECONDS: u64 = 35;
 
 const INSTRUCTIONS: &str = "Develop is a raw photo editor. Photos are files on disk; each photo's edit lives in a .dvlp file beside it. \
 Your changes to a photo are saved automatically in one version per photo per request, labelled 'AI · ...' (it is updated as you keep working on the request; pass new_version: true to set_settings or apply_preset to start a separate version, e.g. for an alternative look such as black and white), and the user's own edit is kept first as 'Before AI · ...'; other versions are never changed. Use list_photos to see a folder, get_settings to read an edit, set_settings to change it (only the settings you name change), \
-render_preview to look at the result (or check_photo to measure it with numbers: histogram, clipping, colour cast; use it if you cannot see images), check_photos to measure many photos at once with one short row each (use it for whole folders instead of check_photo on each photo; focus: true adds a full-size focus measurement), cull_photos to rate a whole folder by focus (bursts grouped by capture time; call it until status is done, then with apply: true), auto_white_balance to let Develop set photos' white balance itself (from neutral areas, or from skin in warm light), check_focus to measure one photo's focus and see a 100% crop of its sharpest area, and export to write JPEG, PNG or TIFF files. Slider scales follow Lightroom's: exposure in stops (-5..5), \
+render_preview to look at the result (or check_photo to measure it with numbers: histogram, clipping, colour cast; use it if you cannot see images), check_photos to measure many photos at once with one short row each (use it for whole folders instead of check_photo on each photo; focus: true adds a full-size focus measurement), cull_photos to rate a whole folder by focus (bursts grouped by capture time; call it until status is done, then with apply: true), auto_white_balance to let Develop set photos' white balance itself (from neutral areas, or from skin in warm light), search_photos to find photos by keyword, person or description across the user's library, set_keywords and suggest_keywords for keywords, list_people for the people the user has named, check_focus to measure one photo's focus and see a 100% crop of its sharpest area, and export to write JPEG, PNG or TIFF files. Slider scales follow Lightroom's: exposure in stops (-5..5), \
 most other sliders -100..100, temperature in kelvin (0 = as shot), tint -150..150. Tell the user which AI versions you made. \
 If Develop is open on the same folder, it shows changes made here as they happen.";
 
@@ -854,6 +992,18 @@ curve is a list of [x, y] points 0..1; hsl_hue / hsl_saturation / hsl_luminance 
         {"name": "auto_white_balance", "title": "Auto white balance",
          "description": "Let Develop set the white balance of photos itself, by measuring renders: from the grey and white parts of the picture when there are enough, otherwise (firelight, tungsten) from people's skin when there are faces (measured as if the faces were at 20%, cooled to a natural colour strength without turning pink). Changes temperature (and tint when going by neutral areas) only, never exposure, and saves into the photo's AI version. Returns, per photo, the temperature set, the method, readings before and after, and anything worth a look. Several seconds per photo; for many photos it may return early with remaining above 0: call again with the rest. Prefer this to adjusting temperature by hand.",
          "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path, "from": {"type": "string", "enum": ["auto", "skin"], "description": "auto (default): neutral areas when there are enough, else skin; skin: go by the faces only (the Skin button), setting temperature for skin colour strength and tint for skin hue"}}}},
+        {"name": "search_photos", "title": "Search photos",
+         "description": "Find photos by keyword, person's name, file name, or by describing what is in them (\"red car at night\", \"bride and groom dancing\"). Searches the user's library (the folders they added in Develop), or one folder if folder is given. Word matches come first, then the photos whose content fits the description best.",
+         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "folder": {"type": "string"}, "min_rating": {"type": "integer", "minimum": 0, "maximum": 5}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}}, "required": ["query"]}},
+        {"name": "set_keywords", "title": "Set keywords",
+         "description": "Add or remove keywords on photos (stored in each photo's .dvlp file, so they travel with it). add and remove are lists; replace sets the whole list.",
+         "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path, "add": {"type": "array", "items": {"type": "string"}}, "remove": {"type": "array", "items": {"type": "string"}}, "replace": {"type": "array", "items": {"type": "string"}}}}},
+        {"name": "suggest_keywords", "title": "Suggest keywords",
+         "description": "Suggest keywords for photos from what is in them (wedding, car, flower, beach, dog...), by an image-understanding model running on this computer. Suggestions only: add the right ones with set_keywords.",
+         "inputSchema": {"type": "object", "properties": {"paths": paths, "path": path}}},
+        {"name": "list_people", "title": "List people",
+         "description": "The people the user has named in Develop (faces are recognised across the library), with how many photos each is in. Search for a person's photos with search_photos and their name.",
+         "inputSchema": {"type": "object", "properties": {}}},
         {"name": "check_focus", "title": "Check focus",
          "description": "Measure focus on the full-size photo: the edge width in pixels of its sharpest area (about 2.7 at best; crisp detail reads 2.5-3.5; bigger is softer), across and down (a big difference can mean motion blur), where that area is, the typical edge width of the whole picture, and a verdict. Also returns a 100% crop (512 x 512 px) of the sharpest area so you can see whether the subject is in focus; pass include_crop: false if you cannot see images. For many photos use check_photos with focus: true.",
          "inputSchema": {"type": "object", "properties": {"path": path, "include_crop": {"type": "boolean"}}, "required": ["path"]}},

@@ -48,6 +48,9 @@ pub struct Face {
     pub w: f32,
     pub h: f32,
     pub score: f32,
+    /// Right eye, left eye, nose tip, right and left mouth corners (as seen in the picture),
+    /// in picture pixels: for lining the face up (see faces.rs).
+    pub landmarks: [[f32; 2]; 5],
 }
 
 fn iou(a: &Face, b: &Face) -> f32 {
@@ -85,6 +88,7 @@ pub fn faces(rgb: &[u8], width: usize, height: usize) -> Result<Vec<Face>, Strin
             Ok(value.try_extract_tensor::<f32>().map_err(|e| e.to_string())?.1.to_vec())
         };
         let (cls, obj, bbox) = (get(format!("cls_{stride}"))?, get(format!("obj_{stride}"))?, get(format!("bbox_{stride}"))?);
+        let kps = get(format!("kps_{stride}")).unwrap_or_default();
         let cols = pw / stride;
         for (idx, (&c, &o)) in cls.iter().zip(&obj).enumerate() {
             let score = (c.clamp(0.0, 1.0) * o.clamp(0.0, 1.0)).sqrt();
@@ -97,7 +101,13 @@ pub fn faces(rgb: &[u8], width: usize, height: usize) -> Result<Vec<Face>, Strin
             let cy = (row + bbox[idx * 4 + 1]) * s;
             let w = bbox[idx * 4 + 2].exp() * s;
             let h = bbox[idx * 4 + 3].exp() * s;
-            found.push(Face { x: (cx - w / 2.0) / scale, y: (cy - h / 2.0) / scale, w: w / scale, h: h / scale, score });
+            let mut landmarks = [[0.0f32; 2]; 5];
+            if kps.len() >= (idx + 1) * 10 {
+                for (k, l) in landmarks.iter_mut().enumerate() {
+                    *l = [(col + kps[idx * 10 + 2 * k]) * s / scale, (row + kps[idx * 10 + 2 * k + 1]) * s / scale];
+                }
+            }
+            found.push(Face { x: (cx - w / 2.0) / scale, y: (cy - h / 2.0) / scale, w: w / scale, h: h / scale, score, landmarks });
         }
     }
     // Keep the best of overlapping boxes.

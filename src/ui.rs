@@ -130,7 +130,7 @@ pub fn pro_slider_with(
 /// A full-width one-pixel divider.
 pub fn hairline(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.center().y, theme::hairline());
+    ui.painter().hline(rect.x_range(), rect.center().y, theme::divider());
 }
 
 /// Uppercase, letter-spaced text for section headers.
@@ -272,13 +272,13 @@ pub enum Icon {
     RotateCcw,
     RotateCw,
     Refresh,
-    Sidebar,
     Crop,
     Folder,
     ChevronDown,
     ChevronRight,
     Ascending,
     Descending,
+    Grid,
 }
 
 /// Points along an arc; angles in radians, clockwise from the positive x axis (screen y down).
@@ -315,10 +315,14 @@ pub fn draw_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32
                 Stroke::NONE,
             ));
         }
-        Icon::Sidebar => {
-            painter.rect_stroke(rect, 2.0, stroke);
-            let x = rect.left() + rect.width() * 0.36;
-            painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+        Icon::Grid => {
+            // Four small squares.
+            let g = rect.width() * 0.14;
+            let s = (rect.width() - g) * 0.5;
+            for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                let min = rect.min + egui::vec2(dx * (s + g), dy * (s + g));
+                painter.rect_stroke(Rect::from_min_size(min, Vec2::splat(s)), 1.0, stroke);
+            }
         }
         Icon::Crop => {
             let (l, t, rt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());

@@ -30,6 +30,12 @@ pub const TEXT_HEADER: Color32 = Color32::from_rgb(0x9C, 0xA3, 0xAF);
 pub const FADED: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
 
 /// One-pixel dividers.
+/// Thin dividing lines (between sections, under headers, menu separators): the main pane's
+/// dark tone, cut into the panel's grey.
+pub fn divider() -> Stroke {
+    Stroke::new(1.0_f32, CANVAS)
+}
+
 pub fn hairline() -> Stroke {
     Stroke::new(1.0_f32, Color32::from_white_alpha(16))
 }
@@ -134,7 +140,7 @@ pub fn apply(ctx: &egui::Context) {
 
     let rounding = Rounding::same(4.0);
     // Dividers and panel edges: hairlines only.
-    v.widgets.noninteractive.bg_stroke = hairline();
+    v.widgets.noninteractive.bg_stroke = divider();
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.noninteractive.rounding = rounding;
     // Controls: flat fills, no outlines.

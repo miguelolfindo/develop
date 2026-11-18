@@ -10,6 +10,8 @@ covers everything the app does, in the order you would use it.
 1. [Installing and updating](#1-installing-and-updating)
 2. [The window](#2-the-window)
 3. [Finding and organising photos](#3-finding-and-organising-photos)
+   - [Grid view](#grid-view) · [Search](#search) · [Keywords](#keywords) · [The library](#the-library)
+     · [People](#people)
 4. [Looking at a photo](#4-looking-at-a-photo)
 5. [Editing](#5-editing)
    - [Presets](#presets) · [Versions](#versions) · [Profile and treatment](#profile-and-treatment)
@@ -71,22 +73,33 @@ are; the settings folder (see [section 9](#9-where-your-edits-are-kept)) can be 
 
 ```
 ┌──────────────────────────────── top bar ────────────────────────────────┐
-│ folder panel │            photo (viewer)              │   inspector     │
-│  (Folders)   │                                        │  (edit panel)   │
+│ Folders | Faces & Metadata                                  Inspector   │
+├──────────────┬────────────────────────────────────────┬─────────────────┤
+│  left panel  │            photo (viewer)              │   inspector     │
 │              │  zoom · A/B Split · Clipping           │  [ Export… ]    │
 ├──────────────┴──────────────── filmstrip ─────────────┴─────────────────┤
 ```
 
-- **Top bar:** buttons to show or hide the folder panel and the inspector (also `[` and `]`), the
-  open photo's file name, camera, size and bit depth, and which graphics system Develop is
-  using (Vulkan, DX12, Metal, OpenGL or WebGPU).
-- **Folder panel** (left): your drives, home folder and network.
+- **Top bar:** the open photo's file name, camera, size and bit depth; while Develop is reading
+  new library photos, "Finding faces 37 of 410"; and which graphics system Develop is using
+  (Vulkan, DX12, Metal, OpenGL or WebGPU).
+- **Tabs:** **Folders** and **Faces & Metadata** choose what the left panel shows; **Inspector**
+  shows or hides the right panel. The tab showing is highlighted and joins its panel; click it
+  again to hide the panel (`[` and `]` do the same).
+- **Left panel:** **Folders** shows your drives, home folder and network. **Faces & Metadata**
+  shows the photo's keywords, the People and the Library.
 - **Viewer** (middle): the photo, with the zoom readout, **A/B Split** and **Clipping** in the
-  bottom-left corner.
-- **Inspector** (right): the photo's name and type, **Undo**, **Redo** and **Reset All**, the
-  camera, size and as-shot white balance (hover for details), then the View, Histogram and
-  Vectorscope sections and every editing section. **Export…** sits at the bottom.
-- **Filmstrip** (bottom): the photos of the current folder.
+  bottom-left corner. It also shows the [grid view](#grid-view) and the
+  [People view](#the-people-view).
+- **Inspector** (right): the photo's file name and type, when it was taken, the camera, size and
+  as-shot white balance (hover for details), then **Undo**, **Redo** and **Reset All**, and the
+  View, Histogram and Vectorscope sections. A thick dark line marks where the editing sections
+  begin; they scroll below it. **Export…** sits at the bottom.
+- **Filmstrip** (bottom): the photos of the current folder, or of a search.
+
+**Sizes:** drag the edge of the left or right panel to make it wider or narrower, and the top edge
+of the filmstrip to make it taller (its thumbnails grow with it). Develop remembers the sizes, the
+tab and the grid view for next time.
 
 Sections collapse and expand by clicking their titles. Double-clicking a slider's name puts it
 back to its default.
@@ -108,6 +121,10 @@ Lists your drives, your home folder (and **Volumes** on a Mac) and **Network**. 
 next to a folder to open it, click its name to show its photos. **Read again** (the circular
 arrow) reads the drives, network and folders again.
 
+Right-click a folder and choose **Add to Library** to have it searched with the others and its
+faces recognised (see [The library](#the-library)); a folder already in the library offers
+**Remove from Library**.
+
 **Network** lists the computers and NAS boxes on your network and the folders they share. To
 add one that is not listed, type its address in the box at the top of Network (`\\computer\share`
 on Windows, `smb://computer/share` on a Mac) and confirm. Windows asks for a user name and
@@ -126,8 +143,11 @@ when it has saved versions.
 - **Sort** by Capture Date, File Name or File Type, ascending or descending (the arrow button).
 - **Filter** to show only rated photos, a minimum number of stars, or five stars only.
 - **Refresh** (the circular arrow) reads the folder again for new or deleted files.
+- **Search** the folder or the whole library (see [Search](#search)).
+- **Grid** shows the thumbnails across the whole window (see [Grid view](#grid-view)).
 - The header shows the folder, which photo of how many is open, and how many are selected.
 - The mouse wheel scrolls the strip sideways.
+- Drag the top edge of the filmstrip to make it taller or shorter; the thumbnails follow.
 
 **Versions in the filmstrip.** A photo with saved [versions](#versions) is shown together with
 them in one tinted frame: the photo's own card first, then a smaller card per version, marked
@@ -135,6 +155,108 @@ them in one tinted frame: the photo's own card first, then a smaller card per ve
 version (drawn once the photo has been opened; until then the photo's own thumbnail, dimmed).
 Click a version card to open the photo at that version; right-click it to **Open this version**
 or **Delete this version**.
+
+### Grid view
+
+Click **Grid** at the top left of the filmstrip to show the thumbnails across the whole main
+window. The rows run from edge to edge: the **Size** slider at the bottom right sets about how big
+the thumbnails are, and each row stretches them a little to fill the width (a last row that is not
+full keeps the same size). Click a photo to open it (the Inspector follows it); double-click it,
+or click **Grid** again, to go back to the photo with the filmstrip underneath. Selecting, rating,
+sorting, filtering and searching work as in the filmstrip. A photo's saved versions show as the
+number in its corner; their own cards appear in the filmstrip.
+
+### Search
+
+Type in the box at the top of the filmstrip. Every word must appear in a photo's keywords, the
+names of the people in it, or its file name.
+
+- **This folder** searches the photos of the open folder.
+- Click it to switch to **Library**: every [library](#the-library) folder at once. Photos whose
+  words match come first; after them come photos whose **content** fits what you typed, so you can
+  describe what you are looking for: "people eating noodles", "surfboard on the sand", "red car at
+  night". The header says how many matched each way, for example *Library: "dinner" (4 by keyword,
+  20 by content)*.
+- **×** clears the search.
+
+Searching by content works in English, on library photos Develop has already read.
+
+### Keywords
+
+Keywords are words to find photos by. They are in **Faces & Metadata**, under **KEYWORDS**, for
+the open photo (or the selected photos; the first line says which).
+
+- Type a word and press **Enter** to add it; separate several with commas.
+- Click **×** on a keyword to remove it.
+- With several photos selected, words you add go onto all of them, and each keyword shows how
+  many have it, for example *dinner (2 of 3)*.
+- **Suggested (click to add):** Develop looks at the photo and offers words for what is in it
+  (dog, beach, restaurant, car, flower…). Click one to add it; nothing is added unless you click.
+  The suggestions come from a built-in list of about 80 common photo subjects; to use your own
+  words, put them in `keyword-vocabulary.txt` in the [settings folder](#9-where-your-edits-are-kept),
+  one per line.
+- **People:** the named people in the photo. **×** takes someone off it (a wrong match).
+
+Keywords are kept in the photo's `.dvlp` file, so they travel with it.
+
+### The library
+
+The library is the set of folders you want searched together and whose faces Develop recognises.
+It is under **LIBRARY** in Faces & Metadata.
+
+- **+ Add** picks a folder (its subfolders are included). Or right-click a folder under Folders and
+  choose **Add to Library**.
+- Click a library folder to show its photos; right-click it to **Remove from Library**.
+- The circular arrow reads the library again.
+
+Develop reads each library photo once, in the background: it finds the faces and looks at what is
+in the photo, from the photo's embedded preview (about two photos a second). While it does,
+**Finding faces and reading content** shows a progress bar and the time left above People, and the
+top bar shows "Finding faces 37 of 410" whatever tab is open. It checks the library again when it
+starts and every ten minutes, and only new or changed photos are read again. A photo moved to
+another folder keeps its faces and names.
+
+**Closing while it reads:** Develop asks first. **Keep running** carries on; **Quit now** keeps
+everything read so far (it is also saved every 20 seconds as it goes), and the rest is read the
+next time Develop opens.
+
+### People
+
+Faces found in library photos are grouped into people. Under **PEOPLE** in Faces & Metadata:
+
+- A grid of faces: named people first, then unnamed groups, the largest first, each with how many
+  photos it is in. Groups of a single photo are left out.
+- **Find a person** filters by name. A long list shows its first three rows until **Show all**.
+- Click a face to open it in the People view. Right-click it to **Show their photos in the
+  filmstrip**.
+
+#### The People view
+
+Clicking a face fills the main window with that person:
+
+- A large close-up of their face, and **Name**: type their name and press **Enter**. Naming two
+  groups the same joins them into one person.
+- **Could this be one of them?** lists named people who look alike; click a name to put these
+  photos with theirs.
+- Every photo they are in, with the face outlined in amber. Hover the **magnifying glass** in a
+  photo's corner for a close-up of the face in it, useful when a face is small.
+- **×** in a photo's corner (on hover) takes it out of the set.
+- **Picking several:** click a photo to pick it, **Ctrl-click** (Cmd-click) to add or remove one,
+  **Shift-click** to pick a run. With several picked, **Take N out of this set** (or the Delete key)
+  removes them. While photos are picked, the Keywords section works on them.
+- **Moving photos to someone else:** drag a photo (or the picked photos) onto the right face under
+  People. A small copy follows the pointer and says where it will go ("Move to Talia"); the face
+  under the pointer is ringed in teal.
+- **Possible matches:** below a thin line, faces that look somewhat like this person but were not
+  sure enough to join them, most alike first, outlined in teal. Click the **tick** on the right
+  ones, or pick several and drag them up above the line (or use **Add N possible matches**).
+  Some may be people who only look alike: you decide.
+- Double-click a photo to open it; the filmstrip then shows this person's photos.
+- **Back to the photo** (or Esc) returns to the photo.
+
+People's names are written into their photos' `.dvlp` files (like keywords), so a search finds
+them and they travel with the photos. The face fingerprints that recognise people stay in
+Develop's settings folder and are never written into your photos or sent anywhere.
 
 ### Ratings
 
@@ -451,8 +573,8 @@ for editing in other apps or for archiving.
 
 ## 9. Where your edits are kept
 
-**Beside each photo:** `DSC01234.ARW.dvlp`, a small text file with the photo's edit, rating and
-saved versions. Only edited or rated photos get one. Keep it with the photo when you copy or move
+**Beside each photo:** `DSC01234.ARW.dvlp`, a small text file with the photo's edit, rating,
+saved versions, keywords and the names of the people in it. Only photos with any of these get one. Keep it with the photo when you copy or move
 it, and the edit comes along. If a folder cannot be written to (a memory card, a read-only disk),
 the edit is kept in the settings folder instead.
 
@@ -477,7 +599,13 @@ on a Mac.
 | `network.tsv` | Computers and shares added to Network |
 | `photo-settings.tsv` | Edits for photos in folders that cannot be written to |
 | `update-skip.txt` | A version you chose to skip |
-| `thumbs/` | Thumbnails of edited photos and of versions |
+| `layout.tsv` | Panel sizes, the left panel's tab, the grid view and its thumbnail size |
+| `library.txt` | The library's folders |
+| `library-index.tsv` | What Develop knows about each library photo, for searching |
+| `faces.tsv`, `people.tsv` | The faces found in library photos (where they are, and a fingerprint of each), and the people they are grouped into |
+| `clip.tsv` | What each library photo shows, as numbers, for searching by description and keyword suggestions |
+| `keyword-vocabulary.txt` | Your own list of words for keyword suggestions, if you make one |
+| `thumbs/` | Thumbnails of edited photos and of versions, and small pictures of faces |
 | `lensfun/` | Your extra Lensfun lens profiles |
 | `mcp-http.txt` | The address and token of the HTTP MCP server, when used |
 
@@ -501,6 +629,9 @@ Develop protects your work while an assistant edits:
   for example `AI · Claude: exposure, highlights · 17 Nov 14:32 UTC`. Alternatives the assistant
   makes on request (a black and white take, say) get their own version.
 - Versions you made can never be changed or removed by an assistant.
+
+An assistant can also search your library (by keyword, person, file name or description), add
+keywords, suggest keywords from what is in a photo, and list the people you have named.
 
 Setup for each AI app, every tool and setting, good practice and privacy notes are in
 **[MCP.md](MCP.md)** (including `check_photos`, which lets an assistant measure a whole folder at once; focus checks that measure the full-size photo and show the assistant its sharpest area at 100%; `cull_photos`, which rates a whole shoot by focus, keeping the sharpest frame of each burst; and a skin-tone reading, so an assistant can judge white balance from people's faces in firelight or tungsten, where nothing in the picture is grey), and a ready-made guide to give your assistant is in
@@ -530,7 +661,8 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | Delete, Backspace | In Retouch: remove the selected spot |
 | H | In Retouch: hide / show the outlines |
 | Space+drag | In Retouch: pan |
-| Esc | In Retouch: deselect, then leave the tool |
+| Esc | In Retouch: deselect, then leave the tool; in the People view: back to the photo |
+| Delete | In the People view: take the picked photos out of the set |
 
 | Mouse | Action |
 |---|---|
@@ -540,7 +672,10 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | Middle-button drag | Pan (also in Retouch) |
 | Double-click a slider's name | Back to its default |
 | Right-click | Export, Convert to DNG, Copy / Paste settings, Rating |
-| Ctrl-click / Shift-click in the filmstrip | Add to the selection / select a range |
+| Ctrl-click / Shift-click in the filmstrip, grid or People view | Add to the selection / select a range |
+| Double-click a photo in the grid or People view | Open it |
+| Drag photos from the People view onto a face under People | Move them to that person |
+| Drag panel edges, the filmstrip's top edge | Resize them |
 
 ---
 
@@ -603,6 +738,12 @@ Other `--name value` options set sliders for testing.
 - **Changes made by an AI assistant do not show.** They normally appear within a second. On some
   network shares Develop is not told about changes and checks every few seconds instead; wait a
   moment, or open the folder again.
+- **The People list is empty, or library search finds nothing.** Add folders to the library
+  (Faces & Metadata, **+ Add**) and wait for **Finding faces** to finish.
+- **No suggested keywords, or search finds nothing by description.** The image understanding
+  model files were not found; reinstall Develop.
+- **The same person is split into two groups.** Give both the same name, or drag the photos onto
+  the right face; check **Possible matches** too.
 - **Graphics problems.** The top bar shows which graphics system Develop uses; updating the
   graphics driver usually helps.
 - **macOS says the app is damaged or will not open.** See the README's
@@ -614,6 +755,8 @@ Other `--name value` options set sliders for testing.
 
 Develop has no account, no cloud and no telemetry. It works on the files on your computer and
 network. It connects to the internet only to check GitHub for updates when it starts. Its own AI
-(noise reduction) runs entirely on your computer. An AI assistant connected through MCP sees only
+(noise reduction, face recognition, and reading what is in photos for keywords and search) runs
+entirely on your computer; face fingerprints stay in the settings folder and are never written
+into your photos or sent anywhere. An AI assistant connected through MCP sees only
 what you point it at; a cloud assistant receives the photo previews it asks for, as anything you
 paste into its chat would (see [MCP.md](MCP.md#privacy-and-safety)).

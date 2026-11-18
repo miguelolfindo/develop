@@ -78,6 +78,9 @@ pub struct Store {
     ratings: HashMap<PathBuf, u8>,
     /// Saved versions of each photo's edit (photos without any are absent).
     versions: HashMap<PathBuf, Vec<Version>>,
+    /// Keywords and people's names per photo (photos without any are absent).
+    keywords: HashMap<PathBuf, Vec<String>>,
+    people: HashMap<PathBuf, Vec<String>>,
     /// Photos whose data is in the central file rather than a sidecar.
     central: HashSet<PathBuf>,
     central_changed: bool,
@@ -207,7 +210,16 @@ pub fn version_thumb_file(key: &str) -> Option<PathBuf> {
 
 /// The settings saved in `photo`'s sidecar, read directly (command-line and MCP use).
 pub fn read_sidecar(photo: &Path) -> Option<Saved> {
-    std::fs::read_to_string(sidecar_path(photo)).ok().and_then(|text| parse_sidecar(&text).0)
+    std::fs::read_to_string(sidecar_path(photo)).ok().and_then(|text| parse_sidecar(&text).saved)
+}
+
+/// A photo's rating, keywords and people, read directly from its sidecar (for the library
+/// index). A photo without a sidecar has none.
+pub fn read_tags(photo: &Path) -> (u8, Vec<String>, Vec<String>) {
+    std::fs::read_to_string(sidecar_path(photo)).map(|text| {
+        let s = parse_sidecar(&text);
+        (s.rating, s.keywords, s.people)
+    }).unwrap_or_default()
 }
 
 /// The sidecar that holds `photo`'s settings and rating: `DSC01234.ARW.dvlp` beside it.
@@ -259,26 +271,53 @@ fn saved_fields(s: &Saved) -> String {
     )
 }
 
-fn parse_sidecar(text: &str) -> (Option<Saved>, u8, Vec<Version>) {
-    let mut saved = None;
-    let mut rating = 0;
-    let mut versions = Vec::new();
+/// What a sidecar holds.
+#[derive(Default)]
+pub struct Sidecar {
+    pub saved: Option<Saved>,
+    pub rating: u8,
+    pub versions: Vec<Version>,
+    /// Keywords, in the order added.
+    pub keywords: Vec<String>,
+    /// Names of the people in the photo (see people.rs); plain words, no face data.
+    pub people: Vec<String>,
+}
+
+/// Words for the keywords and people lines: no tabs or line breaks, at most 60 characters, no
+/// empty ones, and no repeats (ignoring case).
+pub fn clean_words(words: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in words {
+        let w = clean_name(&w);
+        if !w.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&w)) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+fn parse_sidecar(text: &str) -> Sidecar {
+    let mut out = Sidecar::default();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("settings\t") {
-            saved = parse_line(&format!("photo\t{rest}")).map(|(_, s)| s);
+            out.saved = parse_line(&format!("photo\t{rest}")).map(|(_, s)| s);
         } else if let Some(stars) = line.strip_prefix("rating\t") {
-            rating = stars.trim().parse::<u8>().unwrap_or(0).min(5);
+            out.rating = stars.trim().parse::<u8>().unwrap_or(0).min(5);
+        } else if let Some(rest) = line.strip_prefix("keywords\t") {
+            out.keywords = clean_words(rest.split('\t').map(str::to_owned));
+        } else if let Some(rest) = line.strip_prefix("people\t") {
+            out.people = clean_words(rest.split('\t').map(str::to_owned));
         } else if let Some(rest) = line.strip_prefix("version\t") {
             // version <tab> name <tab> time <tab> settings fields
             let mut parts = rest.splitn(3, '\t');
             if let (Some(name), Some(time), Some(fields)) = (parts.next(), parts.next(), parts.next()) {
                 if let Some((_, saved)) = parse_line(&format!("photo\t{fields}")) {
-                    versions.push(Version { name: clean_name(name), time: time.trim().parse().unwrap_or(0), saved });
+                    out.versions.push(Version { name: clean_name(name), time: time.trim().parse().unwrap_or(0), saved });
                 }
             }
         }
     }
-    (saved, rating, versions)
+    out
 }
 
 /// Write a file by writing a temporary one and swapping it in, so a crash mid-write cannot
@@ -315,7 +354,7 @@ impl Store {
             }
         }
         let central = photos.keys().chain(ratings.keys()).cloned().collect();
-        Self { file, photos, ratings, versions: HashMap::new(), central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None, known: HashMap::new() }
+        Self { file, photos, ratings, versions: HashMap::new(), keywords: HashMap::new(), people: HashMap::new(), central, central_changed: false, folders: HashSet::new(), dirty: HashSet::new(), changed: None, known: HashMap::new() }
     }
 
     /// Read the sidecars of a folder (once), and move any settings the central file still
@@ -345,19 +384,7 @@ impl Store {
             if !legacy {
                 self.known.insert(photo.clone(), text.clone());
             }
-            let (saved, rating, versions) = parse_sidecar(&text);
-            match versions.is_empty() {
-                true => self.versions.remove(&photo),
-                false => self.versions.insert(photo.clone(), versions),
-            };
-            match saved {
-                Some(saved) => self.photos.insert(photo.clone(), saved),
-                None => self.photos.remove(&photo),
-            };
-            match rating {
-                0 => self.ratings.remove(&photo),
-                stars => self.ratings.insert(photo.clone(), stars),
-            };
+            self.take_sidecar(&photo, parse_sidecar(&text));
             // The sidecar is the truth; a central entry for the same photo is dropped.
             if self.central.remove(&photo) {
                 self.central_changed = true;
@@ -382,20 +409,13 @@ impl Store {
             return false;
         }
         self.known.insert(photo.to_path_buf(), text.clone());
-        let (saved, rating, versions) = parse_sidecar(&text);
-        let changed = self.photos.get(photo) != saved.as_ref() || self.rating(photo) != rating || self.versions(photo) != versions.as_slice();
-        match saved {
-            Some(saved) => self.photos.insert(photo.to_path_buf(), saved),
-            None => self.photos.remove(photo),
-        };
-        match rating {
-            0 => self.ratings.remove(photo),
-            stars => self.ratings.insert(photo.to_path_buf(), stars),
-        };
-        match versions.is_empty() {
-            true => self.versions.remove(photo),
-            false => self.versions.insert(photo.to_path_buf(), versions),
-        };
+        let side = parse_sidecar(&text);
+        let changed = self.photos.get(photo) != side.saved.as_ref()
+            || self.rating(photo) != side.rating
+            || self.versions(photo) != side.versions.as_slice()
+            || self.keywords(photo) != side.keywords.as_slice()
+            || self.people(photo) != side.people.as_slice();
+        self.take_sidecar(photo, side);
         self.dirty.remove(photo);
         if !text.is_empty() && self.central.remove(photo) {
             self.central_changed = true;
@@ -426,9 +446,70 @@ impl Store {
             .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(SIDECAR_EXTENSION)))
             .map(|p| p.with_extension(""))
             .collect();
-        let remembered = self.photos.keys().chain(self.ratings.keys()).chain(self.versions.keys()).chain(self.known.keys());
+        let remembered = self.photos.keys().chain(self.ratings.keys()).chain(self.versions.keys()).chain(self.keywords.keys()).chain(self.people.keys()).chain(self.known.keys());
         photos.extend(remembered.filter(|p| p.parent() == Some(dir)).cloned());
         photos.into_iter().collect()
+    }
+
+    /// Remember what a sidecar holds for `photo`.
+    fn take_sidecar(&mut self, photo: &Path, side: Sidecar) {
+        let photo = photo.to_path_buf();
+        match side.versions.is_empty() {
+            true => self.versions.remove(&photo),
+            false => self.versions.insert(photo.clone(), side.versions),
+        };
+        match side.saved {
+            Some(saved) => self.photos.insert(photo.clone(), saved),
+            None => self.photos.remove(&photo),
+        };
+        match side.rating {
+            0 => self.ratings.remove(&photo),
+            stars => self.ratings.insert(photo.clone(), stars),
+        };
+        match side.keywords.is_empty() {
+            true => self.keywords.remove(&photo),
+            false => self.keywords.insert(photo.clone(), side.keywords),
+        };
+        match side.people.is_empty() {
+            true => self.people.remove(&photo),
+            false => self.people.insert(photo, side.people),
+        };
+    }
+
+    /// The photo's keywords, in the order added.
+    pub fn keywords(&self, photo: &Path) -> &[String] {
+        self.keywords.get(photo).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Replace the photo's keywords.
+    pub fn set_keywords(&mut self, photo: &Path, words: Vec<String>) {
+        let words = clean_words(words);
+        if words.as_slice() == self.keywords(photo) {
+            return;
+        }
+        match words.is_empty() {
+            true => self.keywords.remove(photo),
+            false => self.keywords.insert(photo.to_path_buf(), words),
+        };
+        self.touch(photo);
+    }
+
+    /// Names of the people in the photo.
+    pub fn people(&self, photo: &Path) -> &[String] {
+        self.people.get(photo).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Replace the names of the people in the photo.
+    pub fn set_people(&mut self, photo: &Path, names: Vec<String>) {
+        let names = clean_words(names);
+        if names.as_slice() == self.people(photo) {
+            return;
+        }
+        match names.is_empty() {
+            true => self.people.remove(photo),
+            false => self.people.insert(photo.to_path_buf(), names),
+        };
+        self.touch(photo);
     }
 
     fn touch(&mut self, photo: &Path) {
@@ -512,7 +593,8 @@ impl Store {
             let (saved, rating) = (self.photos.get(&photo), self.rating(&photo));
             let legacy = sidecar_with(&photo, LEGACY_SIDECAR_EXTENSION);
             let versions = self.versions(&photo);
-            if saved.is_none() && rating == 0 && versions.is_empty() {
+            let (keywords, people) = (self.keywords(&photo), self.people(&photo));
+            if saved.is_none() && rating == 0 && versions.is_empty() && keywords.is_empty() && people.is_empty() {
                 // Nothing left to remember: no sidecar, no central entry.
                 let _ = std::fs::remove_file(&sidecar);
                 let _ = std::fs::remove_file(&legacy);
@@ -526,6 +608,12 @@ impl Store {
             }
             if rating > 0 {
                 text.push_str(&format!("rating\t{rating}\n"));
+            }
+            if !keywords.is_empty() {
+                text.push_str(&format!("keywords\t{}\n", keywords.join("\t")));
+            }
+            if !people.is_empty() {
+                text.push_str(&format!("people\t{}\n", people.join("\t")));
             }
             for v in versions {
                 text.push_str(&format!("version\t{}\t{}\t{}\n", clean_name(&v.name), v.time, saved_fields(&v.saved)));
@@ -599,6 +687,62 @@ impl Session {
         let _ = std::fs::write(file, format!("folder\t{}\nphoto\t{}\n", show(&self.folder), show(&self.photo)));
     }
 }
+/// How the window was laid out: which left panel, the panels' widths, the filmstrip's height,
+/// the grid view and its thumbnail size. Kept in `layout.tsv`.
+pub struct Layout {
+    file: Option<PathBuf>,
+    /// 0: Folders, 1: Faces & Metadata.
+    pub left_tab: u8,
+    pub left_width: f32,
+    pub right_width: f32,
+    pub strip_height: f32,
+    pub grid: bool,
+    pub grid_card: f32,
+    written: String,
+}
+
+impl Layout {
+    pub fn load() -> Self {
+        let file = store_file().and_then(|f| Some(f.parent()?.join("layout.tsv")));
+        let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        let value = |key: &str, default: f32| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('\t')?.trim().parse::<f32>().ok()).unwrap_or(default);
+        let mut l = Self {
+            left_tab: value("left_tab", 0.0) as u8,
+            left_width: value("left_width", 240.0),
+            right_width: value("right_width", 300.0),
+            strip_height: value("strip_height", 0.0),
+            grid: value("grid", 0.0) > 0.5,
+            grid_card: value("grid_card", 160.0),
+            written: String::new(),
+            file,
+        };
+        l.written = l.text();
+        l
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "left_tab\t{}\nleft_width\t{:.0}\nright_width\t{:.0}\nstrip_height\t{:.0}\ngrid\t{}\ngrid_card\t{:.0}\n",
+            self.left_tab, self.left_width, self.right_width, self.strip_height, self.grid as u8, self.grid_card
+        )
+    }
+
+    /// Write the file if anything changed since it was last written.
+    pub fn save_if_changed(&mut self) {
+        let text = self.text();
+        if text == self.written {
+            return;
+        }
+        let Some(file) = &self.file else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::write(file, &text).is_ok() {
+            self.written = text;
+        }
+    }
+}
+
 /// The release the user chose to skip in the update dialog, kept in `update-skip.txt`.
 pub fn skipped_update() -> Option<String> {
     let file = store_file()?.parent()?.join("update-skip.txt");
@@ -802,13 +946,28 @@ mod tests {
     }
 
     #[test]
+    fn keywords_and_people_round_trip() {
+        let text = format!("{SIDECAR_HEADER}
+rating	3
+keywords	wedding	Wedding	car	 
+people	Talia	Miguel
+");
+        let side = parse_sidecar(&text);
+        assert_eq!(side.rating, 3);
+        assert_eq!(side.keywords, vec!["wedding".to_owned(), "car".to_owned()], "repeats and blanks dropped");
+        assert_eq!(side.people, vec!["Talia".to_owned(), "Miguel".to_owned()]);
+        assert!(side.saved.is_none());
+    }
+
+    #[test]
     fn versions_round_trip() {
         let mut a = sample();
         a.values[1] = 1.25;
         a.mono = true;
         a.mono_mix[2] = 40.0;
         let text = format!("{SIDECAR_HEADER}\nsettings\t{}\nversion\tWarm look\t1700000000\t{}\n", saved_fields(&a), saved_fields(&a));
-        let (saved, _, versions) = parse_sidecar(&text);
+        let side = parse_sidecar(&text);
+        let (saved, versions) = (side.saved, side.versions);
         assert_eq!(saved.as_ref(), Some(&a));
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].name, "Warm look");
@@ -845,6 +1004,8 @@ mod tests {
             photos: HashMap::from([(central.clone(), sample())]),
             ratings: HashMap::new(),
             versions: HashMap::new(),
+            keywords: HashMap::new(),
+            people: HashMap::new(),
             central: HashSet::from([central.clone()]),
             central_changed: false,
             folders: HashSet::new(),

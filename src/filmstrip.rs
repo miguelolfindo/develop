@@ -23,6 +23,26 @@ const LABEL_HEIGHT: f32 = 20.0;
 const HEADER_HEIGHT: f32 = 28.0;
 /// Height of the whole panel: header line, thumbnails, names, scroll bar.
 pub const PANEL_HEIGHT: f32 = HEADER_HEIGHT + 1.0 + 8.0 + CARD + LABEL_HEIGHT + 8.0;
+/// The filmstrip's height can be dragged between these; the thumbnails follow it.
+pub const MIN_HEIGHT: f32 = HEADER_HEIGHT + 1.0 + 8.0 + 56.0 + LABEL_HEIGHT + 8.0;
+pub const MAX_HEIGHT: f32 = HEADER_HEIGHT + 1.0 + 8.0 + 320.0 + LABEL_HEIGHT + 8.0;
+/// Thumbnail sizes in the grid view.
+pub const GRID_MIN: f32 = 80.0;
+pub const GRID_MAX: f32 = 320.0;
+const FOOTER_HEIGHT: f32 = 30.0;
+
+/// What one pass of drawing the thumbnails needs to know.
+struct Draw<'a> {
+    current_index: Option<usize>,
+    scroll_to_current: bool,
+    generation: u64,
+    selection_paths: &'a [PathBuf],
+    shown: &'a [usize],
+    can_paste: bool,
+    /// Side of a photo card.
+    card: f32,
+    grid: bool,
+}
 const WORKERS: usize = 4;
 
 enum Thumb {
@@ -93,14 +113,46 @@ pub struct Filmstrip {
     selected: std::collections::BTreeSet<usize>,
     /// Filter: show only photos with at least this many stars (0 = all).
     min_stars: u8,
+    /// Search: every word must appear in the file name, a keyword or a person's name.
+    search: String,
+    /// Search the whole library instead of the folder.
+    library_scope: bool,
+    /// The search last sent to the library (see `library_query`).
+    query_sent: Option<String>,
+    /// Showing library search results (photos from many folders) instead of `dir`.
+    results: bool,
+    /// What the results are ("Library: “dinner”", "People: Talia").
+    results_label: String,
     sort: Sort,
     ascending: bool,
     /// Thumbnails of saved versions, by version key. A version without a rendered thumbnail
     /// yet shows its photo's thumbnail until the photo is opened.
     version_thumbs: std::collections::HashMap<String, Thumb>,
+    /// Thumbnails fill the main window instead of a strip under the picture.
+    grid: bool,
+    /// Thumbnail size in the grid view.
+    pub grid_card: f32,
+    /// Bringing the open photo into view: where its card was drawn (on screen), then the scroll
+    /// position that centres it, applied next frame. Done by hand rather than with
+    /// `scroll_to_rect`, which would also scroll the other panels' lists.
+    scroll_want: Option<egui::Rect>,
+    scroll_goal: Option<f32>,
 }
 
 impl Filmstrip {
+    pub fn grid(&self) -> bool {
+        self.grid
+    }
+
+    pub fn set_grid(&mut self, on: bool) {
+        if self.grid != on {
+            self.grid = on;
+            // Bring the open photo into view in whichever layout is now showing.
+            self.shown_current = None;
+            self.scroll_goal = None;
+        }
+    }
+
     pub fn new(ctx: &egui::Context) -> Self {
         let (jobs, job_rx) = mpsc::channel::<Job>();
         let (done_tx, done) = mpsc::channel::<Done>();
@@ -132,17 +184,102 @@ impl Filmstrip {
                 ctx.request_repaint();
             });
         }
-        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, sort: Sort::CaptureDate, ascending: true, version_thumbs: Default::default() }
+        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, search: String::new(), library_scope: false, query_sent: None, results: false, results_label: String::new(), sort: Sort::CaptureDate, ascending: true, version_thumbs: Default::default(), grid: false, grid_card: 160.0, scroll_want: None, scroll_goal: None }
+    }
+
+    /// Start with this search (`--search` on the command line).
+    /// (`library:<words>` searches the library.)
+    pub fn set_search(&mut self, text: &str) {
+        match text.strip_prefix("library:") {
+            Some(words) => {
+                self.search = words.to_owned();
+                self.library_scope = true;
+            }
+            None => self.search = text.to_owned(),
+        }
     }
 
     /// Show `dir`'s raw files. Does nothing if that folder is already showing.
     pub fn set_folder(&mut self, dir: Option<&Path>) {
         let Some(dir) = dir else { return };
         let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        if self.dir.as_deref() != Some(dir) {
+        if self.dir.as_deref() != Some(dir) || self.results {
             self.dir = Some(dir.to_path_buf());
+            self.results = false;
+            self.library_scope = false;
+            self.query_sent = None;
             self.rescan();
         }
+    }
+
+    /// The search to run on the library, when it changed since last asked (None otherwise).
+    /// An empty search means: back to the folder.
+    pub fn library_query(&mut self) -> Option<String> {
+        if !self.library_scope {
+            if self.results {
+                self.results = false;
+                self.query_sent = None;
+                self.rescan();
+            }
+            return None;
+        }
+        let q = self.search.trim().to_owned();
+        if self.query_sent.as_deref() == Some(q.as_str()) {
+            return None;
+        }
+        self.query_sent = Some(q.clone());
+        if q.is_empty() && self.results {
+            self.results = false;
+            self.rescan();
+            return None;
+        }
+        (!q.is_empty()).then_some(q)
+    }
+
+    /// Ask for the library search again (the index changed).
+    pub fn requery(&mut self) {
+        self.query_sent = None;
+    }
+
+    /// Whether library search results are showing.
+    pub fn showing_results(&self) -> bool {
+        self.results
+    }
+
+    /// Whether `photo` is one of the photos showing.
+    pub fn shows(&self, photo: &Path) -> bool {
+        self.items.iter().any(|i| i.path == photo)
+    }
+
+    /// The star filter.
+    pub fn min_stars(&self) -> u8 {
+        self.min_stars
+    }
+
+    /// Show library search results, or a person's photos, under `label`.
+    pub fn show_results(&mut self, paths: Vec<PathBuf>, label: String) {
+        self.results = true;
+        self.results_label = label;
+        // Stays until the scope is switched back to the folder or the search changes.
+        self.library_scope = true;
+        self.query_sent = Some(self.search.trim().to_owned());
+        self.items = paths
+            .into_iter()
+            .map(|path| Item { name: path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), ext: extension_of(&path), date: None, path, thumb: Thumb::None })
+            .collect();
+        self.selected.clear();
+        self.arrange();
+    }
+
+    /// Folders of the photos showing (for reading their sidecars).
+    pub fn result_dirs(&self) -> Vec<PathBuf> {
+        if !self.results {
+            return Vec::new();
+        }
+        let mut dirs: Vec<PathBuf> = self.items.iter().filter_map(|i| i.path.parent().map(Path::to_path_buf)).collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     /// The folder being shown.
@@ -254,12 +391,19 @@ impl Filmstrip {
     }
 
     fn position(&self, current: Option<&Path>) -> Option<usize> {
+        // Library results come from many folders, where file names repeat.
+        if self.results {
+            let current = current?;
+            return self.items.iter().position(|item| item.path == current);
+        }
         let name = current?.file_name()?;
         self.items.iter().position(|item| item.path.file_name() == Some(name))
     }
 
     fn passes(&self, index: usize, store: &Store) -> bool {
-        self.min_stars == 0 || store.rating(&self.items[index].path) >= self.min_stars
+        let path = &self.items[index].path;
+        // Library results already match the search.
+        (self.min_stars == 0 || store.rating(path) >= self.min_stars) && (self.results || self.library_scope || matches_search(&self.search, path, store))
     }
 
     /// The file `step` places after (or before) `current`, among the photos the filter shows.
@@ -329,7 +473,7 @@ impl Filmstrip {
                 Some(i) => format!("{} of {count}", i + 1),
                 None => format!("{count} photo{}", if count == 1 { "" } else { "s" }),
             };
-            if self.min_stars > 0 {
+            if self.min_stars > 0 || !self.search.trim().is_empty() {
                 place.push_str(&format!(" (of {})", self.items.len()));
             }
             if self.selected.len() > 1 {
@@ -374,9 +518,34 @@ impl Filmstrip {
                     self.arrange();
                 }
                 ui.label(egui::RichText::new("Sort").font(theme::font(11.5)).color(theme::FADED));
+                if !self.search.is_empty() && ui::button(ui, "×", egui::vec2(22.0, 22.0), Look::ghost(), theme::font(13.0), None).on_hover_text("Clear the search").clicked() {
+                    self.search.clear();
+                }
+                ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search keywords, people, file names").desired_width(190.0))
+                    .on_hover_text("Shows the photos whose keywords, people or file name contain every word you type");
+                let scope = if self.library_scope { "Library" } else { "This folder" };
+                if ui::button(ui, scope, egui::vec2(0.0, 22.0), if self.library_scope { Look::teal() } else { Look::bordered() }, theme::font(11.5), None)
+                    .on_hover_text("Search this folder, or every folder in the library (add folders to the library in the left panel)")
+                    .clicked()
+                {
+                    self.library_scope = !self.library_scope;
+                    self.query_sent = None;
+                }
                 // Whatever room is left goes to the path, cut at the left edge of the controls.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let text = format!("{}  •  {place}", dir.display());
+                    let (look, tip) = if self.grid {
+                        (Look::teal(), "Back to the photo, with the filmstrip under it (or double-click a thumbnail)")
+                    } else {
+                        (Look::bordered(), "Show the thumbnails full screen, in a grid")
+                    };
+                    if ui::button(ui, "Grid", egui::vec2(0.0, 22.0), look, theme::font(11.5), Some(Icon::Grid)).on_hover_text(tip).clicked() {
+                        let on = !self.grid;
+                        self.set_grid(on);
+                    }
+                    let text = match self.results {
+                        true => format!("{}  •  {place}", self.results_label),
+                        false => format!("{}  •  {place}", dir.display()),
+                    };
                     ui.add(egui::Label::new(egui::RichText::new(text).font(theme::font(12.0)).color(theme::TEXT_HEADER)).truncate(true));
                 });
             });
@@ -387,9 +556,74 @@ impl Filmstrip {
         let mut action = None;
         let generation = self.generation.load(Ordering::Relaxed);
         let selection_paths = self.selected_paths();
+        if self.grid {
+            // Grid: rows of thumbnails filling the window, the size slider at the bottom right.
+            let room = egui::vec2(ui.available_width(), (ui.available_height() - FOOTER_HEIGHT).max(0.0));
+            ui.allocate_ui(room, |ui| {
+                let mut area = egui::ScrollArea::vertical().id_source("grid").auto_shrink([false, false]);
+                if let Some(y) = self.scroll_goal.take() {
+                    area = area.vertical_scroll_offset(y);
+                }
+                let out = area.show(ui, |ui| {
+                    let origin = ui.max_rect().min;
+                    // The slider sets about how big the thumbnails are; each row then stretches
+                    // them a little so it runs from the left edge to the right edge. With fewer
+                    // photos than fit in a row they keep the slider's size.
+                    const GAP: f32 = 10.0;
+                    let wish = self.grid_card.clamp(GRID_MIN, GRID_MAX);
+                    let width = ui.available_width();
+                    let columns = (((width + GAP) / (wish + GAP)).floor() as usize).max(1);
+                    let card = if shown.len() >= columns {
+                        // A hair under the exact size, so rounding never pushes the last one
+                        // onto the next row.
+                        ((width - GAP * (columns - 1) as f32) / columns as f32 - 0.05).max(GRID_MIN.min(width))
+                    } else {
+                        wish
+                    };
+                    let d = Draw { current_index, scroll_to_current, generation, selection_paths: &selection_paths, shown: &shown, can_paste, card, grid: true };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(GAP, 12.0);
+                        if shown.is_empty() {
+                            ui.label(ui::dim("No photos match the filter.", 12.5));
+                        }
+                        for &index in &shown {
+                            if index >= self.items.len() {
+                                break; // the folder was just read again
+                            }
+                            self.draw_group(ui, index, &d, store, &mut action);
+                        }
+                    });
+                    origin
+                });
+                if let Some(rect) = self.scroll_want.take() {
+                    self.scroll_goal = Some((rect.center().y - out.inner.y - out.inner_rect.height() * 0.5).max(0.0));
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.set_height(FOOTER_HEIGHT);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().slider_width = 160.0;
+                    ui.add(egui::Slider::new(&mut self.grid_card, GRID_MIN..=GRID_MAX).show_value(false)).on_hover_text("Thumbnail size");
+                    ui.label(egui::RichText::new("Size").font(theme::font(11.5)).color(theme::FADED));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(ui::dim("Double-click a photo to open it", 11.5));
+                    });
+                });
+            });
+            return action;
+        }
+        // Strip: one row, as tall as the panel allows.
+        let card = (ui.available_height() - LABEL_HEIGHT - 8.0).clamp(48.0, 400.0);
+        let d = Draw { current_index, scroll_to_current, generation, selection_paths: &selection_paths, shown: &shown, can_paste, card, grid: false };
         // The mouse wheel scrolls the strip sideways.
         ui.style_mut().always_scroll_the_only_direction = true;
-        egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+        let mut area = egui::ScrollArea::horizontal().id_source("strip").auto_shrink([false, false]);
+        if let Some(x) = self.scroll_goal.take() {
+            area = area.horizontal_scroll_offset(x);
+        }
+        let out = area.show(ui, |ui| {
+            let origin = ui.max_rect().min;
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if shown.is_empty() {
@@ -399,215 +633,242 @@ impl Filmstrip {
                     if index >= self.items.len() {
                         break; // the folder was just read again
                     }
-                    let versions: Vec<crate::settings::Version> = store.versions(&self.items[index].path).to_vec();
-                    // A photo with versions and its version cards share one frame, drawn
-                    // behind them once their positions are known.
-                    let group_back = (!versions.is_empty()).then(|| ui.painter().add(egui::Shape::Noop));
-                    let item = &mut self.items[index];
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(CARD, CARD + LABEL_HEIGHT), egui::Sense::click());
-                    let card = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(CARD));
-                    let is_current = current_index == Some(index);
-                    let is_selected = self.selected.contains(&index);
-                    let is_edited = store.contains(&item.path);
-                    if is_current && scroll_to_current {
-                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                    }
-                    if ui.is_rect_visible(rect) {
-                        if matches!(item.thumb, Thumb::None) {
-                            let cache = if is_edited { crate::settings::thumb_file(&item.path) } else { None };
-                            let job = Job { generation, index, path: item.path.clone(), cache, version: None };
-                            item.thumb = if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed };
-                        }
-                        let painter = ui.painter().with_clip_rect(rect.expand(2.0).intersect(ui.clip_rect()));
-                        // The card: a well with a hairline, amber when it is the open photo.
-                        let (fill, border) = if is_current {
-                            (egui::Color32::from_rgb(0x1C, 0x1F, 0x26), egui::Stroke::new(2.0_f32, theme::ACCENT))
-                        } else if is_selected {
-                            (egui::Color32::from_rgb(0x1C, 0x1F, 0x26), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.7)))
-                        } else if response.hovered() {
-                            (egui::Color32::from_rgb(0x17, 0x1A, 0x20), egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)))
-                        } else {
-                            (theme::WELL, theme::hairline())
-                        };
-                        painter.rect(card, 6.0, fill, border);
-                        // The picture, whole, inside the same margin on every side.
-                        let inner = card.shrink(6.0);
-                        match &item.thumb {
-                            Thumb::Ready(texture) => {
-                                let size = texture.size_vec2();
-                                let scale = (inner.width() / size.x).min(inner.height() / size.y);
-                                let picture = egui::Rect::from_center_size(inner.center(), size * scale);
-                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                painter.image(texture.id(), picture, uv, egui::Color32::WHITE);
-                            }
-                            Thumb::Failed => {
-                                painter.text(inner.center(), egui::Align2::CENTER_CENTER, "no preview", theme::font(11.0), theme::FADED);
-                            }
-                            _ => {}
-                        }
-                        // File type, top left of the card.
-                        let badge = if item.ext == "jpeg" { "JPG" } else if item.ext == "tiff" { "TIF" } else { item.ext.as_str() };
-                        let badge_color = if item.ext != "dng" && is_raw(&item.path) { theme::ACCENT } else { theme::TEAL };
-                        let label = painter.layout_no_wrap(badge.to_uppercase(), theme::bold(9.0), badge_color);
-                        let back = egui::Rect::from_min_size(card.min + egui::vec2(5.0, 5.0), label.size() + egui::vec2(8.0, 3.0));
-                        painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(badge_color, 0.45)));
-                        painter.galley(back.min + egui::vec2(4.0, 1.5), label, badge_color);
-                        if is_edited {
-                            // "Edited" mark, top right: a dark disc with two little sliders.
-                            let c = card.right_top() + egui::vec2(-13.0, 13.0);
-                            painter.circle(c, 7.5, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.7)));
-                            for (dy, knob) in [(-2.2_f32, 1.8_f32), (2.2, -1.8)] {
-                                let y = c.y + dy;
-                                painter.line_segment([egui::pos2(c.x - 4.0, y), egui::pos2(c.x + 4.0, y)], egui::Stroke::new(1.1_f32, theme::ACCENT));
-                                painter.circle_filled(egui::pos2(c.x + knob, y), 1.7, theme::ACCENT);
-                            }
-                        }
-                        if !versions.is_empty() {
-                            // Versions mark, bottom right: two stacked frames and the count.
-                            let galley = painter.layout_no_wrap(format!("{}", versions.len() + 1), theme::bold(9.5), theme::TEAL);
-                            let size = egui::vec2(galley.size().x + 20.0, galley.size().y + 4.0);
-                            let back = egui::Rect::from_min_size(card.right_bottom() - size - egui::vec2(5.0, 5.0), size);
-                            painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.5)));
-                            let icon = egui::Rect::from_min_size(back.min + egui::vec2(4.0, 3.5), egui::vec2(8.0, 6.0));
-                            painter.rect_stroke(icon.translate(egui::vec2(2.5, -1.5)), 1.0, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.6)));
-                            painter.rect(icon, 1.0, egui::Color32::from_rgb(0x11, 0x13, 0x17), egui::Stroke::new(1.0_f32, theme::TEAL));
-                            painter.galley(egui::pos2(back.min.x + 15.0, back.min.y + 2.0), galley, theme::TEAL);
-                        }
-                        let rating = store.rating(&item.path);
-                        if rating > 0 {
-                            let galley = painter.layout_no_wrap(stars(rating), theme::font(10.0), theme::ACCENT);
-                            let back = egui::Rect::from_min_size(card.left_bottom() + egui::vec2(5.0, -5.0 - galley.size().y - 2.0), galley.size() + egui::vec2(6.0, 2.0));
-                            painter.rect_filled(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0));
-                            painter.galley(back.min + egui::vec2(3.0, 1.0), galley, theme::ACCENT);
-                        }
-                        // Name under the card, never wider than the card.
-                        let color = if is_current { theme::TEXT_BRIGHT } else if is_selected { theme::TEXT } else { theme::FADED };
-                        let mut job = egui::text::LayoutJob::single_section(item.name.clone(), egui::TextFormat { font_id: theme::font(11.0), color, ..Default::default() });
-                        job.wrap = egui::text::TextWrapping { max_width: CARD, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                        let galley = ui.fonts(|f| f.layout_job(job));
-                        painter.galley(egui::pos2(card.center().x - galley.size().x * 0.5, card.bottom() + 4.0), galley, color);
-                    }
-
-                    // Click opens; Ctrl-click adds or removes from the selection; Shift-click
-                    // selects everything from the open photo to here.
-                    if response.clicked() {
-                        let modifiers = ui.input(|i| i.modifiers);
-                        if modifiers.command {
-                            if self.selected.is_empty() {
-                                self.selected.extend(current_index);
-                            }
-                            if !self.selected.remove(&index) {
-                                self.selected.insert(index);
-                            }
-                        } else if modifiers.shift {
-                            let anchor = current_index.or_else(|| self.selected.iter().next().copied()).unwrap_or(index);
-                            let (from, to) = (anchor.min(index), anchor.max(index));
-                            self.selected = shown.iter().copied().filter(|i| (from..=to).contains(i)).collect();
-                        } else {
-                            self.selected = std::iter::once(index).collect();
-                            if !is_current {
-                                action = Some(Action::Open(item.path.clone()));
-                            }
-                        }
-                    }
-                    let path = &self.items[index].path;
-                    let hover = match versions.len() {
-                        0 => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                        n => format!("{}  ·  the current edit, and {n} saved version{}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), if n == 1 { "" } else { "s" }),
-                    };
-                    response.on_hover_text(hover).context_menu(|ui| {
-                        let targets = if is_selected && selection_paths.len() > 1 { selection_paths.clone() } else { vec![path.clone()] };
-                        if let Some(picked) = edit_menu(ui, path, &targets, is_current || is_edited, can_paste) {
-                            action = Some(picked);
-                        }
-                    });
-
-                    // The photo's saved versions, as smaller cards linked to it in one frame.
-                    if let Some(back) = group_back {
-                        let photo = self.items[index].path.clone();
-                        let main_thumb = match &self.items[index].thumb {
-                            Thumb::Ready(t) => Some(t.clone()),
-                            _ => None,
-                        };
-                        let mut group = rect;
-                        for (vi, version) in versions.iter().enumerate() {
-                            ui.add_space(GROUP_GAP - ui.spacing().item_spacing.x);
-                            let (vrect, vresponse) = ui.allocate_exact_size(egui::vec2(VERSION_CARD, CARD + LABEL_HEIGHT), egui::Sense::click());
-                            group = group.union(vrect);
-                            if !ui.is_rect_visible(vrect) {
-                                continue;
-                            }
-                            let key = crate::settings::version_key(&photo, version);
-                            if !self.version_thumbs.contains_key(&key) {
-                                // Read a thumbnail rendered earlier; there is none until the
-                                // photo has been opened once since the version was saved.
-                                let file = crate::settings::version_thumb_file(&key).filter(|f| f.is_file());
-                                let state = match file {
-                                    Some(file) => {
-                                        let job = Job { generation, index, path: photo.clone(), cache: Some(file), version: Some(key.clone()) };
-                                        if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed }
-                                    }
-                                    None => Thumb::Failed,
-                                };
-                                self.version_thumbs.insert(key.clone(), state);
-                            }
-                            let texture = match self.version_thumbs.get(&key) {
-                                Some(Thumb::Ready(t)) => Some((t.clone(), true)),
-                                _ => main_thumb.clone().map(|t| (t, false)),
-                            };
-                            let painter = ui.painter().with_clip_rect(vrect.expand(2.0).intersect(ui.clip_rect()));
-                            let vcard = egui::Rect::from_min_size(vrect.min + egui::vec2(0.0, 6.0), egui::vec2(VERSION_CARD, CARD - 12.0));
-                            let (fill, border) = if vresponse.hovered() {
-                                (egui::Color32::from_rgb(0x17, 0x1A, 0x20), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.8)))
-                            } else {
-                                (theme::WELL, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.35)))
-                            };
-                            painter.rect(vcard, 5.0, fill, border);
-                            let inner = vcard.shrink(5.0);
-                            if let Some((texture, rendered)) = texture {
-                                let size = texture.size_vec2();
-                                let scale = (inner.width() / size.x).min(inner.height() / size.y);
-                                let picture = egui::Rect::from_center_size(inner.center(), size * scale);
-                                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                                // Not rendered yet: the photo's own thumbnail, dimmed.
-                                let tint = if rendered { egui::Color32::WHITE } else { egui::Color32::from_gray(110) };
-                                painter.image(texture.id(), picture, uv, tint);
-                            }
-                            // "V1", "V2"... top left, in the versions' colour.
-                            let label = painter.layout_no_wrap(format!("V{}", vi + 1), theme::bold(9.0), theme::TEAL);
-                            let badge = egui::Rect::from_min_size(vcard.min + egui::vec2(4.0, 4.0), label.size() + egui::vec2(8.0, 3.0));
-                            painter.rect(badge, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.45)));
-                            painter.galley(badge.min + egui::vec2(4.0, 1.5), label, theme::TEAL);
-                            // The version's name under it.
-                            let mut job = egui::text::LayoutJob::single_section(version.name.clone(), egui::TextFormat { font_id: theme::font(10.5), color: theme::tint(theme::TEAL, 0.9), ..Default::default() });
-                            job.wrap = egui::text::TextWrapping { max_width: VERSION_CARD, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-                            let galley = ui.fonts(|f| f.layout_job(job));
-                            painter.galley(egui::pos2(vcard.center().x - galley.size().x * 0.5, vrect.min.y + CARD + 4.0), galley, theme::TEAL);
-                            if vresponse.clicked() {
-                                action = Some(Action::OpenVersion(photo.clone(), vi));
-                            }
-                            vresponse.on_hover_text(format!("{}  ·  version {} of {}: {}\nClick to open the photo at this version", photo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), vi + 1, versions.len(), version.name)).context_menu(|ui| {
-                                if ui.button("Open this version").clicked() {
-                                    action = Some(Action::OpenVersion(photo.clone(), vi));
-                                    ui.close_menu();
-                                }
-                                if ui.button("Delete this version").clicked() {
-                                    action = Some(Action::DeleteVersion(photo.clone(), vi));
-                                    ui.close_menu();
-                                }
-                            });
-                        }
-                        // The shared frame: a tinted panel behind the photo and its versions,
-                        // with a line along the bottom joining them.
-                        let frame = group.expand2(egui::vec2(3.0, 2.0));
-                        ui.painter().set(back, egui::Shape::rect_filled(frame, 8.0, egui::Color32::from_rgba_unmultiplied(0x2A, 0x9D, 0x8F, 18)));
-                        let y = rect.min.y + CARD + 1.5;
-                        ui.painter().line_segment([egui::pos2(rect.center().x, y), egui::pos2(group.max.x - VERSION_CARD * 0.5, y)], egui::Stroke::new(1.5_f32, theme::tint(theme::TEAL, 0.5)));
-                    }
+                    self.draw_group(ui, index, &d, store, &mut action);
                 }
             });
+            origin
         });
+        if let Some(rect) = self.scroll_want.take() {
+            self.scroll_goal = Some((rect.center().x - out.inner.x - out.inner_rect.width() * 0.5).max(0.0));
+            ui.ctx().request_repaint();
+        }
         action
+    }
+
+    /// One photo's card, and its versions' cards beside it, kept together on one row.
+    fn draw_group(&mut self, ui: &mut egui::Ui, index: usize, d: &Draw, store: &Store, action: &mut Option<Action>) {
+        let versions = if d.grid { 0 } else { store.versions(&self.items[index].path).len() };
+        let vw = d.card * VERSION_CARD / CARD;
+        let width = d.card + versions as f32 * (GROUP_GAP + vw);
+        ui.allocate_ui_with_layout(egui::vec2(width, d.card + LABEL_HEIGHT), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            self.draw_cards(ui, index, d, store, action, vw);
+        });
+    }
+
+    fn draw_cards(&mut self, ui: &mut egui::Ui, index: usize, d: &Draw, store: &Store, action: &mut Option<Action>, vw: f32) {
+        use crate::theme;
+        let versions: Vec<crate::settings::Version> = store.versions(&self.items[index].path).to_vec();
+        // A photo with versions and its version cards share one frame, drawn
+        // behind them once their positions are known.
+        let group_back = (!versions.is_empty() && !d.grid).then(|| ui.painter().add(egui::Shape::Noop));
+        let item = &mut self.items[index];
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(d.card, d.card + LABEL_HEIGHT), egui::Sense::click());
+        let card = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(d.card));
+        let is_current = d.current_index == Some(index);
+        let is_selected = self.selected.contains(&index);
+        let is_edited = store.contains(&item.path);
+        if is_current && d.scroll_to_current {
+            self.scroll_want = Some(rect);
+        }
+        if ui.is_rect_visible(rect) {
+            if matches!(item.thumb, Thumb::None) {
+                let cache = if is_edited { crate::settings::thumb_file(&item.path) } else { None };
+                let job = Job { generation: d.generation, index, path: item.path.clone(), cache, version: None };
+                item.thumb = if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed };
+            }
+            let painter = ui.painter().with_clip_rect(rect.expand(2.0).intersect(ui.clip_rect()));
+            // The card: a well with a hairline, amber when it is the open photo.
+            let (fill, border) = if is_current {
+                (egui::Color32::from_rgb(0x1C, 0x1F, 0x26), egui::Stroke::new(2.0_f32, theme::ACCENT))
+            } else if is_selected {
+                (egui::Color32::from_rgb(0x1C, 0x1F, 0x26), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.7)))
+            } else if response.hovered() {
+                (egui::Color32::from_rgb(0x17, 0x1A, 0x20), egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(40)))
+            } else {
+                (theme::WELL, theme::hairline())
+            };
+            painter.rect(card, 6.0, fill, border);
+            // The picture, whole, inside the same margin on every side.
+            let inner = card.shrink(6.0);
+            match &item.thumb {
+                Thumb::Ready(texture) => {
+                    let size = texture.size_vec2();
+                    let scale = (inner.width() / size.x).min(inner.height() / size.y);
+                    let picture = egui::Rect::from_center_size(inner.center(), size * scale);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    painter.image(texture.id(), picture, uv, egui::Color32::WHITE);
+                }
+                Thumb::Failed => {
+                    painter.text(inner.center(), egui::Align2::CENTER_CENTER, "no preview", theme::font(11.0), theme::FADED);
+                }
+                _ => {}
+            }
+            // File type, top left of the card.
+            let badge = if item.ext == "jpeg" { "JPG" } else if item.ext == "tiff" { "TIF" } else { item.ext.as_str() };
+            let badge_color = if item.ext != "dng" && is_raw(&item.path) { theme::ACCENT } else { theme::TEAL };
+            let label = painter.layout_no_wrap(badge.to_uppercase(), theme::bold(9.0), badge_color);
+            let back = egui::Rect::from_min_size(card.min + egui::vec2(5.0, 5.0), label.size() + egui::vec2(8.0, 3.0));
+            painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(badge_color, 0.45)));
+            painter.galley(back.min + egui::vec2(4.0, 1.5), label, badge_color);
+            if is_edited {
+                // "Edited" mark, top right: a dark disc with two little sliders.
+                let c = card.right_top() + egui::vec2(-13.0, 13.0);
+                painter.circle(c, 7.5, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.7)));
+                for (dy, knob) in [(-2.2_f32, 1.8_f32), (2.2, -1.8)] {
+                    let y = c.y + dy;
+                    painter.line_segment([egui::pos2(c.x - 4.0, y), egui::pos2(c.x + 4.0, y)], egui::Stroke::new(1.1_f32, theme::ACCENT));
+                    painter.circle_filled(egui::pos2(c.x + knob, y), 1.7, theme::ACCENT);
+                }
+            }
+            if !versions.is_empty() {
+                // Versions mark, bottom right: two stacked frames and the count.
+                let galley = painter.layout_no_wrap(format!("{}", versions.len() + 1), theme::bold(9.5), theme::TEAL);
+                let size = egui::vec2(galley.size().x + 20.0, galley.size().y + 4.0);
+                let back = egui::Rect::from_min_size(card.right_bottom() - size - egui::vec2(5.0, 5.0), size);
+                painter.rect(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.5)));
+                let icon = egui::Rect::from_min_size(back.min + egui::vec2(4.0, 3.5), egui::vec2(8.0, 6.0));
+                painter.rect_stroke(icon.translate(egui::vec2(2.5, -1.5)), 1.0, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.6)));
+                painter.rect(icon, 1.0, egui::Color32::from_rgb(0x11, 0x13, 0x17), egui::Stroke::new(1.0_f32, theme::TEAL));
+                painter.galley(egui::pos2(back.min.x + 15.0, back.min.y + 2.0), galley, theme::TEAL);
+            }
+            let rating = store.rating(&item.path);
+            if rating > 0 {
+                let galley = painter.layout_no_wrap(stars(rating), theme::font(10.0), theme::ACCENT);
+                let back = egui::Rect::from_min_size(card.left_bottom() + egui::vec2(5.0, -5.0 - galley.size().y - 2.0), galley.size() + egui::vec2(6.0, 2.0));
+                painter.rect_filled(back, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0));
+                painter.galley(back.min + egui::vec2(3.0, 1.0), galley, theme::ACCENT);
+            }
+            // Name under the card, never wider than the card.
+            let color = if is_current { theme::TEXT_BRIGHT } else if is_selected { theme::TEXT } else { theme::FADED };
+            let mut job = egui::text::LayoutJob::single_section(item.name.clone(), egui::TextFormat { font_id: theme::font(11.0), color, ..Default::default() });
+            job.wrap = egui::text::TextWrapping { max_width: d.card, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let galley = ui.fonts(|f| f.layout_job(job));
+            painter.galley(egui::pos2(card.center().x - galley.size().x * 0.5, card.bottom() + 4.0), galley, color);
+        }
+
+        // Click opens; Ctrl-click adds or removes from the selection; Shift-click
+        // selects everything from the open photo to here.
+        if response.clicked() {
+            let modifiers = ui.input(|i| i.modifiers);
+            if modifiers.command {
+                if self.selected.is_empty() {
+                    self.selected.extend(d.current_index);
+                }
+                if !self.selected.remove(&index) {
+                    self.selected.insert(index);
+                }
+            } else if modifiers.shift {
+                let anchor = d.current_index.or_else(|| self.selected.iter().next().copied()).unwrap_or(index);
+                let (from, to) = (anchor.min(index), anchor.max(index));
+                self.selected = d.shown.iter().copied().filter(|i| (from..=to).contains(i)).collect();
+            } else {
+                self.selected = std::iter::once(index).collect();
+                if !is_current {
+                    *action = Some(Action::Open(item.path.clone()));
+                }
+            }
+        }
+        if d.grid && response.double_clicked() {
+            if !is_current {
+                *action = Some(Action::Open(item.path.clone()));
+            }
+            self.set_grid(false);
+        }
+        let path = &self.items[index].path;
+        let hover = match versions.len() {
+            0 => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            n => format!("{}  ·  the current edit, and {n} saved version{}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), if n == 1 { "" } else { "s" }),
+        };
+        response.on_hover_text(hover).context_menu(|ui| {
+            let targets = if is_selected && d.selection_paths.len() > 1 { d.selection_paths.to_vec() } else { vec![path.clone()] };
+            if let Some(picked) = edit_menu(ui, path, &targets, is_current || is_edited, d.can_paste) {
+                *action = Some(picked);
+            }
+        });
+
+        // The photo's saved versions, as smaller cards linked to it in one frame.
+        if let Some(back) = group_back {
+            let photo = self.items[index].path.clone();
+            let main_thumb = match &self.items[index].thumb {
+                Thumb::Ready(t) => Some(t.clone()),
+                _ => None,
+            };
+            let mut group = rect;
+            for (vi, version) in versions.iter().enumerate() {
+                ui.add_space(GROUP_GAP - ui.spacing().item_spacing.x);
+                let (vrect, vresponse) = ui.allocate_exact_size(egui::vec2(vw, d.card + LABEL_HEIGHT), egui::Sense::click());
+                group = group.union(vrect);
+                if !ui.is_rect_visible(vrect) {
+                    continue;
+                }
+                let key = crate::settings::version_key(&photo, version);
+                if !self.version_thumbs.contains_key(&key) {
+                    // Read a thumbnail rendered earlier; there is none until the
+                    // photo has been opened once since the version was saved.
+                    let file = crate::settings::version_thumb_file(&key).filter(|f| f.is_file());
+                    let state = match file {
+                        Some(file) => {
+                            let job = Job { generation: d.generation, index, path: photo.clone(), cache: Some(file), version: Some(key.clone()) };
+                            if self.jobs.send(job).is_ok() { Thumb::Pending } else { Thumb::Failed }
+                        }
+                        None => Thumb::Failed,
+                    };
+                    self.version_thumbs.insert(key.clone(), state);
+                }
+                let texture = match self.version_thumbs.get(&key) {
+                    Some(Thumb::Ready(t)) => Some((t.clone(), true)),
+                    _ => main_thumb.clone().map(|t| (t, false)),
+                };
+                let painter = ui.painter().with_clip_rect(vrect.expand(2.0).intersect(ui.clip_rect()));
+                let vcard = egui::Rect::from_min_size(vrect.min + egui::vec2(0.0, 6.0), egui::vec2(vw, d.card - 12.0));
+                let (fill, border) = if vresponse.hovered() {
+                    (egui::Color32::from_rgb(0x17, 0x1A, 0x20), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.8)))
+                } else {
+                    (theme::WELL, egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.35)))
+                };
+                painter.rect(vcard, 5.0, fill, border);
+                let inner = vcard.shrink(5.0);
+                if let Some((texture, rendered)) = texture {
+                    let size = texture.size_vec2();
+                    let scale = (inner.width() / size.x).min(inner.height() / size.y);
+                    let picture = egui::Rect::from_center_size(inner.center(), size * scale);
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    // Not rendered yet: the photo's own thumbnail, dimmed.
+                    let tint = if rendered { egui::Color32::WHITE } else { egui::Color32::from_gray(110) };
+                    painter.image(texture.id(), picture, uv, tint);
+                }
+                // "V1", "V2"... top left, in the versions' colour.
+                let label = painter.layout_no_wrap(format!("V{}", vi + 1), theme::bold(9.0), theme::TEAL);
+                let badge = egui::Rect::from_min_size(vcard.min + egui::vec2(4.0, 4.0), label.size() + egui::vec2(8.0, 3.0));
+                painter.rect(badge, 3.0, egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xE0), egui::Stroke::new(1.0_f32, theme::tint(theme::TEAL, 0.45)));
+                painter.galley(badge.min + egui::vec2(4.0, 1.5), label, theme::TEAL);
+                // The version's name under it.
+                let mut job = egui::text::LayoutJob::single_section(version.name.clone(), egui::TextFormat { font_id: theme::font(10.5), color: theme::tint(theme::TEAL, 0.9), ..Default::default() });
+                job.wrap = egui::text::TextWrapping { max_width: vw, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let galley = ui.fonts(|f| f.layout_job(job));
+                painter.galley(egui::pos2(vcard.center().x - galley.size().x * 0.5, vrect.min.y + d.card + 4.0), galley, theme::TEAL);
+                if vresponse.clicked() {
+                    *action = Some(Action::OpenVersion(photo.clone(), vi));
+                }
+                vresponse.on_hover_text(format!("{}  ·  version {} of {}: {}\nClick to open the photo at this version", photo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), vi + 1, versions.len(), version.name)).context_menu(|ui| {
+                    if ui.button("Open this version").clicked() {
+                        *action = Some(Action::OpenVersion(photo.clone(), vi));
+                        ui.close_menu();
+                    }
+                    if ui.button("Delete this version").clicked() {
+                        *action = Some(Action::DeleteVersion(photo.clone(), vi));
+                        ui.close_menu();
+                    }
+                });
+            }
+            // The shared frame: a tinted panel behind the photo and its versions,
+            // with a line along the bottom joining them.
+            let frame = group.expand2(egui::vec2(3.0, 2.0));
+            ui.painter().set(back, egui::Shape::rect_filled(frame, 8.0, egui::Color32::from_rgba_unmultiplied(0x2A, 0x9D, 0x8F, 18)));
+            let y = rect.min.y + d.card + 1.5;
+            ui.painter().line_segment([egui::pos2(rect.center().x, y), egui::pos2(group.max.x - vw * 0.5, y)], egui::Stroke::new(1.5_f32, theme::tint(theme::TEAL, 0.5)));
+        }
     }
 }
 
@@ -628,6 +889,18 @@ pub enum Action {
     OpenVersion(PathBuf, usize),
     /// Delete this photo's saved version number n.
     DeleteVersion(PathBuf, usize),
+}
+
+/// Whether every word of `search` appears (ignoring case) in the photo's file name, one of its
+/// keywords or one of its people's names. An empty search matches everything.
+pub fn matches_search(search: &str, path: &Path, store: &Store) -> bool {
+    let words: Vec<String> = search.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return true;
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let tags: Vec<String> = store.keywords(path).iter().chain(store.people(path)).map(|w| w.to_lowercase()).collect();
+    words.iter().all(|w| name.contains(w.as_str()) || tags.iter().any(|t| t.contains(w.as_str())))
 }
 
 pub fn stars(count: u8) -> String {
@@ -1077,6 +1350,17 @@ pub fn exif_orientation(path: &Path) -> Option<u16> {
     tiff_info(path).map(|info| info.orientation)
 }
 
+/// When the picture was taken, for people to read ("18 Nov 2026, 21:42"), from the EXIF
+/// capture date; None when the file doesn't record one.
+pub fn taken_text(path: &Path) -> Option<String> {
+    let date = tiff_info(path).and_then(|info| info.date).filter(|d| d.len() >= 16 && !d.starts_with("0000"))?;
+    let num = |r: std::ops::Range<usize>| date.get(r).and_then(|s| s.parse::<usize>().ok());
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let name = months.get(month.checked_sub(1)?)?;
+    Some(format!("{day} {name} {year}, {}", date.get(11..16)?))
+}
+
 /// When the picture was taken, as sortable text: the EXIF capture date, or else the
 /// file's modified time in the same form.
 pub fn capture_date(path: &Path) -> String {
@@ -1135,6 +1419,30 @@ fn thumbnail(path: &Path) -> Option<egui::ColorImage> {
     }
     // Formats without a TIFF-style preview (Minolta MRW, Sigma X3F, old Canon CRW...): ask
     // the decoder for the preview it knows how to find.
+    decoder_preview(path).map(finish)
+}
+
+/// A picture of the photo for analysis (faces, content), long side at most `max_side`, upright:
+/// the largest preview inside a raw file, or the picture itself. Fast: no raw decoding.
+pub fn preview(path: &Path, max_side: u32) -> Option<image::RgbImage> {
+    let info = tiff_info(path);
+    let orientation = info.as_ref().map_or(1, |i| i.orientation);
+    let finish = |decoded: image::DynamicImage| upright(decoded.thumbnail(max_side, max_side), orientation).to_rgb8();
+    if !is_raw(path) {
+        return crate::heic::open_picture(path).ok().map(finish);
+    }
+    let mut file = File::open(path).ok()?;
+    let mut jpegs = info?.jpegs;
+    jpegs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    for (offset, len) in jpegs {
+        let mut bytes = vec![0u8; len as usize];
+        if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut bytes).is_err() {
+            continue;
+        }
+        if let Ok(decoded) = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg) {
+            return Some(finish(decoded));
+        }
+    }
     decoder_preview(path).map(finish)
 }
 

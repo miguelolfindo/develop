@@ -1,6 +1,6 @@
 [package]
 name = "develop"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 description = "Develop: a GPU raw photo processor"
 license = "GPL-3.0-or-later"
@@ -61,6 +61,16 @@ resources = [
     # Face detector for the skin-tone reading in check_photo (YuNet, MIT).
     { src = "models/face_detection_yunet_2023mar.onnx", target = "models/face_detection_yunet_2023mar.onnx" },
     { src = "models/LICENSE-YuNet.txt", target = "models/LICENSE-YuNet.txt" },
+    # Face recognition for People (SFace, Apache-2.0).
+    { src = "models/face_recognition_sface_2021dec.onnx", target = "models/face_recognition_sface_2021dec.onnx" },
+    { src = "models/LICENSE-SFace.txt", target = "models/LICENSE-SFace.txt" },
+    # Image understanding for keyword suggestions and search by description (CLIP, MIT).
+    { src = "models/clip_vision_quantized.onnx", target = "models/clip_vision_quantized.onnx" },
+    { src = "models/clip_text_quantized.onnx", target = "models/clip_text_quantized.onnx" },
+    { src = "models/clip_tokenizer.json", target = "models/clip_tokenizer.json" },
+    { src = "models/clip_config.json", target = "models/clip_config.json" },
+    { src = "models/clip_preprocessor_config.json", target = "models/clip_preprocessor_config.json" },
+    { src = "models/LICENSE-CLIP.txt", target = "models/LICENSE-CLIP.txt" },
     # Lensfun lens profiles (.xml), if a `lensfun` folder is added to the project.
     { src = "lensfun", target = "lensfun" },
     # ONNX Runtime's DirectML helper on Windows (no such file on macOS).
