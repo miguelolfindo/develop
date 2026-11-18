@@ -80,13 +80,34 @@ fn index_file() -> Option<PathBuf> {
 }
 
 /// Every photo Develop opens under `dir`, in subfolders too (hidden folders skipped).
-fn photos_under(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(read) = std::fs::read_dir(dir) else { return };
+/// The content key of each photo in the library's own index (see people::key), with where it was.
+pub fn index_paths() -> HashMap<String, PathBuf> {
+    let mut out = HashMap::new();
+    if let Some(text) = index_file().and_then(|f| std::fs::read_to_string(f).ok()) {
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() >= 2 {
+                let path = PathBuf::from(f[0]);
+                if let Some(name) = path.file_name() {
+                    out.insert(format!("{}|{}", name.to_string_lossy(), f[1]), path.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every photo under `dir`; folders that could not be read go into `failed`.
+fn photos_under(dir: &Path, out: &mut Vec<PathBuf>, failed: &mut Vec<PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        failed.push(dir.to_path_buf());
+        return;
+    };
     for entry in read.flatten() {
         let path = entry.path();
         let hidden = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
         match entry.file_type() {
-            Ok(t) if t.is_dir() && !hidden => photos_under(&path, out),
+            Ok(t) if t.is_dir() && !hidden => photos_under(&path, out, failed),
             Ok(t) if t.is_file() && crate::filmstrip::is_supported(&path) => out.push(path),
             _ => {}
         }
@@ -214,8 +235,11 @@ impl Library {
         let use_clip = crate::clip::available();
         std::thread::spawn(move || {
             let mut photos = Vec::new();
+            // Folders that could not be read (a network drive asleep, a disk unplugged): their
+            // photos are kept as they are, not forgotten.
+            let mut unreachable = Vec::new();
             for folder in &folders {
-                photos_under(folder, &mut photos);
+                photos_under(folder, &mut photos, &mut unreachable);
             }
             // Which photos are new (faces or content not read yet): counted first, for progress.
             let keyed: Vec<(PathBuf, String)> = photos.into_iter().map(|p| {
@@ -306,11 +330,11 @@ impl Library {
             // Named people found in photos whose .dvlp does not say so yet (or no longer).
             let mut due = Vec::new();
             if let Ok(mut p) = pictures.lock() {
-                p.prune(&keys);
+                p.prune(&keys, &unreachable);
                 p.save();
             }
             if let Ok(mut p) = people.lock() {
-                p.prune(&keys);
+                p.prune(&keys, &unreachable);
                 p.save();
                 for e in fresh.values() {
                     let names = p.names_in(&e.path);

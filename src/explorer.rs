@@ -318,10 +318,16 @@ impl Explorer {
         ui.horizontal(|ui| {
             ui.set_height(ROW);
             ui.add_space(4.0 + depth as f32 * INDENT + 20.0);
-            ui.label(egui::RichText::new(text).font(theme::font(11.5)).color(color));
-            if let Some(label) = button {
-                pressed = ui.small_button(label).clicked();
-            }
+            // The button first (from the right), then the message in what is left, cut with
+            // "…": a long message must never widen the panel.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(label) = button {
+                    pressed = ui.small_button(label).clicked();
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(text).font(theme::font(11.5)).color(color)).truncate(true)).on_hover_text(text);
+                });
+            });
         });
         pressed
     }
@@ -332,9 +338,18 @@ impl Explorer {
         ui.horizontal(|ui| {
             ui.set_height(ROW + 2.0);
             ui.add_space(4.0 + depth as f32 * INDENT + 20.0);
-            let field = ui.add(egui::TextEdit::singleline(&mut self.address).hint_text(hint).desired_width((ui.available_width() - 44.0).max(60.0)));
-            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.small_button("Add").on_hover_text("Add this computer or shared folder to Network").clicked() || entered) && !self.address.trim().is_empty() {
+            // The button first (from the right), then the box in exactly the room left, so the
+            // row never comes out wider than the panel (which would widen the panel, again and
+            // again).
+            let (add, entered) = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let add = ui.small_button("Add").on_hover_text("Add this computer or shared folder to Network").clicked();
+                    let size = egui::vec2(ui.available_width().max(40.0), ROW);
+                    let field = ui.add_sized(size, egui::TextEdit::singleline(&mut self.address).hint_text(hint));
+                    (add, field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                })
+                .inner;
+            if (add || entered) && !self.address.trim().is_empty() {
                 if let Some((host, share)) = network::parse_address(&self.address) {
                     let address = match (&share, cfg!(windows)) {
                         (Some(s), true) => format!("\\\\{host}\\{s}"),

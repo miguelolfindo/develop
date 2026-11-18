@@ -314,16 +314,19 @@ pub fn rank(phrase: &[f32], pictures: &[(std::path::PathBuf, Vec<f32>)]) -> Vec<
     hits
 }
 
-/// Each photo's CLIP numbers, filed by content key (see people::key) so moved photos keep them;
-/// kept in `clip.tsv` in the settings folder.
-#[derive(Default)]
+/// Each photo's CLIP numbers, filed by content key (see people::key) so moved photos keep them:
+/// where the photo was last seen, on which day, and its numbers. Kept in the library data, one
+/// file per photo folder (see store.rs).
 pub struct Pictures {
-    map: HashMap<String, (std::path::PathBuf, Vec<f32>)>,
+    map: HashMap<String, (std::path::PathBuf, u32, Vec<f32>)>,
     changed: bool,
+    files: crate::store::Files,
 }
 
-fn hex(v: &[f32]) -> String {
-    v.iter().flat_map(|f| f.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
+impl Default for Pictures {
+    fn default() -> Self {
+        Self { map: HashMap::new(), changed: false, files: crate::store::Files::new("content") }
+    }
 }
 
 fn unhex(s: &str) -> Vec<f32> {
@@ -334,13 +337,34 @@ fn unhex(s: &str) -> Vec<f32> {
 impl Pictures {
     pub fn load() -> Self {
         let mut p = Pictures::default();
-        if let Some(text) = crate::settings::settings_dir().and_then(|d| std::fs::read_to_string(d.join("clip.tsv")).ok()) {
+        let today = crate::store::today();
+        if p.files.exists() {
+            for text in p.files.read_all() {
+                let mut folder = std::path::PathBuf::new();
+                for line in text.lines() {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    match f.as_slice() {
+                        ["folder", path] => folder = std::path::PathBuf::from(path),
+                        ["C", key, name, day, numbers] => {
+                            p.map.insert((*key).to_owned(), (folder.join(name), day.parse().unwrap_or(today), crate::store::unpack(numbers)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let summaries = p.summaries().into_iter().map(|(f, (h, _))| (f, h)).collect();
+            p.files.set_summaries(&summaries);
+        } else if let Some(text) = crate::settings::settings_dir().and_then(|d| std::fs::read_to_string(d.join("clip.tsv")).ok()) {
+            // The single file of 0.4.x: read it and write it the new way (the old file stays, for
+            // an older Develop).
             for line in text.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() == 3 {
-                    p.map.insert(f[0].to_owned(), (std::path::PathBuf::from(f[1]), unhex(f[2])));
+                    p.map.insert(f[0].to_owned(), (std::path::PathBuf::from(f[1]), today, unhex(f[2])));
                 }
             }
+            p.changed = true;
+            p.save();
         }
         p
     }
@@ -350,19 +374,45 @@ impl Pictures {
             return;
         }
         self.changed = false;
-        let Some(dir) = crate::settings::settings_dir() else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        let mut lines: Vec<String> = self.map.iter().map(|(k, (p, e))| format!("{k}\t{}\t{}\n", p.display(), hex(e))).collect();
-        lines.sort();
-        let _ = std::fs::write(dir.join("clip.tsv"), lines.concat());
+        // Only folders whose summary changed are written (the numbers never change once read).
+        let mut files = std::mem::replace(&mut self.files, crate::store::Files::new("content"));
+        let summaries = self.summaries();
+        let hashes: HashMap<std::path::PathBuf, u64> = summaries.iter().map(|(f, (h, _))| (f.clone(), *h)).collect();
+        let text = |folder: &std::path::Path| -> String {
+            let mut text = format!("folder\t{}\n", folder.display());
+            for k in summaries.get(folder).map(|(_, keys)| keys.as_slice()).unwrap_or(&[]) {
+                let (photo, day, e) = &self.map[*k];
+                text.push_str(&format!("C\t{k}\t{}\t{day}\t{}\n", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), crate::store::pack(e)));
+            }
+            text
+        };
+        files.save_folders(&hashes, text);
+        self.files = files;
+    }
+
+    /// Per photo folder: a cheap summary of what its file holds, and its photos' keys.
+    fn summaries(&self) -> HashMap<std::path::PathBuf, (u64, Vec<&str>)> {
+        let mut out: HashMap<std::path::PathBuf, (u64, Vec<&str>)> = HashMap::new();
+        let mut keys: Vec<&String> = self.map.keys().collect();
+        keys.sort();
+        for k in keys {
+            let (photo, day, _) = &self.map[k];
+            let Some(folder) = photo.parent() else { continue };
+            let entry = out.entry(folder.to_path_buf()).or_insert((crate::store::HASH_START, Vec::new()));
+            crate::store::mix(&mut entry.0, &format!("{k}|{}|{day}", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+            entry.1.push(k.as_str());
+        }
+        out
     }
 
     /// Whether `photo`'s content has its numbers already (and note where it is now).
     pub fn known(&mut self, photo: &std::path::Path, k: &str) -> bool {
         match self.map.get_mut(k) {
-            Some((p, _)) => {
-                if p != photo {
+            Some((p, day, _)) => {
+                let today = crate::store::today();
+                if p != photo || *day != today {
                     *p = photo.to_path_buf();
+                    *day = today;
                     self.changed = true;
                 }
                 true
@@ -372,24 +422,26 @@ impl Pictures {
     }
 
     pub fn insert(&mut self, photo: &std::path::Path, k: &str, e: Vec<f32>) {
-        self.map.insert(k.to_owned(), (photo.to_path_buf(), e));
+        self.map.insert(k.to_owned(), (photo.to_path_buf(), crate::store::today(), e));
         self.changed = true;
     }
 
     pub fn get(&self, k: &str) -> Option<&Vec<f32>> {
-        self.map.get(k).map(|(_, e)| e)
+        self.map.get(k).map(|(_, _, e)| e)
     }
 
-    /// Forget photos no longer in the library.
-    pub fn prune(&mut self, keep: &std::collections::HashSet<String>) {
+    /// Forget photos no longer in the library: only once missing for a while, and never those in
+    /// folders that could not be read.
+    pub fn prune(&mut self, keep: &std::collections::HashSet<String>, unreachable: &[std::path::PathBuf]) {
         let before = self.map.len();
-        self.map.retain(|k, _| keep.contains(k));
+        let today = crate::store::today();
+        self.map.retain(|k, (photo, day, _)| keep.contains(k) || !crate::store::forget(photo, *day, unreachable, today));
         self.changed |= self.map.len() != before;
     }
 
     /// Every photo with its numbers, by where it was last seen.
     pub fn all(&self) -> Vec<(std::path::PathBuf, Vec<f32>)> {
-        self.map.values().cloned().collect()
+        self.map.values().map(|(p, _, e)| (p.clone(), e.clone())).collect()
     }
 }
 

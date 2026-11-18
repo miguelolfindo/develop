@@ -4,8 +4,8 @@
 //! face is filed under its photo's content (file name and size), not its path, so a photo moved
 //! to another folder keeps its faces. Similar faces are grouped; the user names a group once and
 //! the name is written into each of its photos' `.dvlp` files (as a plain word, like a keyword).
-//! The fingerprints and groups stay in the settings folder (`faces.tsv`, `people.tsv`) and never
-//! go into the photos' files.
+//! The fingerprints and groups stay in Develop's own library data (see store.rs: a file per photo
+//! folder, a file per person) and never go into the photos' files.
 
 use std::path::{Path, PathBuf};
 
@@ -33,16 +33,34 @@ pub struct Person {
     pub name: Option<String>,
     /// The average fingerprint of its faces (length 1).
     centre: Vec<f32>,
+    /// Its id in the saved files (unique across computers), and when and where it was last
+    /// named.
+    uid: String,
+    named: (u64, String),
 }
 
-#[derive(Default)]
+impl Person {
+    fn new(id: u32, centre: Vec<f32>) -> Self {
+        Self { id, name: None, centre, uid: crate::store::new_id(), named: (0, String::new()) }
+    }
+}
+
 pub struct People {
     pub faces: Vec<Face>,
     pub people: Vec<Person>,
     next_id: u32,
-    /// Photo content keys already looked at (with or without faces).
-    pub seen: std::collections::HashSet<String>,
+    /// Photo content keys already looked at (with or without faces): where the photo was last
+    /// seen, and on which day.
+    pub seen: std::collections::HashMap<String, (PathBuf, u32)>,
     changed: bool,
+    face_files: crate::store::Files,
+    people_files: crate::store::Files,
+}
+
+impl Default for People {
+    fn default() -> Self {
+        Self { faces: Vec::new(), people: Vec::new(), next_id: 0, seen: Default::default(), changed: false, face_files: crate::store::Files::new("faces"), people_files: crate::store::Files::new("people") }
+    }
 }
 
 /// A photo's content key: its file name and size, which survive moving it.
@@ -50,10 +68,6 @@ pub fn key(photo: &Path) -> String {
     let size = std::fs::metadata(photo).map(|m| m.len()).unwrap_or(0);
     let name = photo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     format!("{name}|{size}")
-}
-
-fn hex(v: &[f32]) -> String {
-    v.iter().flat_map(|f| f.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
 }
 
 fn unhex(s: &str) -> Vec<f32> {
@@ -127,32 +141,154 @@ pub fn find_faces_in(pic: &image::RgbImage, k: &str) -> Vec<(u8, [f32; 4], Vec<f
 impl People {
     pub fn load() -> Self {
         let mut p = People::default();
+        if p.face_files.exists() || p.people_files.exists() {
+            p.read_files();
+        } else if file("faces.tsv").is_some_and(|f| f.is_file()) {
+            // A library from before the per-folder files: read it and write it the new way. The
+            // old files stay as they are, so an older Develop still finds its library.
+            p.read_old();
+            p.changed = true;
+            p.save();
+        }
+        p
+    }
+
+    fn read_files(&mut self) {
+        let mut ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for text in self.people_files.read_all() {
+            let (mut uid, mut name, mut centre, mut named) = (String::new(), None, Vec::new(), (0, String::new()));
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                match f.as_slice() {
+                    ["person", u] => uid = (*u).to_owned(),
+                    ["name", n] => name = (!n.is_empty()).then(|| (*n).to_owned()),
+                    ["centre", c] => centre = crate::store::unpack(c),
+                    ["named", at, by] => named = (at.parse().unwrap_or(0), (*by).to_owned()),
+                    _ => {}
+                }
+            }
+            if uid.is_empty() || centre.is_empty() {
+                continue;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            ids.insert(uid.clone(), id);
+            self.people.push(Person { id, name, centre, uid, named });
+        }
+        let today = crate::store::today();
+        for text in self.face_files.read_all() {
+            let mut folder = PathBuf::new();
+            let mut where_: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                match f.as_slice() {
+                    ["folder", path] => folder = PathBuf::from(path),
+                    ["P", key, name, day] => {
+                        let photo = folder.join(name);
+                        where_.insert((*key).to_owned(), photo.clone());
+                        self.seen.insert((*key).to_owned(), (photo, day.parse().unwrap_or(today)));
+                    }
+                    ["F", key, n, area, print, person, not] => {
+                        let area: Vec<f32> = area.split(',').filter_map(|v| v.parse().ok()).collect();
+                        let Some(photo) = where_.get(*key) else { continue };
+                        if area.len() != 4 || person.is_empty() {
+                            continue;
+                        }
+                        // An unnamed group has no file of its own: it is rebuilt from its faces.
+                        let person = match ids.get(*person) {
+                            Some(&id) => id,
+                            None => {
+                                let id = self.next_id;
+                                self.next_id += 1;
+                                ids.insert((*person).to_owned(), id);
+                                let mut group = Person::new(id, Vec::new());
+                                group.uid = (*person).to_owned();
+                                self.people.push(group);
+                                id
+                            }
+                        };
+                        let not = not.split(',').filter_map(|u| ids.get(u).copied()).collect();
+                        self.faces.push(Face { key: (*key).to_owned(), n: n.parse().unwrap_or(0), photo: photo.clone(), area: [area[0], area[1], area[2], area[3]], print: crate::store::unpack(print), person, not });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Unnamed groups' average faces, from their faces.
+        let rebuild: Vec<u32> = self.people.iter().filter(|p| p.centre.is_empty()).map(|p| p.id).collect();
+        for id in rebuild {
+            self.recentre(id);
+        }
+        self.people.retain(|p| !p.centre.is_empty() && p.centre.iter().any(|v| *v != 0.0) || p.name.is_some());
+        let summaries = self.summaries().into_iter().map(|(f, (h, _))| (f, h)).collect();
+        self.face_files.set_summaries(&summaries);
+    }
+
+    /// Per photo folder: a cheap summary of what its file holds (photos, days, faces' people and
+    /// boxes; fingerprints never change once found), and its photos' keys.
+    fn summaries(&self) -> std::collections::HashMap<PathBuf, (u64, Vec<&str>)> {
+        let mut by_key: std::collections::HashMap<&str, Vec<&Face>> = std::collections::HashMap::new();
+        for f in &self.faces {
+            by_key.entry(f.key.as_str()).or_default().push(f);
+        }
+        let uid: std::collections::HashMap<u32, &str> = self.people.iter().map(|p| (p.id, p.uid.as_str())).collect();
+        let mut out: std::collections::HashMap<PathBuf, (u64, Vec<&str>)> = std::collections::HashMap::new();
+        let mut keys: Vec<&String> = self.seen.keys().collect();
+        keys.sort();
+        for k in keys {
+            let (photo, day) = &self.seen[k];
+            let Some(folder) = photo.parent() else { continue };
+            let entry = out.entry(folder.to_path_buf()).or_insert((crate::store::HASH_START, Vec::new()));
+            crate::store::mix(&mut entry.0, &format!("{k}|{}|{day}", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+            for f in by_key.get(k.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
+                let not: Vec<&str> = f.not.iter().filter_map(|n| uid.get(n).copied()).collect();
+                crate::store::mix(&mut entry.0, &format!("{}|{}|{:?}|{}", f.n, uid.get(&f.person).unwrap_or(&""), f.area, not.join(",")));
+            }
+            entry.1.push(k.as_str());
+        }
+        out
+    }
+
+    /// The single-file store of 0.4.x (`people.tsv`, `faces.tsv`).
+    fn read_old(&mut self) {
+        let today = crate::store::today();
         if let Some(text) = file("people.tsv").and_then(|f| std::fs::read_to_string(f).ok()) {
             for line in text.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() == 3 {
                     let id = f[0].parse().unwrap_or(0);
-                    p.next_id = p.next_id.max(id + 1);
-                    let name = (!f[1].is_empty()).then(|| f[1].to_owned());
-                    p.people.push(Person { id, name, centre: unhex(f[2]) });
+                    self.next_id = self.next_id.max(id + 1);
+                    let mut person = Person::new(id, unhex(f[2]));
+                    person.name = (!f[1].is_empty()).then(|| f[1].to_owned());
+                    self.people.push(person);
                 }
             }
         }
         if let Some(text) = file("faces.tsv").and_then(|f| std::fs::read_to_string(f).ok()) {
+            let mut no_faces = Vec::new();
             for line in text.lines() {
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() == 1 && !f[0].is_empty() {
-                    p.seen.insert(f[0].to_owned()); // a photo without faces
+                    no_faces.push(f[0].to_owned()); // a photo without faces (no path in this format)
                 } else if f.len() == 6 || f.len() == 7 {
                     let area: Vec<f32> = f[3].split(',').filter_map(|v| v.parse().ok()).collect();
                     if area.len() == 4 {
-                        p.seen.insert(f[0].to_owned());
-                        p.faces.push(Face { key: f[0].to_owned(), n: f[1].parse().unwrap_or(0), photo: PathBuf::from(f[2]), area: [area[0], area[1], area[2], area[3]], print: unhex(f[4]), person: f[5].parse().unwrap_or(0), not: f.get(6).map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect()).unwrap_or_default() });
+                        let photo = PathBuf::from(f[2]);
+                        self.seen.insert(f[0].to_owned(), (photo.clone(), today));
+                        self.faces.push(Face { key: f[0].to_owned(), n: f[1].parse().unwrap_or(0), photo, area: [area[0], area[1], area[2], area[3]], print: unhex(f[4]), person: f[5].parse().unwrap_or(0), not: f.get(6).map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect()).unwrap_or_default() });
+                    }
+                }
+            }
+            // Photos without faces had no path then; the library's own index has it.
+            if !no_faces.is_empty() {
+                let places = crate::library::index_paths();
+                for k in no_faces {
+                    if let Some(photo) = places.get(&k) {
+                        self.seen.insert(k, (photo.clone(), today));
                     }
                 }
             }
         }
-        p
     }
 
     pub fn save(&mut self) {
@@ -160,40 +296,60 @@ impl People {
             return;
         }
         self.changed = false;
-        let Some(dir) = crate::settings::settings_dir() else { return };
-        let _ = std::fs::create_dir_all(&dir);
-        let people: String = self.people.iter().map(|p| format!("{}\t{}\t{}\n", p.id, p.name.as_deref().unwrap_or(""), hex(&p.centre))).collect();
-        let _ = std::fs::write(dir.join("people.tsv"), people);
-        let with_faces: std::collections::HashSet<&str> = self.faces.iter().map(|f| f.key.as_str()).collect();
-        let mut lines: Vec<String> = self
-            .faces
-            .iter()
-            .map(|f| {
-                let not: Vec<String> = f.not.iter().map(u32::to_string).collect();
-                format!("{}\t{}\t{}\t{:.4},{:.4},{:.4},{:.4}\t{}\t{}\t{}\n", f.key, f.n, f.photo.display(), f.area[0], f.area[1], f.area[2], f.area[3], hex(&f.print), f.person, not.join(","))
-            })
-            .collect();
-        lines.extend(self.seen.iter().filter(|k| !with_faces.contains(k.as_str())).map(|k| format!("{k}\n")));
-        lines.sort();
-        let _ = std::fs::write(dir.join("faces.tsv"), lines.concat());
+        // One file per named person (only those that changed are written); unnamed groups are
+        // rebuilt from their faces, so they need none.
+        let mut people = std::collections::HashMap::new();
+        for p in self.people.iter().filter(|p| p.name.is_some()) {
+            let text = format!("person\t{}\nname\t{}\ncentre\t{}\nnamed\t{}\t{}\n", p.uid, p.name.as_deref().unwrap_or(""), crate::store::pack(&p.centre), p.named.0, p.named.1);
+            people.insert(format!("{}.tsv", p.uid), text);
+        }
+        self.people_files.write_all(people);
+        // One file per photo folder: each photo looked at, then its faces. Only folders whose
+        // summary changed are written.
+        let mut files = std::mem::replace(&mut self.face_files, crate::store::Files::new("faces"));
+        let summaries = self.summaries();
+        let hashes: std::collections::HashMap<PathBuf, u64> = summaries.iter().map(|(f, (h, _))| (f.clone(), *h)).collect();
+        let mut by_key: std::collections::HashMap<&str, Vec<&Face>> = std::collections::HashMap::new();
+        for f in &self.faces {
+            by_key.entry(f.key.as_str()).or_default().push(f);
+        }
+        let uid: std::collections::HashMap<u32, &str> = self.people.iter().map(|p| (p.id, p.uid.as_str())).collect();
+        let text = |folder: &Path| -> String {
+            let mut text = format!("folder\t{}\n", folder.display());
+            for k in summaries.get(folder).map(|(_, keys)| keys.as_slice()).unwrap_or(&[]) {
+                let (photo, day) = &self.seen[*k];
+                text.push_str(&format!("P\t{k}\t{}\t{day}\n", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+                for f in by_key.get(k).map(Vec::as_slice).unwrap_or(&[]) {
+                    let Some(person) = uid.get(&f.person) else { continue };
+                    let not: Vec<&str> = f.not.iter().filter_map(|n| uid.get(n).copied()).collect();
+                    text.push_str(&format!("F\t{}\t{}\t{:.4},{:.4},{:.4},{:.4}\t{}\t{person}\t{}\n", f.key, f.n, f.area[0], f.area[1], f.area[2], f.area[3], crate::store::pack(&f.print), not.join(",")));
+                }
+            }
+            text
+        };
+        files.save_folders(&hashes, text);
+        self.face_files = files;
     }
 
     /// Whether `photo`'s content was looked at already. Notes where the photo is now, if it
     /// moved.
     pub fn known(&mut self, photo: &Path, k: &str) -> bool {
-        if !self.seen.contains(k) {
-            return false;
+        let today = crate::store::today();
+        let Some((was, day)) = self.seen.get_mut(k) else { return false };
+        if was.as_path() != photo || *day != today {
+            *was = photo.to_path_buf();
+            *day = today;
+            self.changed = true;
         }
         for f in self.faces.iter_mut().filter(|f| f.key == k && f.photo != photo) {
             f.photo = photo.to_path_buf();
-            self.changed = true;
         }
         true
     }
 
     /// File faces found by `find_faces`.
     pub fn add_faces(&mut self, photo: &Path, k: &str, found: Vec<(u8, [f32; 4], Vec<f32>)>) {
-        self.seen.insert(k.to_owned());
+        self.seen.insert(k.to_owned(), (photo.to_path_buf(), crate::store::today()));
         self.changed = true;
         for (n, area, print) in found {
             let person = self.assign(&print);
@@ -217,15 +373,18 @@ impl People {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.people.push(Person { id, name: None, centre: print.to_vec() });
+        self.people.push(Person::new(id, print.to_vec()));
         id
     }
 
-    /// Forget photos no longer in the library (`keep` holds the content keys still there).
-    pub fn prune(&mut self, keep: &std::collections::HashSet<String>) {
+    /// Forget photos no longer in the library (`keep` holds the content keys found this time):
+    /// only once missing for a while, and never those in folders that could not be read.
+    pub fn prune(&mut self, keep: &std::collections::HashSet<String>, unreachable: &[PathBuf]) {
         let before = self.faces.len() + self.seen.len();
-        self.faces.retain(|f| keep.contains(&f.key));
-        self.seen.retain(|k| keep.contains(k));
+        let today = crate::store::today();
+        self.seen.retain(|k, (photo, day)| keep.contains(k) || !crate::store::forget(photo, *day, unreachable, today));
+        let seen = &self.seen;
+        self.faces.retain(|f| seen.contains_key(&f.key));
         let used: std::collections::HashSet<u32> = self.faces.iter().map(|f| f.person).collect();
         self.people.retain(|p| used.contains(&p.id) || p.name.is_some());
         if self.faces.len() + self.seen.len() != before {
@@ -282,6 +441,7 @@ impl People {
             touched.extend(self.photos_of(other));
         } else if let Some(p) = self.people.iter_mut().find(|p| p.id == id) {
             p.name = (!name.is_empty()).then_some(name);
+            p.named = (crate::store::now(), crate::store::computer());
         }
         self.changed = true;
         touched.sort();
@@ -295,7 +455,7 @@ impl People {
         for i in moved {
             let nid = self.next_id;
             self.next_id += 1;
-            self.people.push(Person { id: nid, name: None, centre: self.faces[i].print.clone() });
+            self.people.push(Person::new(nid, self.faces[i].print.clone()));
             self.faces[i].person = nid;
             if !self.faces[i].not.contains(&id) {
                 self.faces[i].not.push(id);
@@ -554,7 +714,7 @@ mod tests {
         for (k, pr) in [("y|1", near.clone()), ("z|1", near.clone()), ("w|1", b.clone())] {
             let nid = p.next_id;
             p.next_id += 1;
-            p.people.push(Person { id: nid, name: None, centre: pr.clone() });
+            p.people.push(Person::new(nid, pr.clone()));
             p.faces.push(Face { key: k.into(), n: 0, photo: k[..1].into(), area: [0.0; 4], print: pr, person: nid, not: Vec::new() });
         }
         // The user said z is not Talia.
@@ -574,7 +734,7 @@ mod tests {
     #[test]
     fn fingerprints_survive_saving_as_text() {
         let v = print(3.0);
-        let back = unhex(&hex(&v));
-        assert_eq!(v, back);
+        let back = crate::store::unpack(&crate::store::pack(&v));
+        assert!(crate::faces::similarity_of(&v, &back) > 0.9999);
     }
 }

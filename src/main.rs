@@ -26,6 +26,7 @@ mod mcp;
 mod measure;
 mod network;
 mod people;
+mod store;
 mod pictures;
 mod pipeline;
 mod profile;
