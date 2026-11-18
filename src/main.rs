@@ -126,6 +126,34 @@ fn main() -> eframe::Result<()> {
     }
     // Diagnostic: `app --dump-clip "<phrase>" <photos...>`: the CLIP models' inputs and outputs,
     // the phrase's tokens, and for each photo its suggested keywords and its score for the phrase.
+    // `--regroup-report`: what Regroup would move in the library, without saving anything.
+    if args.len() >= 2 && args[1] == "--regroup-report" {
+        let mut p = people::People::load();
+        let before: std::collections::HashMap<String, usize> = p.list().into_iter().filter_map(|(id, n, ..)| n.map(|n| (n, p.faces.iter().filter(|f| f.person == id).count()))).collect();
+        let groups = p.list().len();
+        let was: Vec<u32> = p.faces.iter().map(|f| f.person).collect();
+        let (moved, touched, skipped) = p.regroup();
+        println!("faces {}, groups shown {groups}; regroup moves {moved} faces in {} photos; skipped {skipped:?}", p.faces.len(), touched.len());
+        // Every face that moved, and every face already named, for a contact sheet.
+        if let Some(out) = args.get(2) {
+            let mut lines = String::new();
+            for (f, w) in p.faces.iter().zip(&was) {
+                if let Some(name) = p.name_of(f.person) {
+                    let how = if *w == f.person { "had" } else { "moved" };
+                    lines += &format!("{name}	{how}	{}	{}	{}
+", f.key, f.n, f.photo.display());
+                }
+            }
+            let _ = std::fs::write(out, lines);
+        }
+        let mut names: Vec<(String, usize, usize)> = p.list().into_iter().filter_map(|(id, n, ..)| n.map(|n| { let now = p.faces.iter().filter(|f| f.person == id).count(); (n.clone(), *before.get(&n).unwrap_or(&0), now) })).collect();
+        names.sort_by(|a, b| b.2.cmp(&a.2));
+        for (n, b, a) in names {
+            println!("  {n}: {b} -> {a} faces");
+        }
+        println!("groups shown after: {}", p.list().len());
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--dump-clip" {
         print!("{}", clip::describe());
         println!("tokens of {:?}: {:?}", args[2], clip::tokens(&args[2]));
@@ -749,6 +777,8 @@ struct App {
     people_show_all: bool,
     /// The person a dragged photo would go to (the face under the pointer), for the drag label.
     drop_hint: Option<String>,
+    /// What the last Regroup did, shown for a few seconds.
+    regroup_note: Option<(String, std::time::Instant)>,
     /// Closing while faces are being read: the question is showing, or the user said quit.
     quit_asked: bool,
     quit_ok: bool,
@@ -978,6 +1008,7 @@ impl App {
             people_filter: String::new(),
             people_show_all: false,
             drop_hint: None,
+            regroup_note: None,
             quit_asked: false,
             quit_ok: false,
             person_selected: Default::default(),
@@ -4434,7 +4465,24 @@ impl App {
             return;
         }
         let named = list.iter().filter(|(_, n, ..)| n.is_some()).count();
-        ui.label(ui::dim(&format!("{named} named, {} to name", list.len() - named), 11.0));
+        let mut regroup = false;
+        ui.horizontal(|ui| {
+            ui.label(ui::dim(&format!("{named} named, {} to name", list.len() - named), 11.0));
+            if named > 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let tip = "Check the faces not named yet against the people you have named, and move the clear matches to them. Borderline faces stay for you to confirm under Possible matches; photos you took out of someone's set are never put back.";
+                    if ui::button(ui, "Regroup", egui::vec2(0.0, 20.0), ui::Look::bordered(), theme::font(11.5), None).on_hover_text(tip).clicked() {
+                        regroup = true;
+                    }
+                });
+            }
+        });
+        if let Some((note, at)) = &self.regroup_note {
+            if at.elapsed() < std::time::Duration::from_secs(30) {
+                ui.label(egui::RichText::new(note).font(theme::font(11.5)).color(theme::TEAL));
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            }
+        }
         ui.add_space(4.0);
         ui.add(egui::TextEdit::singleline(&mut self.people_filter).hint_text("Find a person").desired_width(f32::INFINITY));
         ui.add_space(6.0);
@@ -4537,6 +4585,24 @@ impl App {
         if let Some(id) = open {
             self.open_person(id);
         }
+        if regroup {
+            let result = self.library.people.lock().map(|mut p| {
+                let r = p.regroup();
+                p.save();
+                r
+            });
+            let (moved, touched, skipped) = result.unwrap_or_default();
+            let photos = touched.len();
+            self.refresh_names(touched);
+            let mut note = match moved {
+                0 => "No clear matches to move. Check Possible matches in each person.".to_owned(),
+                _ => format!("Moved {moved} face{} into named people ({photos} photo{}).", if moved == 1 { "" } else { "s" }, if photos == 1 { "" } else { "s" }),
+            };
+            if !skipped.is_empty() {
+                note.push_str(&format!(" Not added to {}: their photos vary too much to match reliably. Open them and take out photos that aren't them (backs of heads, other people).", skipped.join(", ")));
+            }
+            self.regroup_note = Some((note, std::time::Instant::now()));
+        }
         if let Some((items, to)) = dropped {
             let touched = self.library.people.lock().map(|mut p| {
                 let t: Vec<PathBuf> = items.iter().flat_map(|(from, photo)| p.move_photo(*from, photo, to)).collect();
@@ -4571,10 +4637,12 @@ impl App {
     fn person_view_ui(&mut self, ui: &mut egui::Ui) {
         self.people_pictures.poll(ui.ctx());
         let Some(id) = self.person_view else { return };
-        let Some((faces, best, name, others, maybe)) = self.library.people.lock().ok().map(|p| {
+        let Some((faces, best, name, others, maybe, all_names)) = self.library.people.lock().ok().map(|p| {
             // Only named people who look somewhat like them.
             let others = p.similar_named(id);
-            (p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id))
+            // Every other name, for completing what is typed.
+            let all: Vec<String> = p.list().into_iter().filter(|(i, ..)| *i != id).filter_map(|(_, n, ..)| n).collect();
+            (p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id), all)
         }) else {
             return;
         };
@@ -4646,12 +4714,58 @@ impl App {
                 ui.label(egui::RichText::new("Name").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
                 ui.add_space(4.0);
                 if let Some((_, text)) = self.person_rename.as_mut() {
-                    let field = ui.add(egui::TextEdit::singleline(text).hint_text("Type their name, then Enter").font(theme::font(16.0)).desired_width(300.0));
+                    // Names already given that fit what is typed: those starting with it first,
+                    // then those with a word starting with it, then any containing it.
+                    let typed = text.trim().to_lowercase();
+                    let mut fits: Vec<(u8, &String)> = all_names
+                        .iter()
+                        .filter(|n| !typed.is_empty() && n.to_lowercase() != typed)
+                        .filter_map(|n| {
+                            let low = n.to_lowercase();
+                            if low.starts_with(&typed) {
+                                Some((0, n))
+                            } else if low.split_whitespace().any(|w| w.starts_with(&typed)) {
+                                Some((1, n))
+                            } else if low.contains(&typed) {
+                                Some((2, n))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    fits.sort();
+                    fits.truncate(6);
+                    // Tab takes the first one (before the box sees the key).
+                    let field_id = egui::Id::new("person-name-box");
+                    let focused = ui.memory(|m| m.has_focus(field_id));
+                    if focused && !fits.is_empty() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+                        *text = fits[0].1.clone();
+                        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), field_id) {
+                            let end = egui::text::CCursor::new(text.chars().count());
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                            state.store(ui.ctx(), field_id);
+                        }
+                        fits.clear();
+                    }
+                    let field = ui.add(egui::TextEdit::singleline(text).id(field_id).hint_text("Type their name, then Enter").font(theme::font(16.0)).desired_width(300.0));
                     if std::mem::take(&mut self.rename_focus) {
                         field.request_focus();
                     }
                     if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         rename = Some(text.trim().to_owned());
+                    }
+                    if !fits.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                            ui.label(ui::dim("Tab or click:", 11.5));
+                            for (i, (_, n)) in fits.iter().enumerate() {
+                                let look = if i == 0 { ui::Look::teal() } else { ui::Look::bordered() };
+                                if ui::button(ui, n, egui::vec2(0.0, 22.0), look, theme::font(12.0), None).on_hover_text(format!("These photos are {n}: put them with {n}'s")).clicked() {
+                                    rename = Some((*n).clone());
+                                }
+                            }
+                        });
                     }
                 }
                 if !others.is_empty() {
