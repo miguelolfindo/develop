@@ -320,12 +320,14 @@ pub fn rank(phrase: &[f32], pictures: &[(std::path::PathBuf, Vec<f32>)]) -> Vec<
 pub struct Pictures {
     map: HashMap<String, (std::path::PathBuf, u32, Vec<f32>)>,
     changed: bool,
-    files: crate::store::Files,
+    /// The content files of each place the library keeps data (local first, then each shared
+    /// library; see store.rs).
+    files: Vec<crate::store::Files>,
 }
 
 impl Default for Pictures {
     fn default() -> Self {
-        Self { map: HashMap::new(), changed: false, files: crate::store::Files::new("content") }
+        Self { map: HashMap::new(), changed: false, files: vec![crate::store::Files::new("content")] }
     }
 }
 
@@ -338,22 +340,15 @@ impl Pictures {
     pub fn load() -> Self {
         let mut p = Pictures::default();
         let today = crate::store::today();
-        if p.files.exists() {
-            for text in p.files.read_all() {
-                let mut folder = std::path::PathBuf::new();
-                for line in text.lines() {
-                    let f: Vec<&str> = line.split('\t').collect();
-                    match f.as_slice() {
-                        ["folder", path] => folder = std::path::PathBuf::from(path),
-                        ["C", key, name, day, numbers] => {
-                            p.map.insert((*key).to_owned(), (folder.join(name), day.parse().unwrap_or(today), crate::store::unpack(numbers)));
-                        }
-                        _ => {}
-                    }
+        p.files = crate::store::places().iter().map(|pl| crate::store::Files::at(pl, "content")).collect();
+        if p.files.iter().any(|f| f.exists()) {
+            for i in 0..p.files.len() {
+                let place = p.files[i].place.clone();
+                for (_, text) in p.files[i].read_all() {
+                    p.take_folder_text(&place, &text, false);
                 }
             }
-            let summaries = p.summaries().into_iter().map(|(f, (h, _))| (f, h)).collect();
-            p.files.set_summaries(&summaries);
+            p.reset_summaries();
         } else if let Some(text) = crate::settings::settings_dir().and_then(|d| std::fs::read_to_string(d.join("clip.tsv")).ok()) {
             // The single file of 0.4.x: read it and write it the new way (the old file stays, for
             // an older Develop).
@@ -374,20 +369,98 @@ impl Pictures {
             return;
         }
         self.changed = false;
-        // Only folders whose summary changed are written (the numbers never change once read).
-        let mut files = std::mem::replace(&mut self.files, crate::store::Files::new("content"));
-        let summaries = self.summaries();
-        let hashes: HashMap<std::path::PathBuf, u64> = summaries.iter().map(|(f, (h, _))| (f.clone(), *h)).collect();
-        let text = |folder: &std::path::Path| -> String {
-            let mut text = format!("folder\t{}\n", folder.display());
-            for k in summaries.get(folder).map(|(_, keys)| keys.as_slice()).unwrap_or(&[]) {
-                let (photo, day, e) = &self.map[*k];
-                text.push_str(&format!("C\t{k}\t{}\t{day}\t{}\n", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), crate::store::pack(e)));
+        // Only folders whose summary changed are written (the numbers never change once read),
+        // each in the place that keeps it; a shared file another computer changed meanwhile is
+        // merged with it.
+        let mut all = std::mem::take(&mut self.files);
+        let places: Vec<crate::store::Place> = all.iter().map(|f| f.place.clone()).collect();
+        let mut merged = Vec::new();
+        {
+            let summaries = self.summaries();
+            for (i, files) in all.iter_mut().enumerate() {
+                let place = files.place.clone();
+                let hashes: HashMap<std::path::PathBuf, u64> = summaries.iter().filter(|(f, _)| crate::store::place_of(&places, f) == i).map(|(f, (h, _))| (f.clone(), *h)).collect();
+                let text = |folder: &std::path::Path| -> String {
+                    let mut text = format!("folder\t{}\n", place.written(folder));
+                    for k in summaries.get(folder).map(|(_, keys)| keys.as_slice()).unwrap_or(&[]) {
+                        let (photo, day, e) = &self.map[*k];
+                        text.push_str(&format!("C\t{k}\t{}\t{day}\t{}\n", photo.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), crate::store::pack(e)));
+                    }
+                    text
+                };
+                merged.extend(files.save_folders(&hashes, text).into_iter().map(|m| (place.clone(), m)));
             }
-            text
-        };
-        files.save_folders(&hashes, text);
-        self.files = files;
+        }
+        self.files = all;
+        if !merged.is_empty() {
+            for (place, text) in merged {
+                self.take_folder_text(&place, &text, true);
+            }
+            self.reset_summaries();
+        }
+    }
+
+    /// Take in one folder's content file (with `replace`: instead of what was known for it).
+    fn take_folder_text(&mut self, place: &crate::store::Place, text: &str, replace: bool) {
+        let today = crate::store::today();
+        let mut folder = std::path::PathBuf::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["folder", path] => {
+                    folder = place.folder(path);
+                    if replace {
+                        self.map.retain(|_, (photo, _, _)| photo.parent() != Some(folder.as_path()));
+                    }
+                }
+                ["C", key, name, day, numbers] => {
+                    self.map.insert((*key).to_owned(), (folder.join(name), day.parse().unwrap_or(today), crate::store::unpack(numbers)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reset_summaries(&mut self) {
+        let all: HashMap<std::path::PathBuf, u64> = self.summaries().into_iter().map(|(f, (h, _))| (f, h)).collect();
+        let places: Vec<crate::store::Place> = self.files.iter().map(|f| f.place.clone()).collect();
+        for (i, files) in self.files.iter_mut().enumerate() {
+            let mine: HashMap<std::path::PathBuf, u64> = all.iter().filter(|(f, _)| crate::store::place_of(&places, f) == i).map(|(f, h)| (f.clone(), *h)).collect();
+            files.set_summaries(&mine);
+        }
+    }
+
+    /// Another computer changed a content file in a shared place: read it again.
+    pub fn reload(&mut self, data: &std::path::Path, name: &str) {
+        let Some(i) = self.files.iter().position(|f| f.place.data == data) else { return };
+        let place = self.files[i].place.clone();
+        match self.files[i].reload(name) {
+            Some(text) => self.take_folder_text(&place, &text, true),
+            None => self.map.retain(|_, (p, _, _)| !p.parent().is_some_and(|f| place.holds(f) && place.file_name(f) == name)),
+        }
+        self.reset_summaries();
+    }
+
+    /// Keep the data in these places from now on, and write everything there.
+    pub fn use_places(&mut self, places: &[crate::store::Place]) {
+        self.files = places.iter().map(|pl| crate::store::Files::at(pl, "content")).collect();
+        self.save_all();
+    }
+
+    /// Write everything again, each folder to the place that keeps it now.
+    pub fn save_all(&mut self) {
+        self.changed = true;
+        self.save();
+    }
+
+    /// Read everything in a shared place again.
+    pub fn reload_all(&mut self, data: &std::path::Path) {
+        let Some(i) = self.files.iter().position(|f| f.place.data == data) else { return };
+        let place = self.files[i].place.clone();
+        for (_, text) in self.files[i].read_all() {
+            self.take_folder_text(&place, &text, true);
+        }
+        self.reset_summaries();
     }
 
     /// Per photo folder: a cheap summary of what its file holds, and its photos' keys.
@@ -410,7 +483,8 @@ impl Pictures {
         match self.map.get_mut(k) {
             Some((p, day, _)) => {
                 let today = crate::store::today();
-                if p != photo || *day != today {
+                // The day is refreshed weekly, so a library pass does not rewrite every file daily.
+                if p != photo || *day + 7 <= today {
                     *p = photo.to_path_buf();
                     *day = today;
                     self.changed = true;

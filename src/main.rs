@@ -144,6 +144,73 @@ fn main() -> eframe::Result<()> {
         let _ = std::fs::write(&args[3], filmstrip::dates_report(Path::new(&args[2]), n));
         return Ok(());
     }
+    // Test hooks for shared libraries: `--share-library <folder>` (as Share this library does)
+    // and `--rename-person <name or #n> <new name>` (as naming in the People view does).
+    if args.len() >= 3 && args[1] == "--share-library" {
+        let folder = PathBuf::from(&args[2]);
+        let text = match store::make_shared(&folder) {
+            Ok(()) => {
+                let mut people = people::People::load();
+                people.save_all();
+                let mut pictures = clip::Pictures::load();
+                pictures.save_all();
+                format!("shared {}: {} faces, {} people
+", folder.display(), people.faces.len(), people.people.len())
+            }
+            Err(e) => format!("failed: {e}
+"),
+        };
+        if let Some(out) = args.get(3) {
+            let _ = std::fs::write(out, text);
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--stop-sharing" {
+        let folder = PathBuf::from(&args[2]);
+        let everyone = args[3] == "everyone";
+        let mut people = people::People::load();
+        let mut pictures = clip::Pictures::load();
+        store::set_not_shared_here(&folder, true);
+        let places = store::places();
+        people.use_places(&places);
+        pictures.use_places(&places);
+        let mut text = format!("copied here: {} faces, {} people\n", people.faces.len(), people.people.len());
+        if everyone {
+            match store::retire_shared(&folder) {
+                Ok(kept) => text += &format!("kept as {}\n", kept.display()),
+                Err(e) => text += &format!("failed: {e}\n"),
+            }
+            store::set_not_shared_here(&folder, false);
+        }
+        if let Some(out) = args.get(4) {
+            let _ = std::fs::write(out, text);
+        }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--share-again" {
+        let folder = PathBuf::from(&args[2]);
+        store::set_not_shared_here(&folder, false);
+        store::drop_local_under(&folder);
+        let people = people::People::load();
+        if let Some(out) = args.get(3) {
+            let _ = std::fs::write(out, format!("{} faces, {} people
+", people.faces.len(), people.people.len()));
+        }
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--rename-person" {
+        let mut people = people::People::load();
+        let list = people.list();
+        let id = match args[2].strip_prefix('#').and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) => list.get(n).map(|e| e.0),
+            None => list.iter().find(|e| e.1.as_deref() == Some(args[2].as_str())).map(|e| e.0),
+        };
+        if let Some(id) = id {
+            people.rename(id, &args[3]);
+            people.save();
+        }
+        return Ok(());
+    }
     // `--regroup-report`: what Regroup would move in the library, without saving anything.
     if args.len() >= 2 && args[1] == "--regroup-report" {
         let mut p = people::People::load();
@@ -803,6 +870,11 @@ struct App {
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
+    /// A library folder the user asked to share (the question showing), and how it went.
+    share_ask: Option<PathBuf>,
+    /// A shared library folder the user asked to stop sharing (the question showing).
+    unshare_ask: Option<PathBuf>,
+    share_result: Option<(String, bool)>,
     /// What the last Regroup did, shown for a few seconds.
     regroup_note: Option<(String, std::time::Instant)>,
     /// Closing while faces are being read: the question is showing, or the user said quit.
@@ -1035,6 +1107,9 @@ impl App {
             people_show_all: false,
             drop_hint: None,
             regroup_note: None,
+            share_ask: None,
+            unshare_ask: None,
+            share_result: None,
             dates_asked: None,
             move_plan: None,
             move_job: None,
@@ -4167,11 +4242,40 @@ impl App {
         }
         for f in self.library.folders().to_vec() {
             let name = f.file_name().map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into_owned());
-            let row = ui.add(egui::Label::new(egui::RichText::new(name).font(theme::font(12.0)).color(theme::TEXT)).sense(egui::Sense::click()).truncate(true)).on_hover_text(f.display().to_string());
+            let shared = self.library.is_shared(&f);
+            let stopped_here = self.library.stopped_here(&f);
+            let row = ui
+                .horizontal(|ui| {
+                    let row = ui.add(egui::Label::new(egui::RichText::new(name).font(theme::font(12.0)).color(theme::TEXT)).sense(egui::Sense::click()).truncate(true));
+                    if shared {
+                        ui.label(egui::RichText::new("shared").font(theme::font(10.5)).color(theme::TEAL)).on_hover_text("Its people, names and search are shared with the other computers that have this folder in their library");
+                    } else if stopped_here {
+                        ui.label(ui::dim("not shared here", 10.5)).on_hover_text("Other computers share this library; this one keeps its own copy (right-click to use the shared one again)");
+                    }
+                    row
+                })
+                .inner
+                .on_hover_text(f.display().to_string());
             if row.clicked() {
                 open = Some(f.clone());
             }
             row.context_menu(|ui| {
+                if stopped_here {
+                    if ui.button("Use the shared library again").on_hover_text("Go back to the people, names and search shared by the other computers").clicked() {
+                        self.share_result = Some(match self.library.share_again(&f, ui.ctx()) {
+                            Ok(()) => (format!("This computer shares {} again.", f.display()), true),
+                            Err(e) => (e, false),
+                        });
+                        ui.close_menu();
+                    }
+                } else if !shared && ui.button("Share this library…").on_hover_text("Use the same people, names and search on other computers (another PC, a Mac) that add this folder to their library").clicked() {
+                    self.share_ask = Some(f.clone());
+                    ui.close_menu();
+                }
+                if shared && ui.button("Stop sharing…").clicked() {
+                    self.unshare_ask = Some(f.clone());
+                    ui.close_menu();
+                }
                 if ui.button("Remove from Library").clicked() {
                     remove = Some(f.clone());
                     ui.close_menu();
@@ -4403,6 +4507,91 @@ impl App {
         }
         if bar.right() > x {
             ui.painter().hline(x..=bar.right(), y, stroke);
+        }
+    }
+
+    /// Share this library…: what it means, then do it.
+    fn share_windows(&mut self, ctx: &egui::Context) {
+        if let Some(folder) = self.share_ask.clone() {
+            let (mut go, mut cancel) = (false, false);
+            let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string());
+            egui::Window::new(format!("Share \u{201c}{name}\u{201d}")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(format!("Other computers that add {} to their library (another PC, or a Mac where it appears under /Volumes) will see the same people, names, keywords and search as this one, and changes made on either show on the other within seconds.", folder.display()));
+                ui.add_space(6.0);
+                ui.label(ui::dim("Develop keeps this library's face and search data in a hidden folder inside it, .develop. Your photos and their .dvlp files don't change. This computer keeps a copy of the names, for when the folder can't be reached.", 11.5));
+                ui.add_space(6.0);
+                ui.label(ui::dim("If two computers rename the same person at about the same time, the later name is kept. New photos are read by one computer only, whichever gets there first.", 11.5));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui::button(ui, "Share", egui::vec2(90.0, 28.0), ui::Look::primary(), theme::font(12.5), None).clicked() {
+                        go = true;
+                    }
+                    if ui::button(ui, "Cancel", egui::vec2(90.0, 28.0), ui::Look::bordered(), theme::font(12.5), None).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if cancel {
+                self.share_ask = None;
+            }
+            if go {
+                self.share_ask = None;
+                self.share_result = Some(match self.library.share(&folder, ctx) {
+                    Ok(()) => (format!("{} is now shared. On the other computer, add the same folder to the library (on a Mac, the share under /Volumes): its people and names will be there.", folder.display()), true),
+                    Err(e) => (e, false),
+                });
+            }
+        }
+        if let Some(folder) = self.unshare_ask.clone() {
+            let (mut here, mut everyone, mut cancel) = (false, false, false);
+            let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string());
+            egui::Window::new(format!("Stop sharing \u{201c}{name}\u{201d}")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(470.0);
+                ui.label("Either way, this computer keeps a full copy of the library's people, names and search data, and carries on as a library of its own. Your photos and their .dvlp files don't change.");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Stop on this computer").font(theme::bold(12.5)).color(theme::TEXT_BRIGHT));
+                ui.label(ui::dim("The other computers keep sharing it. You can come back later (right-click the folder: Use the shared library again).", 11.5));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Stop for everyone").font(theme::bold(12.5)).color(theme::TEXT_BRIGHT));
+                ui.label(ui::dim("No computer uses the shared data any more. It isn't deleted: the hidden .develop folder is renamed .develop-stopped-<date>, as a backup. The other computers go back to their own copies; names given only on another computer, and faces only it has read, would need doing again there.", 11.5));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui::button(ui, "Stop on this computer", egui::vec2(0.0, 28.0), ui::Look::primary(), theme::font(12.5), None).clicked() {
+                        here = true;
+                    }
+                    if ui::button(ui, "Stop for everyone", egui::vec2(0.0, 28.0), ui::Look::bordered(), theme::font(12.5), None).clicked() {
+                        everyone = true;
+                    }
+                    if ui::button(ui, "Cancel", egui::vec2(80.0, 28.0), ui::Look::ghost(), theme::font(12.5), None).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if cancel {
+                self.unshare_ask = None;
+            }
+            if here || everyone {
+                self.unshare_ask = None;
+                self.share_result = Some(match self.library.stop_sharing(&folder, everyone, ctx) {
+                    Ok(text) => (text, true),
+                    Err(e) => (e, false),
+                });
+            }
+        }
+        if let Some((text, ok)) = self.share_result.clone() {
+            let mut close = false;
+            egui::Window::new(if ok { "Library" } else { "Could not change sharing" }).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(text);
+                ui.add_space(8.0);
+                if ui::button(ui, "OK", egui::vec2(80.0, 26.0), ui::Look::primary(), theme::font(12.5), None).clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                self.share_result = None;
+            }
         }
     }
 
@@ -4685,6 +4874,7 @@ impl App {
     /// Click one to see and name them in the main pane; drop a photo from the People view on one
     /// to move it to them. Long lists show their first rows until "Show all".
     fn people_list(&mut self, ui: &mut egui::Ui) {
+        self.people_pictures.poll(ui.ctx());
         let list = self.library.people.lock().map(|p| p.list()).unwrap_or_default();
         if list.is_empty() {
             return;
@@ -4738,7 +4928,12 @@ impl App {
             for (id, name, count, face) in shown.iter().take(limit) {
                 let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, FACE + 30.0), egui::Sense::click());
                 let circle = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + FACE / 2.0 + 2.0), egui::Vec2::splat(FACE));
-                let texture = self.face_texture(ui.ctx(), face.as_ref());
+                // The small face picture this computer made when it read the photo; in a shared
+                // library read by another computer there is none here: cut it from the photo.
+                let texture = self.face_texture(ui.ctx(), face.as_ref()).or_else(|| {
+                    let best = self.library.people.lock().ok().and_then(|p| p.best_face(*id));
+                    best.and_then(|f| self.people_pictures.face(&f.photo, f.area))
+                });
                 let drop_here = dragging && pointer.is_some_and(|p| rect.contains(p));
                 if drop_here {
                     self.drop_hint = Some(name.clone().unwrap_or_else(|| "this person".to_owned()));
@@ -4900,6 +5095,10 @@ impl App {
             let title = name.clone().unwrap_or_else(|| "Who is this?".to_owned());
             ui.label(egui::RichText::new(title).font(theme::bold(16.0)).color(theme::TEXT_BRIGHT));
             ui.label(ui::dim(&format!("{} photo{}", faces.len(), if faces.len() == 1 { "" } else { "s" }), 12.0));
+            // Named on another computer (a shared library): say where.
+            if let Some((computer, _)) = self.library.people.lock().ok().and_then(|p| p.named_on(id)).filter(|(c, _)| *c != crate::store::computer()) {
+                ui.label(egui::RichText::new(format!("named on {computer}")).font(theme::font(11.5)).color(theme::TEAL));
+            }
             let picked = self.person_selected.len();
             if picked > 1 {
                 ui.add_space(10.0);
@@ -6367,6 +6566,7 @@ impl App {
         }
         self.export_window(ctx);
         self.move_windows(ctx);
+        self.share_windows(ctx);
         self.poll_export(ctx);
         self.advance_batch(ctx);
         if self.remember && !ctx.input(|i| i.pointer.any_down()) {

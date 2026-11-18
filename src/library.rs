@@ -58,6 +58,11 @@ pub struct Library {
     /// Each photo's CLIP numbers (content search and keyword suggestions).
     pub pictures: Arc<Mutex<crate::clip::Pictures>>,
     last_pass: Option<Instant>,
+    /// Shared libraries: what other computers change, as it happens (see store::watch_changes),
+    /// the shared places being watched, and when a change last came in.
+    changes: (std::sync::mpsc::Sender<crate::store::Change>, std::sync::mpsc::Receiver<crate::store::Change>),
+    watched: Vec<PathBuf>,
+    pub changed_elsewhere: Option<Instant>,
 }
 
 fn seconds(t: std::io::Result<SystemTime>) -> u64 {
@@ -73,6 +78,14 @@ fn stamp(photo: &Path) -> (u64, u64, u64) {
 
 fn folders_file() -> Option<PathBuf> {
     crate::settings::settings_dir().map(|d| d.join("library.txt"))
+}
+
+/// The library's folders, as saved.
+pub fn folder_list() -> Vec<PathBuf> {
+    folders_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 fn index_file() -> Option<PathBuf> {
@@ -145,7 +158,7 @@ impl Library {
                 let _ = f[8];
             }
         }
-        Self { folders, shared: Arc::new(Mutex::new(Shared { entries, ..Default::default() })), people: Arc::new(Mutex::new(crate::people::People::load())), pictures: Arc::new(Mutex::new(crate::clip::Pictures::load())), last_pass: None }
+        Self { folders, shared: Arc::new(Mutex::new(Shared { entries, ..Default::default() })), people: Arc::new(Mutex::new(crate::people::People::load())), pictures: Arc::new(Mutex::new(crate::clip::Pictures::load())), last_pass: None, changes: std::sync::mpsc::channel(), watched: Vec::new(), changed_elsewhere: None }
     }
 
     pub fn folders(&self) -> &[PathBuf] {
@@ -159,6 +172,75 @@ impl Library {
         }
         let text: String = self.folders.iter().map(|f| format!("{}\n", f.display())).collect();
         let _ = std::fs::write(file, text);
+    }
+
+    /// Whether `folder` (a library folder) is shared with other computers, as used here.
+    pub fn is_shared(&self, folder: &Path) -> bool {
+        crate::store::shared_here(folder)
+    }
+
+    /// Whether `folder` is a shared library this computer stopped sharing (it keeps its own copy).
+    pub fn stopped_here(&self, folder: &Path) -> bool {
+        crate::store::is_shared(folder) && !crate::store::shared_here(folder)
+    }
+
+    /// Stop sharing `folder`: this computer copies the library's data to itself and goes back to
+    /// a local library. With `everyone`, the shared folder's `.develop` is also renamed (kept as
+    /// a backup), so no computer uses it any more. Returns what to tell the user.
+    pub fn stop_sharing(&mut self, folder: &Path, everyone: bool, ctx: &egui::Context) -> Result<String, String> {
+        if self.status().0 {
+            return Err("Wait until the library has finished reading its photos, then try again.".into());
+        }
+        crate::store::set_not_shared_here(folder, true);
+        let places = crate::store::places();
+        if let Ok(mut p) = self.people.lock() {
+            p.use_places(&places);
+        }
+        if let Ok(mut p) = self.pictures.lock() {
+            p.use_places(&places);
+        }
+        let text = if everyone {
+            let kept = crate::store::retire_shared(folder)?;
+            crate::store::set_not_shared_here(folder, false);
+            format!("{} is no longer shared. Its people and search data are on this computer now; the shared data was kept as {}.", folder.display(), kept.display())
+        } else {
+            format!("This computer no longer shares {}: it keeps its own copy of the people and search data. The other computers still share it.", folder.display())
+        };
+        self.reindex(ctx);
+        Ok(text)
+    }
+
+    /// Use a shared library again on this computer (after Stop sharing on this computer only):
+    /// the shared data is the one to go by; this computer's own copy for it is set aside.
+    pub fn share_again(&mut self, folder: &Path, ctx: &egui::Context) -> Result<(), String> {
+        if self.status().0 {
+            return Err("Wait until the library has finished reading its photos, then try again.".into());
+        }
+        crate::store::set_not_shared_here(folder, false);
+        crate::store::drop_local_under(folder);
+        self.people = Arc::new(Mutex::new(crate::people::People::load()));
+        self.pictures = Arc::new(Mutex::new(crate::clip::Pictures::load()));
+        self.reindex(ctx);
+        Ok(())
+    }
+
+    /// Share the library folder `folder`: its faces, people and content data move into
+    /// `folder/.develop`, where other computers that add `folder` to their library use them.
+    pub fn share(&mut self, folder: &Path, ctx: &egui::Context) -> Result<(), String> {
+        if self.status().0 {
+            return Err("Wait until the library has finished reading its photos, then try again.".into());
+        }
+        crate::store::make_shared(folder)?;
+        // Read again with the new place, and write everything: what belongs to the shared
+        // folder goes there (and leaves this computer's own files).
+        let mut people = crate::people::People::load();
+        people.save_all();
+        let mut pictures = crate::clip::Pictures::load();
+        pictures.save_all();
+        self.people = Arc::new(Mutex::new(people));
+        self.pictures = Arc::new(Mutex::new(pictures));
+        self.reindex(ctx);
+        Ok(())
     }
 
     /// Capture dates the index knows for photos in `dir` (unchanged since they were indexed).
@@ -309,12 +391,34 @@ impl Library {
             let known: HashMap<PathBuf, Entry> = shared.lock().map(|s| s.entries.clone()).unwrap_or_default();
             let mut fresh = HashMap::with_capacity(keyed.len());
             let mut keys = std::collections::HashSet::new();
+            // In a shared library, a folder is read by one computer at a time (see store::claim).
+            let places = crate::store::places();
+            let mut claims: HashMap<PathBuf, (bool, Instant)> = HashMap::new();
             for (n, (photo, k)) in keyed.into_iter().enumerate() {
                 // Faces: found once per photo content (moving a photo keeps them).
                 keys.insert(k.clone());
                 let faces_known = people.lock().map(|mut p| p.known(&photo, &k)).unwrap_or(true);
                 let clip_known = !use_clip || pictures.lock().map(|mut p| p.known(&photo, &k)).unwrap_or(true);
-                if !faces_known || !clip_known {
+                let dir = photo.parent().map(Path::to_path_buf).unwrap_or_default();
+                let mine = if faces_known && clip_known {
+                    true
+                } else {
+                    let place = &places[crate::store::place_of(&places, &dir)];
+                    let entry = claims.entry(dir.clone()).or_insert_with(|| (crate::store::claim(place, &dir), Instant::now()));
+                    // Renew a claim held for a long read.
+                    if entry.0 && entry.1.elapsed() > Duration::from_secs(5 * 60) {
+                        *entry = (crate::store::claim(place, &dir), Instant::now());
+                    }
+                    entry.0
+                };
+                if !mine {
+                    // Another computer is reading this folder: its results come through the
+                    // shared library's change log.
+                    if let Ok(mut s) = shared.lock() {
+                        s.to_read = s.to_read.saturating_sub(1);
+                    }
+                }
+                if (!faces_known || !clip_known) && mine {
                     // One preview for both.
                     let pic = crate::filmstrip::preview(&photo, 1600);
                     if !faces_known {
@@ -378,6 +482,9 @@ impl Library {
             }
             // Named people found in photos whose .dvlp does not say so yet (or no longer).
             let mut due = Vec::new();
+            for place in places.iter().filter(|p| p.shared()) {
+                crate::store::release_claims(place);
+            }
             if let Ok(mut p) = pictures.lock() {
                 p.prune(&keys, &unreachable);
                 p.save();
@@ -407,6 +514,44 @@ impl Library {
     pub fn tick(&mut self, ctx: &egui::Context) {
         if self.folders.is_empty() {
             return;
+        }
+        // Shared libraries: watch each for other computers' changes, and take them in.
+        for place in crate::store::places().into_iter().filter(|p| p.shared()) {
+            if !self.watched.contains(&place.data) {
+                let c = ctx.clone();
+                crate::store::watch_changes(&place, self.changes.0.clone(), move || c.request_repaint());
+                self.watched.push(place.data.clone());
+            }
+        }
+        let mut any = false;
+        while let Ok(change) = self.changes.1.try_recv() {
+            any = true;
+            match change {
+                crate::store::Change::File(data, kind, name) => match kind.as_str() {
+                    "content" => {
+                        if let Ok(mut p) = self.pictures.lock() {
+                            p.reload(&data, &name);
+                        }
+                    }
+                    _ => {
+                        if let Ok(mut p) = self.people.lock() {
+                            p.reload(&data, &kind, &name);
+                        }
+                    }
+                },
+                crate::store::Change::All(data) => {
+                    if let Ok(mut p) = self.people.lock() {
+                        p.reload_all(&data);
+                    }
+                    if let Ok(mut p) = self.pictures.lock() {
+                        p.reload_all(&data);
+                    }
+                }
+            }
+        }
+        if any {
+            self.changed_elsewhere = Some(Instant::now());
+            ctx.request_repaint();
         }
         if self.last_pass.map_or(true, |t| t.elapsed() >= RECHECK) {
             self.reindex(ctx);
