@@ -949,6 +949,30 @@ impl People {
     }
 
     /// Names of the named people in `photo`.
+    /// The names of the people in each of these photos, in one pass over the faces.
+    pub fn names_for(&self, photos: &[PathBuf]) -> Vec<(PathBuf, Vec<String>)> {
+        let wanted: std::collections::HashSet<&Path> = photos.iter().map(PathBuf::as_path).collect();
+        let name: std::collections::HashMap<u32, &str> = self.people.iter().filter_map(|p| Some((p.id, p.name.as_deref()?))).collect();
+        let mut found: std::collections::HashMap<&Path, Vec<String>> = photos.iter().map(|p| (p.as_path(), Vec::new())).collect();
+        for f in &self.faces {
+            if wanted.contains(f.photo.as_path()) {
+                if let (Some(n), Some(v)) = (name.get(&f.person), found.get_mut(f.photo.as_path())) {
+                    v.push((*n).to_owned());
+                }
+            }
+        }
+        photos
+            .iter()
+            .map(|p| {
+                let mut names = found.remove(p.as_path()).unwrap_or_default();
+                names.sort();
+                names.dedup();
+                (p.clone(), names)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn names_in(&self, photo: &Path) -> Vec<String> {
         let ids: Vec<u32> = self.faces.iter().filter(|f| f.photo == photo).map(|f| f.person).collect();
         let mut names: Vec<String> = self.people.iter().filter(|p| ids.contains(&p.id)).filter_map(|p| p.name.clone()).collect();
@@ -1037,6 +1061,11 @@ mod tests {
         assert_eq!(p.names_in(Path::new("y")), vec!["Talia".to_owned()]);
         assert!(p.names_in(Path::new("z")).is_empty(), "a face said not to be her stays out");
         assert!(p.names_in(Path::new("w")).is_empty(), "an unlike face stays out");
+        // Many photos at once give the same answers.
+        let photos: Vec<PathBuf> = ["y", "z", "w", "nowhere"].iter().map(PathBuf::from).collect();
+        for (photo, names) in p.names_for(&photos) {
+            assert_eq!(names, p.names_in(&photo), "{}", photo.display());
+        }
         // And "not her" survives saving as text: the 7th column.
         assert!(p.maybe(ia).iter().all(|(f, _)| f.key != "z|1"));
     }

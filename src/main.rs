@@ -208,6 +208,28 @@ fn main() -> eframe::Result<()> {
         }
         out.push_str(&format!("{}
 ", p.sizes()));
+        // Naming: the names of every photo of the largest named person, the old way (photo by
+        // photo, a sample of 100) and in one pass.
+        if let Some(&(id, ..)) = p.list().iter().find(|e| e.1.is_some()) {
+            let photos = p.photos_of(id);
+            let t = std::time::Instant::now();
+            for photo in photos.iter().take(100) {
+                let ids: Vec<u32> = p.faces.iter().filter(|f| &f.photo == photo).map(|f| f.person).collect();
+                let _ = ids;
+            }
+            let each = t.elapsed().as_secs_f64() / photos.len().min(100).max(1) as f64;
+            out.push_str(&format!("old way, photo by photo: about {:.1} s for {} photos
+", each * photos.len() as f64, photos.len()));
+            let t = std::time::Instant::now();
+            let _ = p.names_for(&photos);
+            out.push_str(&format!("one pass: {:.3} s
+", t.elapsed().as_secs_f64()));
+        }
+        let all: Vec<PathBuf> = p.seen.values().map(|(photo, _)| photo.clone()).collect();
+        let t = std::time::Instant::now();
+        let _ = p.names_for(&all);
+        out.push_str(&format!("names of all {} photos in one pass: {:.3} s
+", all.len(), t.elapsed().as_secs_f64()));
         let mut p = p;
         let t = std::time::Instant::now();
         p.save_all();
@@ -969,6 +991,8 @@ struct App {
     /// The person page's faces, possible matches and names, for the people library as it was
     /// (its generation) and that person: worked out once, not on every frame.
     person_view_data: Option<(u64, u32, std::rc::Rc<PersonViewData>)>,
+    /// Writes people's names into `.dvlp` files of folders not open, in the background.
+    names_writer: Option<std::sync::mpsc::Sender<(PathBuf, Vec<String>)>>,
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
@@ -1219,6 +1243,7 @@ impl App {
             move_progress: (0, 0, String::new()),
             move_check: None,
             person_view_data: None,
+            names_writer: None,
             move_result: None,
             quit_asked: false,
             quit_ok: false,
@@ -5040,9 +5065,39 @@ impl App {
 
     /// Bring the `.dvlp` names of these photos up to date with the people store.
     fn refresh_names(&mut self, photos: Vec<PathBuf>) {
-        for photo in photos {
-            let names = self.library.people.lock().map(|p| p.names_in(&photo)).unwrap_or_default();
-            self.apply_names(&photo, names);
+        let names = self.library.people.lock().map(|p| p.names_for(&photos)).unwrap_or_default();
+        self.apply_names_many(names);
+    }
+
+    /// Put people's names in many photos at once (naming someone in thousands of photos):
+    /// photos in folders already open are updated here; for the rest only their `people`
+    /// line is rewritten, in the background, so the window never waits on the disk or network.
+    fn apply_names_many(&mut self, names: Vec<(PathBuf, Vec<String>)>) {
+        let mut later = Vec::new();
+        for (photo, names) in names {
+            if photo.parent().is_some_and(|d| self.store.has_folder(d)) {
+                self.store.set_people(&photo, names);
+                self.library.note(&photo, self.store.rating(&photo), self.store.keywords(&photo), self.store.people(&photo));
+            } else {
+                self.library.note_people(&photo, &names);
+                later.push((photo, names));
+            }
+        }
+        if later.is_empty() {
+            return;
+        }
+        // One writer, in order: naming twice quickly ends with the second name.
+        let tx = self.names_writer.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, Vec<String>)>();
+            std::thread::spawn(move || {
+                for (photo, names) in rx {
+                    settings::write_people_line(&photo, &names);
+                }
+            });
+            tx
+        });
+        for job in later {
+            let _ = tx.send(job);
         }
     }
 
@@ -6528,8 +6583,9 @@ impl App {
                 self.filmstrip.requery();
             }
             self.library_was_indexing = indexing;
-            for (photo, names) in self.library.take_names_due() {
-                self.apply_names(&photo, names);
+            let due = self.library.take_names_due();
+            if !due.is_empty() {
+                self.apply_names_many(due);
             }
             if let Some(query) = self.filmstrip.library_query() {
                 let (hits, by_words) = self.library.search(&query, self.filmstrip.min_stars());

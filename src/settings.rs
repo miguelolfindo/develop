@@ -352,7 +352,46 @@ fn write_whole(file: &Path, text: &str) -> bool {
     true
 }
 
+/// Put these names in the photo's `.dvlp`, changing only its `people` line (for photos whose
+/// folder isn't open: no need to read the whole folder). An old-style sidecar is carried over.
+/// Returns whether the file now says so.
+pub fn write_people_line(photo: &Path, names: &[String]) -> bool {
+    let sidecar = sidecar_path(photo);
+    let legacy = sidecar_with(photo, LEGACY_SIDECAR_EXTENSION);
+    let old = std::fs::read_to_string(&sidecar).or_else(|_| std::fs::read_to_string(&legacy)).unwrap_or_default();
+    let names = clean_words(names.iter().cloned());
+    let mut lines: Vec<String> = old.lines().filter(|l| !l.trim().is_empty() && !l.starts_with("people	")).map(str::to_owned).collect();
+    if lines.first().map(String::as_str) != Some(SIDECAR_HEADER) {
+        lines.retain(|l| l != SIDECAR_HEADER);
+        lines.insert(0, SIDECAR_HEADER.to_owned());
+    }
+    if !names.is_empty() {
+        lines.push(format!("people	{}", names.join("	")));
+    }
+    if lines.len() == 1 {
+        // Nothing left to remember.
+        let _ = std::fs::remove_file(&sidecar);
+        return true;
+    }
+    let text = lines.join("
+") + "
+";
+    if text == old {
+        return true;
+    }
+    let ok = write_whole(&sidecar, &text);
+    if ok {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    ok
+}
+
 impl Store {
+    /// Whether this folder's sidecars have been read (its photos' settings are held here).
+    pub fn has_folder(&self, dir: &Path) -> bool {
+        self.folders.contains(dir)
+    }
+
     pub fn load() -> Self {
         let file = store_file();
         let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
@@ -960,6 +999,35 @@ impl Preset {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_people_line_changes_alone() {
+        let dir = std::env::temp_dir().join(format!("develop-people-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("DSC00001.ARW");
+        // A sidecar with a rating and keywords, and someone already named.
+        std::fs::write(sidecar_path(&photo), "Develop settings	1
+rating	4
+keywords	beach
+people	Kaye
+").unwrap();
+        assert!(write_people_line(&photo, &["Talia".to_owned(), "Kaye".to_owned()]));
+        let (rating, keywords, people) = read_tags(&photo);
+        assert_eq!((rating, keywords), (4, vec!["beach".to_owned()]));
+        let mut people = people;
+        people.sort();
+        assert_eq!(people, vec!["Kaye".to_owned(), "Talia".to_owned()]);
+        // No sidecar yet: one is made with just the names.
+        let other = dir.join("DSC00002.ARW");
+        assert!(write_people_line(&other, &["Talia".to_owned()]));
+        assert_eq!(read_tags(&other).2, vec!["Talia".to_owned()]);
+        // No names and nothing else: no sidecar.
+        assert!(write_people_line(&other, &[]));
+        assert!(!sidecar_path(&other).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn sample() -> Saved {

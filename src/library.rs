@@ -537,15 +537,21 @@ impl Library {
                 p.prune(&keys, &unreachable);
                 p.save();
             }
-            if let Ok(mut p) = people.lock() {
+            // Names worked out for every photo in one pass over the faces (photo by photo it
+            // would hold the people store for minutes in a big library, freezing the window).
+            let all: Vec<PathBuf> = fresh.keys().cloned().collect();
+            let names = people.lock().map(|mut p| {
                 p.prune(&keys, &unreachable);
                 p.save();
-                for e in fresh.values() {
-                    let names = p.names_in(&e.path);
+                p.names_for(&all)
+            });
+            for (photo, names) in names.unwrap_or_default() {
+                if let Some(e) = fresh.get(&photo) {
                     let mut have = e.people.clone();
                     have.sort();
+                    have.dedup();
                     if names != have {
-                        due.push((e.path.clone(), names));
+                        due.push((photo, names));
                     }
                 }
             }
@@ -626,6 +632,16 @@ impl Library {
             entry.keywords = keywords.to_vec();
             entry.people = people.to_vec();
             entry.stamp = (0, 0, 0); // read it again on the next pass
+        }
+    }
+
+    /// Note the names of the people in a photo in the index (its other tags as they were).
+    pub fn note_people(&self, photo: &Path, people: &[String]) {
+        if let Ok(mut s) = self.shared.lock() {
+            if let Some(entry) = s.entries.get_mut(photo) {
+                entry.people = people.to_vec();
+                entry.stamp = (0, 0, 0); // read it again on the next pass
+            }
         }
     }
 
