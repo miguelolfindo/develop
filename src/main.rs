@@ -324,7 +324,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Develop")
             .with_icon(app_icon())
-            .with_inner_size([1600.0, 1000.0])
+            // DEVELOP_WINDOW=<width>x<height>: another starting size (screenshots).
+            .with_inner_size(
+                std::env::var("DEVELOP_WINDOW")
+                    .ok()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])))
+                    .unwrap_or([1600.0, 1000.0]),
+            )
             .with_min_inner_size([900.0, 600.0])
             .with_drag_and_drop(true),
         wgpu_options: egui_wgpu::WgpuConfiguration {
@@ -1049,7 +1055,7 @@ impl App {
             // leave the remembered settings alone.
             remember: {
                 let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-                args.len() <= 2 || (args.len() == 4 && (args[2] == "--export-dialog" || args[2] == "--search" || args[2] == "--person"))
+                args.len() <= 2 || (args.len() == 4 && (args[2] == "--export-dialog" || args[2] == "--search" || args[2] == "--person")) || (args.len() == 5 && args[2] == "--move-preview")
             },
             folder_watch: None,
             outside: Default::default(),
@@ -1266,6 +1272,12 @@ impl App {
             let id = app.library.people.lock().ok().and_then(|p| p.list().get(n).map(|e| e.0));
             if let Some(id) = id {
                 app.open_person(id);
+            }
+        }
+        // `--move-preview <folder> <into>`: start with Move to…'s summary showing (screenshots).
+        if let Some(i) = args.iter().position(|a| a == "--move-preview") {
+            if let (Some(from), Some(into)) = (args.get(i + 1), args.get(i + 2)) {
+                app.move_plan = mover::plan(Path::new(from), Path::new(into)).ok();
             }
         }
         // Look for a newer release in the background, except in scripted runs
