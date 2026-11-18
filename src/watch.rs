@@ -29,8 +29,9 @@ enum Notice {
 
 pub struct FolderWatch {
     dir: PathBuf,
-    /// Kept so the watching goes on; dropping it stops it.
-    _watcher: Box<dyn Watcher + Send>,
+    /// Kept so the watching goes on; dropping it stops it. Filled in by a background thread,
+    /// since starting to watch a network folder means looking at every file in it first.
+    _watcher: std::sync::Arc<std::sync::Mutex<Option<Box<dyn Watcher + Send>>>>,
     notices: Receiver<Notice>,
     /// Photos whose sidecar changed, with the time of the latest notice.
     waiting: HashMap<PathBuf, Instant>,
@@ -72,15 +73,25 @@ impl FolderWatch {
             }
         };
         let network = dir.to_string_lossy().starts_with(r"\\");
-        let mut watcher: Box<dyn Watcher + Send> = match network {
-            false => match notify::recommended_watcher(handler.clone()) {
-                Ok(w) => Box::new(w),
-                Err(_) => Box::new(notify::PollWatcher::new(handler, notify::Config::default().with_poll_interval(NETWORK_CHECK)).ok()?),
-            },
-            true => Box::new(notify::PollWatcher::new(handler, notify::Config::default().with_poll_interval(NETWORK_CHECK)).ok()?),
-        };
-        watcher.watch(dir, notify::RecursiveMode::NonRecursive).ok()?;
-        Some(Self { dir: dir.to_path_buf(), _watcher: watcher, notices, waiting: HashMap::new(), everything: None })
+        let slot: std::sync::Arc<std::sync::Mutex<Option<Box<dyn Watcher + Send>>>> = Default::default();
+        let (keep, folder) = (slot.clone(), dir.to_path_buf());
+        std::thread::spawn(move || {
+            let made: Option<Box<dyn Watcher + Send>> = match network {
+                false => match notify::recommended_watcher(handler.clone()) {
+                    Ok(w) => Some(Box::new(w)),
+                    Err(_) => notify::PollWatcher::new(handler, notify::Config::default().with_poll_interval(NETWORK_CHECK)).ok().map(|w| Box::new(w) as Box<dyn Watcher + Send>),
+                },
+                true => notify::PollWatcher::new(handler, notify::Config::default().with_poll_interval(NETWORK_CHECK)).ok().map(|w| Box::new(w) as Box<dyn Watcher + Send>),
+            };
+            if let Some(mut w) = made {
+                if w.watch(&folder, notify::RecursiveMode::NonRecursive).is_ok() {
+                    if let Ok(mut s) = keep.lock() {
+                        *s = Some(w);
+                    }
+                }
+            }
+        });
+        Some(Self { dir: dir.to_path_buf(), _watcher: slot, notices, waiting: HashMap::new(), everything: None })
     }
 
     /// The folder being watched.

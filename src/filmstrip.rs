@@ -58,9 +58,56 @@ struct Item {
     name: String,
     /// File type, lower case ("arw", "jpg"...).
     ext: String,
-    /// Capture date as sortable text; read only when sorting by date.
+    /// Capture date as sortable text; read only when sorting by date, in the background.
     date: Option<String>,
+    /// Size and modified time, from the folder listing (free): to tell whether a remembered
+    /// capture date still applies, and to sort by until the real dates are read.
+    size: u64,
+    modified: i64,
     thumb: Thumb,
+}
+
+/// Capture dates read for a folder's photos, remembered per folder (`dates/` in the settings
+/// folder) so a folder opens in order at once next time: file name -> (size, modified, date).
+type Dates = std::collections::HashMap<String, (u64, i64, String)>;
+
+fn dates_file(dir: &Path) -> Option<PathBuf> {
+    crate::settings::settings_dir().map(|d| d.join("dates").join(crate::store::folder_file(dir)))
+}
+
+fn load_dates(dir: &Path) -> Dates {
+    let text = dates_file(dir).and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() == 4).then(|| (f[0].to_owned(), (f[1].parse().unwrap_or(0), f[2].parse().unwrap_or(0), f[3].to_owned())))
+        })
+        .collect()
+}
+
+fn save_dates(dir: &Path, dates: &Dates) {
+    let Some(file) = dates_file(dir) else { return };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut lines: Vec<String> = dates.iter().map(|(n, (s, m, d))| format!("{n}\t{s}\t{m}\t{d}\n")).collect();
+    lines.sort();
+    let _ = std::fs::write(file, lines.concat());
+}
+
+/// Seconds since 1970 as the capture date's text form ("YYYY:MM:DD HH:MM:SS").
+fn date_text(seconds: i64) -> String {
+    let (days, rem) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}:{month:02}:{day:02} {:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// How the filmstrip is ordered.
@@ -130,6 +177,9 @@ pub struct Filmstrip {
     version_thumbs: std::collections::HashMap<String, Thumb>,
     /// Thumbnails fill the main window instead of a strip under the picture.
     grid: bool,
+    /// Capture dates being read in the background, for this folder.
+    dates_job: Option<(PathBuf, Receiver<Vec<(PathBuf, String)>>)>,
+    dates_wanted: bool,
     /// Thumbnail size in the grid view.
     pub grid_card: f32,
     /// Bringing the open photo into view: where its card was drawn (on screen), then the scroll
@@ -184,7 +234,7 @@ impl Filmstrip {
                 ctx.request_repaint();
             });
         }
-        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, search: String::new(), library_scope: false, query_sent: None, results: false, results_label: String::new(), sort: Sort::CaptureDate, ascending: true, version_thumbs: Default::default(), grid: false, grid_card: 160.0, scroll_want: None, scroll_goal: None }
+        Self { dir: None, items: Vec::new(), generation, jobs, done, shown_current: None, selected: Default::default(), min_stars: 0, search: String::new(), library_scope: false, query_sent: None, results: false, results_label: String::new(), sort: Sort::CaptureDate, ascending: true, version_thumbs: Default::default(), grid: false, grid_card: 160.0, scroll_want: None, scroll_goal: None, dates_job: None, dates_wanted: false }
     }
 
     /// Start with this search (`--search` on the command line).
@@ -265,7 +315,12 @@ impl Filmstrip {
         self.query_sent = Some(self.search.trim().to_owned());
         self.items = paths
             .into_iter()
-            .map(|path| Item { name: path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), ext: extension_of(&path), date: None, path, thumb: Thumb::None })
+            .map(|path| {
+                let meta = std::fs::metadata(&path).ok();
+                let size = meta.as_ref().map_or(0, |m| m.len());
+                let modified = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64);
+                Item { name: path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), ext: extension_of(&path), date: None, size, modified, path, thumb: Thumb::None }
+            })
             .collect();
         self.selected.clear();
         self.arrange();
@@ -290,37 +345,115 @@ impl Filmstrip {
     /// Read the folder again (new or deleted files).
     fn rescan(&mut self) {
         let Some(dir) = &self.dir else { return };
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        let t = std::time::Instant::now();
+        // One listing: the system returns each file's type, size and time with it, so there is
+        // no question per file (which over the network is what made big folders slow).
+        let mut found: Vec<(PathBuf, u64, i64)> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| is_supported(p) && p.is_file())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| {
+                let meta = e.metadata().ok();
+                let size = meta.as_ref().map_or(0, |m| m.len());
+                let modified = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64);
+                (e.path(), size, modified)
+            })
+            .filter(|(p, ..)| is_supported(p))
             .collect();
-        paths.sort();
-        self.items = paths
+        found.sort();
+        let known = load_dates(dir);
+        self.items = found
             .into_iter()
-            .map(|path| Item {
-                name: path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                ext: extension_of(&path),
-                date: None,
-                path,
-                thumb: Thumb::None,
+            .map(|(path, size, modified)| {
+                let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                // A remembered date still applies if the file is unchanged.
+                let date = known.get(&file).filter(|(s, m, _)| *s == size && *m == modified).map(|(.., d)| d.clone());
+                Item { name: path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), ext: extension_of(&path), date, size, modified, path, thumb: Thumb::None }
             })
             .collect();
+        self.dates_job = None;
+        crate::timing(&format!("folder listed ({} photos)", self.items.len()), t);
         self.selected.clear();
+        let t = std::time::Instant::now();
         self.arrange();
+        crate::timing("sorted (capture dates read)", t);
+    }
+
+    /// Capture dates known elsewhere (the library's index), for photos of this folder whose
+    /// dates are not known yet: used at once, and remembered, instead of being read again.
+    pub fn know_dates(&mut self, known: &std::collections::HashMap<PathBuf, String>) {
+        let mut any = false;
+        for item in self.items.iter_mut().filter(|i| i.date.is_none()) {
+            if let Some(d) = known.get(&item.path) {
+                item.date = Some(d.clone());
+                any = true;
+            }
+        }
+        if any {
+            if let (Some(dir), false) = (self.dir.clone(), self.results) {
+                let mut remembered = load_dates(&dir);
+                for item in &self.items {
+                    if let (Some(d), Some(name)) = (&item.date, item.path.file_name()) {
+                        remembered.insert(name.to_string_lossy().into_owned(), (item.size, item.modified, d.clone()));
+                    }
+                }
+                save_dates(&dir, &remembered);
+            }
+            if self.sort == Sort::CaptureDate {
+                self.arrange();
+            }
+        }
+    }
+
+    /// Whether some photos' capture dates are not known yet.
+    pub fn missing_dates(&self) -> bool {
+        self.items.iter().any(|i| i.date.is_none())
+    }
+
+    /// Read the capture dates not known yet, in the background (opening each photo, slow over
+    /// the network); `poll` puts them in and sorts again.
+    fn read_dates(&mut self) {
+        let Some(dir) = self.dir.clone() else { return };
+        let missing: Vec<PathBuf> = self.items.iter().filter(|i| i.date.is_none()).map(|i| i.path.clone()).collect();
+        if missing.is_empty() || self.dates_job.is_some() {
+            return;
+        }
+        crate::timing(&format!("reading capture dates of {} photos: started", missing.len()), std::time::Instant::now());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+            let t = std::time::Instant::now();
+            let count = missing.len();
+            // A few at a time: enough to hide the network's delay without flooding it (the
+            // folder listing and thumbnails share the same connection).
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build();
+            let read = || missing.into_par_iter().map(|p| {
+                let d = capture_date(&p);
+                (p, d)
+            }).collect::<Vec<(PathBuf, String)>>();
+            let dates = match pool {
+                Ok(pool) => pool.install(read),
+                Err(_) => read(),
+            };
+            crate::timing(&format!("capture dates of {count} photos read (in the background)"), t);
+            let _ = tx.send(dates);
+        });
+        self.dates_job = Some((dir, rx));
     }
 
     /// Put the photos in the chosen order. Thumbnails already loaded are kept.
     fn arrange(&mut self) {
-        use rayon::prelude::*;
         let selected = self.selected_paths();
         if self.sort == Sort::CaptureDate {
-            self.items.par_iter_mut().filter(|item| item.date.is_none()).for_each(|item| item.date = Some(capture_date(&item.path)));
+            // Started from `poll`, once the folder's edits have been read.
+            self.dates_wanted = true;
         }
         let by_name = |a: &Item, b: &Item| natural_cmp(&a.name, &b.name).then_with(|| a.ext.cmp(&b.ext));
+        // Until a photo's capture date is read, its file time stands in for it.
+        let when = |i: &Item| i.date.clone().unwrap_or_else(|| date_text(i.modified));
         match self.sort {
-            Sort::CaptureDate => self.items.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| by_name(a, b))),
+            Sort::CaptureDate => self.items.sort_by(|a, b| when(a).cmp(&when(b)).then_with(|| by_name(a, b))),
             Sort::FileName => self.items.sort_by(by_name),
             Sort::FileType => self.items.sort_by(|a, b| a.ext.cmp(&b.ext).then_with(|| by_name(a, b))),
         }
@@ -340,6 +473,39 @@ impl Filmstrip {
 
     /// Turn finished thumbnails into textures.
     pub fn poll(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.dates_wanted) {
+            self.read_dates();
+        }
+        // Capture dates read in the background: put them in, remember them, sort again.
+        let arrived = match &self.dates_job {
+            Some((dir, rx)) => rx.try_recv().ok().map(|d| (dir.clone(), d)),
+            None => None,
+        };
+        if let Some((dir, dates)) = arrived {
+            self.dates_job = None;
+            if self.dir.as_deref() == Some(dir.as_path()) {
+                let found: std::collections::HashMap<PathBuf, String> = dates.into_iter().collect();
+                let mut remembered = load_dates(&dir);
+                for item in &mut self.items {
+                    if let Some(d) = found.get(&item.path) {
+                        item.date = Some(d.clone());
+                    }
+                    if let (Some(d), Some(name)) = (&item.date, item.path.file_name()) {
+                        remembered.insert(name.to_string_lossy().into_owned(), (item.size, item.modified, d.clone()));
+                    }
+                }
+                // Search results come from many folders: only a folder's own dates are kept.
+                if !self.results {
+                    save_dates(&dir, &remembered);
+                }
+                if self.sort == Sort::CaptureDate {
+                    self.arrange();
+                }
+            }
+        }
+        if self.dates_job.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         let generation = self.generation.load(Ordering::Relaxed);
         while let Ok((job_generation, index, version, image)) = self.done.try_recv() {
             if let Some(key) = version {
@@ -478,6 +644,9 @@ impl Filmstrip {
             }
             if self.selected.len() > 1 {
                 place.push_str(&format!("  •  {} selected", self.selected.len()));
+            }
+            if self.dates_job.is_some() && self.sort == Sort::CaptureDate {
+                place.push_str("  •  reading dates…");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui::icon_button(ui, Icon::Refresh, 22.0, Look::ghost()).on_hover_text("Read the folder again").clicked() {
@@ -1345,6 +1514,74 @@ pub fn tiff_info(path: &Path) -> Option<TiffInfo> {
     }
 }
 
+/// How much of a photo's start `date_from_head` reads. Measured on a Synology over the network:
+/// 256 KB found every Sony date; 64 KB or 32 KB missed a few (which then need the slow read), and
+/// the time per photo is about the same (the drive's time to open a file dominates).
+const HEAD_KB: usize = 256;
+
+/// The capture date from the start of the file, read in one go (256 KB; the EXIF block of
+/// TIFF-based raw files and JPEGs is near the start). Over the network one read instead of many
+/// small ones is what makes a big folder's dates quick. None when it isn't there.
+fn date_from_head(path: &Path) -> Option<String> {
+    let ext = extension_of(path);
+    if matches!(ext.as_str(), "raf" | "cr3" | "heic" | "heif" | "png") {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut head = vec![0u8; HEAD_KB * 1024];
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => return None,
+        }
+    }
+    head.truncate(n);
+    let base = if matches!(ext.as_str(), "jpg" | "jpeg") { head.windows(6).position(|w| w == b"Exif\0\0")? as u64 + 6 } else { 0 };
+    let info = scan_tiff(&mut std::io::Cursor::new(&head), base)?;
+    info.date.filter(|d| d.len() >= 19 && !d.starts_with("0000"))
+}
+
+/// Diagnostic: for the first `n` photos in `dir`, how long the quick and the full date reading
+/// take, and whether they agree.
+pub fn dates_report(dir: &Path, n: usize) -> String {
+    if let Some(threads) = std::env::var("DEVELOP_DATES_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        use rayon::prelude::*;
+        let photos: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| is_supported(p)).take(n).collect();
+        let t = std::time::Instant::now();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let found = pool.install(|| photos.par_iter().filter(|p| date_from_head(p).is_some()).count());
+        return format!("{} photos: {found} dates found, {:.0} ms in all, {:.1} ms per photo
+", photos.len(), t.elapsed().as_secs_f64() * 1000.0, t.elapsed().as_secs_f64() * 1000.0 / photos.len().max(1) as f64);
+    }
+    let mut out = String::new();
+    let photos: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| is_supported(p)).take(n).collect();
+    let (mut quick_ms, mut full_ms, mut found, mut agree) = (0.0, 0.0, 0, 0);
+    for p in &photos {
+        // Whichever runs first reads the file cold; DEVELOP_DATES_FULL_FIRST picks which.
+        let full_first = std::env::var_os("DEVELOP_DATES_FULL_FIRST").is_some();
+        let (mut quick, mut full) = (None, None);
+        for step in 0..2 {
+            if (step == 0) == full_first {
+                let t = std::time::Instant::now();
+                full = tiff_info(p).and_then(|i| i.date);
+                full_ms += t.elapsed().as_secs_f64() * 1000.0;
+            } else {
+                let t = std::time::Instant::now();
+                quick = date_from_head(p);
+                quick_ms += t.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        found += quick.is_some() as usize;
+        agree += (quick.is_some() && quick == full) as usize;
+    }
+    let k = photos.len().max(1) as f64;
+    out += &format!("{} photos: quick read found a date in {found}, agreeing with the full read in {agree}; quick {:.1} ms each, full {:.1} ms each
+", photos.len(), quick_ms / k, full_ms / k);
+    out
+}
+
 /// The EXIF orientation recorded in a file (1 = as is, 3, 6, 8 = rotated).
 pub fn exif_orientation(path: &Path) -> Option<u16> {
     tiff_info(path).map(|info| info.orientation)
@@ -1369,7 +1606,7 @@ pub fn taken_text_of(date: &str) -> Option<String> {
 /// When the picture was taken, as sortable text: the EXIF capture date, or else the
 /// file's modified time in the same form.
 pub fn capture_date(path: &Path) -> String {
-    if let Some(date) = tiff_info(path).and_then(|info| info.date).filter(|d| d.len() >= 19 && !d.starts_with("0000")) {
+    if let Some(date) = date_from_head(path).or_else(|| tiff_info(path).and_then(|info| info.date)).filter(|d| d.len() >= 19 && !d.starts_with("0000")) {
         return date;
     }
     let seconds = std::fs::metadata(path)
@@ -1377,18 +1614,7 @@ pub fn capture_date(path: &Path) -> String {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs() as i64);
-    // Days since 1970 to a calendar date (proleptic Gregorian).
-    let (days, rem) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
-    format!("{year:04}:{month:02}:{day:02} {:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+    date_text(seconds)
 }
 
 fn upright(image: image::DynamicImage, orientation: u16) -> image::DynamicImage {

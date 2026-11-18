@@ -504,8 +504,20 @@ impl Explorer {
                     }
                 } else {
                     self.start_load(path);
-                    let text = if is_network { "Looking for computers…" } else if computer.is_some() { "Asking for its shared folders…" } else { "Reading…" };
-                    Self::note(ui, depth + 1, text, theme::FADED, None);
+                    // Network discovery can take many seconds: list at once what is known
+                    // (added computers, mapped drives' servers, those found last time); the
+                    // rest is added when discovery finishes.
+                    let quick = if is_network { network::computers_quick(&self.places.list) } else { Vec::new() };
+                    if !quick.is_empty() {
+                        let paths = quick.iter().map(|e| e.path.clone()).collect();
+                        for e in quick {
+                            self.labels.insert(e.path, e.label);
+                        }
+                        self.children.insert(path.to_path_buf(), paths);
+                    } else {
+                        let text = if is_network { "Looking for computers…" } else if computer.is_some() { "Asking for its shared folders…" } else { "Reading…" };
+                        Self::note(ui, depth + 1, text, theme::FADED, None);
+                    }
                 }
                 return;
             }
@@ -515,12 +527,16 @@ impl Explorer {
                 folders
             }
         };
-        if entries.is_empty() && container_only {
+        let still_looking = is_network && self.pending.contains_key(path);
+        if entries.is_empty() && container_only && !still_looking {
             let text = if is_network { "No computers found yet. Add one by address above." } else { "No shared folders." };
             Self::note(ui, depth + 1, text, theme::FADED, None);
         }
         for entry in entries {
             self.node(ui, &entry, depth + 1, selected, reveal, clicked);
+        }
+        if still_looking {
+            Self::note(ui, depth + 1, "Still looking for others…", theme::FADED, None);
         }
     }
 }

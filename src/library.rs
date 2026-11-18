@@ -161,6 +161,12 @@ impl Library {
         let _ = std::fs::write(file, text);
     }
 
+    /// Capture dates the index knows for photos in `dir` (unchanged since they were indexed).
+    pub fn dates_in(&self, dir: &Path) -> HashMap<PathBuf, String> {
+        let Ok(s) = self.shared.lock() else { return HashMap::new() };
+        s.entries.values().filter(|e| e.path.parent() == Some(dir) && !e.taken.is_empty()).map(|e| (e.path.clone(), e.taken.clone())).collect()
+    }
+
     /// A folder was moved from `from` to `to` (Move to…): faces, content and the index follow it
     /// at once. A library folder that was moved is replaced by its new place; a folder moved out
     /// of the library into a place outside it adds that place. Returns whether `to` was added.

@@ -423,7 +423,39 @@ mod platform {
     }
 }
 
-pub use platform::{computers, drive_share, ensure_access, mount, shares};
+pub use platform::{drive_share, ensure_access, mount, shares};
+
+fn seen_file() -> Option<PathBuf> {
+    crate::settings::settings_dir().map(|d| d.join("network-seen.tsv"))
+}
+
+/// The computers found on the network (slow: network discovery can take many seconds).
+/// Remembered, so the next visit can show them at once (see `computers_quick`).
+pub fn computers(saved: &[String]) -> Vec<Entry> {
+    let found = platform::computers(saved);
+    if let Some(file) = seen_file() {
+        let text: String = found.iter().map(|e| format!("{}\t{}\n", e.path.display(), e.label)).collect();
+        let _ = std::fs::write(file, text);
+    }
+    found
+}
+
+/// What can be listed at once, without asking the network: computers added by address, the
+/// servers behind mapped drives (Windows), and those found last time.
+pub fn computers_quick(saved: &[String]) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = saved.iter().filter_map(|s| parse_address(s)).map(|(h, _)| Entry { path: host_path(&h), label: h.clone() }).collect();
+    if cfg!(windows) {
+        for letter in 'A'..='Z' {
+            if let Some(host) = drive_share(&PathBuf::from(format!("{letter}:\\"))).and_then(|s| host_of(Path::new(&s))) {
+                entries.push(Entry { path: host_path(&host), label: host });
+            }
+        }
+    }
+    if let Some(text) = seen_file().and_then(|f| std::fs::read_to_string(f).ok()) {
+        entries.extend(text.lines().filter_map(|l| l.split_once('\t')).map(|(p, label)| Entry { path: PathBuf::from(p), label: label.to_owned() }));
+    }
+    sort_unique(entries)
+}
 
 /// Open the system's sign-in for `host` (macOS Finder "Connect to Server"); on Windows the
 /// sign-in dialog appears by itself when a share is opened.

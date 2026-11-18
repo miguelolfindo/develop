@@ -363,6 +363,12 @@ impl Store {
         if self.folders.contains(dir) {
             return;
         }
+        let t = std::time::Instant::now();
+        self.load_folder_inner(dir);
+        crate::timing("edits (.dvlp) read", t);
+    }
+
+    fn load_folder_inner(&mut self, dir: &Path) {
         self.folders.insert(dir.to_path_buf());
         for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()) {
             let path = entry.path();

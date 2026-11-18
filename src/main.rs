@@ -54,6 +54,16 @@ use color::{CameraColor, KELVIN_DEFAULT, KELVIN_MAX, KELVIN_MIN};
 use pipeline::{ImageCallback, ImageRenderer, Uniforms};
 use raw::DecodedImage;
 
+/// With DEVELOP_TIMING set to a file, note how long `what` took (for measuring slow folders).
+pub fn timing(what: &str, since: std::time::Instant) {
+    if let Some(file) = std::env::var_os("DEVELOP_TIMING") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+            let _ = writeln!(f, "{:>8.0} ms  {what}", since.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     // Diagnostic: `app --dump-dcp <profile.dcp> <out.txt>` writes a summary of a camera profile.
     let args: Vec<String> = std::env::args().collect();
@@ -128,6 +138,12 @@ fn main() -> eframe::Result<()> {
     }
     // Diagnostic: `app --dump-clip "<phrase>" <photos...>`: the CLIP models' inputs and outputs,
     // the phrase's tokens, and for each photo its suggested keywords and its score for the phrase.
+    // `--dates-report <folder> <out>`: how quickly capture dates read there.
+    if args.len() >= 4 && args[1] == "--dates-report" {
+        let n = std::env::var("DEVELOP_DATES_N").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let _ = std::fs::write(&args[3], filmstrip::dates_report(Path::new(&args[2]), n));
+        return Ok(());
+    }
     // `--regroup-report`: what Regroup would move in the library, without saving anything.
     if args.len() >= 2 && args[1] == "--regroup-report" {
         let mut p = people::People::load();
@@ -785,6 +801,8 @@ struct App {
     move_job: Option<mover::Job>,
     move_progress: (u64, u64, String),
     move_result: Option<(String, bool)>,
+    /// The folder whose capture dates were last asked of the library's index.
+    dates_asked: Option<PathBuf>,
     /// What the last Regroup did, shown for a few seconds.
     regroup_note: Option<(String, std::time::Instant)>,
     /// Closing while faces are being read: the question is showing, or the user said quit.
@@ -1017,6 +1035,7 @@ impl App {
             people_show_all: false,
             drop_hint: None,
             regroup_note: None,
+            dates_asked: None,
             move_plan: None,
             move_job: None,
             move_progress: (0, 0, String::new()),
@@ -6094,11 +6113,26 @@ impl App {
                     self.store.load_folder(&d);
                 }
                 if self.folder_watch.as_ref().map(|w| w.dir()) != Some(dir.as_path()) {
+                    let t = std::time::Instant::now();
                     self.folder_watch = watch::FolderWatch::new(&dir, ctx);
+                    timing("change watcher started", t);
                     self.outside.clear();
                 }
             }
             self.take_outside_changes(ctx);
+        }
+        // A library folder's capture dates are in the library's index already: no need to read
+        // them from the photos (slow over the network). Asked once per folder.
+        if self.filmstrip.missing_dates() {
+            if let Some(dir) = self.filmstrip.dir().map(Path::to_path_buf) {
+                if self.dates_asked.as_deref() != Some(dir.as_path()) && self.library.contains(&dir.join("x")) {
+                    self.dates_asked = Some(dir.clone());
+                    let known = self.library.dates_in(&dir);
+                    if !known.is_empty() {
+                        self.filmstrip.know_dates(&known);
+                    }
+                }
+            }
         }
         self.filmstrip.poll(ctx);
         let current = self.loading_path.clone().or_else(|| self.loaded.as_ref().map(|l| l.path.clone()));
