@@ -72,11 +72,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             format: nsis
-            artifact: dist/*.exe
+            artifact: dist/*.exe dist/*-update.zip dist/models.tsv
           - os: macos-latest
             target: aarch64-apple-darwin
             format: dmg
-            artifact: dist/*.dmg
+            artifact: dist/*.dmg dist/*-update.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -130,18 +130,51 @@ jobs:
       - name: Build and package
         run: cargo packager --release --formats ${{ matrix.format }}
 
+      # The small update: everything but the AI models (which rarely change). Develop downloads
+      # it instead of the full installer when it already has the models models.tsv lists.
+      - name: Make the small update package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $stage = 'update-stage'
+          New-Item -ItemType Directory -Force "$stage/models" | Out-Null
+          Copy-Item target/release/develop.exe $stage
+          Copy-Item target/release/*.dll $stage
+          if (Test-Path lensfun) { Copy-Item lensfun $stage -Recurse }
+          Copy-Item models/LICENSE-*.txt "$stage/models"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/develop_${v}_x64-update.zip" -CompressionLevel Optimal
+          Get-ChildItem models -File | Where-Object { $_.Extension -in '.onnx', '.json' } | Sort-Object Name | ForEach-Object { "$($_.Name)`t$($_.Length)" } | Out-File dist/models.tsv -Encoding ascii
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Make the small update package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          app=$(find dist target/release -maxdepth 4 -name '*.app' -type d 2>/dev/null | head -1)
+          if [ -z "$app" ]; then echo "::warning::No .app found; Mac updates will use the full disk image."; exit 0; fi
+          stage=$(mktemp -d)
+          ditto "$app" "$stage/Develop.app"
+          rm -f "$stage/Develop.app/Contents/Resources/models/"*.onnx
+          (cd "$stage" && ditto -c -k --keepParent Develop.app "$GITHUB_WORKSPACE/dist/Develop_${v}_aarch64-update.zip")
+          ls -l dist
+
       - name: Upload to the draft release
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.ref_name }}" ${{ matrix.artifact }} --clobber
+        run: |
+          shopt -s nullglob
+          files=(${{ matrix.artifact }})
+          gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
 
       - name: Keep the installer as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: develop-${{ matrix.target }}
-          path: ${{ matrix.artifact }}
+          path: dist/*
 
   publish:
     needs: package

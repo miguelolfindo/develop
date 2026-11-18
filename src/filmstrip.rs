@@ -1077,8 +1077,22 @@ pub fn stars(count: u8) -> String {
 }
 
 /// The right-click menu shared by the filmstrip and the main picture.
+/// "Show in File Explorer" / "Show in Finder": the photo's folder, with the photo selected.
+pub const REVEAL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in folder"
+};
+
 pub fn edit_menu(ui: &mut egui::Ui, photo: &Path, targets: &[PathBuf], can_copy: bool, can_paste: bool) -> Option<Action> {
     let mut action = None;
+    if ui.button(REVEAL).on_hover_text(photo.display().to_string()).clicked() {
+        crate::reveal_in_folder(photo);
+        ui.close_menu();
+    }
+    ui.separator();
     let export = if targets.len() > 1 { format!("Export {} photos…", targets.len()) } else { "Export…".to_owned() };
     if ui.button(export).clicked() {
         action = Some(Action::Export(targets.to_vec()));

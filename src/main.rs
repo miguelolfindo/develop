@@ -138,6 +138,19 @@ fn main() -> eframe::Result<()> {
     }
     // Diagnostic: `app --dump-clip "<phrase>" <photos...>`: the CLIP models' inputs and outputs,
     // the phrase's tokens, and for each photo its suggested keywords and its score for the phrase.
+    // `--models-match <models.tsv> <out>`: whether the small update would be used here.
+    if args.len() >= 4 && args[1] == "--models-match" {
+        let list = std::fs::read_to_string(&args[2]).unwrap_or_default();
+        let _ = std::fs::write(&args[3], if update::models_match(&list) { "small" } else { "full" });
+        return Ok(());
+    }
+    // `--apply-update <package>`: install a downloaded update, as the Update button does.
+    if args.len() >= 3 && args[1] == "--apply-update" {
+        if let Err(e) = update::install(Path::new(&args[2])) {
+            eprintln!("{e}");
+        }
+        return Ok(());
+    }
     // `--dates-report <folder> <out>`: how quickly capture dates read there.
     if args.len() >= 4 && args[1] == "--dates-report" {
         let n = std::env::var("DEVELOP_DATES_N").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
@@ -1279,6 +1292,15 @@ impl App {
             if let (Some(from), Some(into)) = (args.get(i + 1), args.get(i + 2)) {
                 app.move_plan = mover::plan(Path::new(from), Path::new(into)).ok();
             }
+        }
+        // DEVELOP_ZOOM=<factor>: draw everything larger (screenshots for phones).
+        if let Some(z) = std::env::var("DEVELOP_ZOOM").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+            egui_ctx.set_zoom_factor(z.clamp(0.5, 4.0));
+        }
+        // DEVELOP_HIDE=left,right: start with those panels closed (screenshots).
+        if let Ok(hide) = std::env::var("DEVELOP_HIDE") {
+            app.show_left &= !hide.contains("left");
+            app.show_right &= !hide.contains("right");
         }
         // Look for a newer release in the background, except in scripted runs
         // (`app file.ARW --export ...`) and when DEVELOP_NO_UPDATE_CHECK is set.
@@ -4707,6 +4729,8 @@ impl App {
             if cancel {
                 self.move_plan = None;
             }
+            // DEVELOP_MOVE_NOW: go straight into the move (screenshots of its progress).
+            go |= std::env::var_os("DEVELOP_MOVE_NOW").is_some();
             if go {
                 self.move_plan = None;
                 // Save any edit not written yet, and let go of the folder (its change watcher, the
@@ -4737,7 +4761,16 @@ impl App {
                 ui.set_width(420.0);
                 ui.label(format!("To {}", job.plan.to.display()));
                 ui.add_space(6.0);
-                ui.add(egui::ProgressBar::new(*done as f32 / (*all).max(1) as f32).desired_height(10.0).fill(theme::TEAL).text(format!("{} of {}", size(*done), size(*all))));
+                // The numbers sit beside the bar, not inside it: a thin bar has no room for text.
+                let fraction = *done as f32 / (*all).max(1) as f32;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{} of {}", size(*done), size(*all))).font(theme::font(12.5)).color(theme::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:.0}%", fraction * 100.0)).font(theme::bold(12.5)).color(theme::TEXT));
+                    });
+                });
+                ui.add_space(3.0);
+                ui.add(egui::ProgressBar::new(fraction).desired_height(8.0).fill(theme::TEAL));
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(ui::dim(file, 11.5)).truncate(true));
                 ui.add_space(8.0);
@@ -5266,7 +5299,14 @@ impl App {
                         } else if response.clicked() {
                             click = Some((index, ui.input(|i| i.modifiers)));
                         }
-                        response.on_hover_text(format!("{}\nClick to pick, Ctrl or Shift for several; drag onto a person under People to move; double-click to open", face.photo.display()));
+                        response
+                            .on_hover_text(format!("{}\nClick to pick, Ctrl or Shift for several; drag onto a person under People to move; double-click to open", face.photo.display()))
+                            .context_menu(|ui| {
+                                if ui.button(filmstrip::REVEAL).clicked() {
+                                    reveal_in_folder(&face.photo);
+                                    ui.close_menu();
+                                }
+                            });
                     });
                 }
             });
@@ -5306,7 +5346,14 @@ impl App {
                         } else if response.clicked() {
                             maybe_click = Some((index, ui.input(|i| i.modifiers)));
                         }
-                        response.on_hover_text(format!("{}\nClick the tick if this is them. Click to pick, Ctrl or Shift for several, then drag up above the line", face.photo.display()));
+                        response
+                            .on_hover_text(format!("{}\nClick the tick if this is them. Click to pick, Ctrl or Shift for several, then drag up above the line", face.photo.display()))
+                            .context_menu(|ui| {
+                                if ui.button(filmstrip::REVEAL).clicked() {
+                                    reveal_in_folder(&face.photo);
+                                    ui.close_menu();
+                                }
+                            });
                     });
                 }
             });

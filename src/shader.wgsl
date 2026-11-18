@@ -523,17 +523,20 @@ fn reduce_noise(cam_in: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<f
         // strictly neighbours must match in brightness, which keeps small coloured details.
         let smoothness = params.noise2.y;
         let colour_detail = params.noise2.x;
-        let clod = lod + 0.5 + (1.0 + 2.0 * smoothness) * colour;
+        let clod = lod + 0.5 + (1.0 + 2.5 * smoothness) * colour;
         let tolerance = 0.6 - 0.45 * colour_detail;
-        let cstep = exp2(clod) / texels;
+        // 5 x 5 samples half the reach apart, each from a copy one size finer: overlapping and
+        // weighted to the middle, so the averaged colour changes smoothly, without blocks.
+        let cstep = exp2(clod) * 0.5 / texels;
+        let slod = max(clod - 1.0, lod);
         var acc = vec3<f32>(0.0);
         var total = 0.0;
-        for (var j = -1; j <= 1; j++) {
-            for (var i = -1; i <= 1; i++) {
-                let s = raw_at(uv + vec2<f32>(f32(i), f32(j)) * cstep, clod);
+        for (var j = -2; j <= 2; j++) {
+            for (var i = -2; i <= 2; i++) {
+                let s = raw_at(uv + vec2<f32>(f32(i), f32(j)) * cstep, slod);
                 let ls = max(dot(s, w), 1.0e-5);
                 let d = log(ls / l);
-                let weight = exp(-d * d / (2.0 * tolerance * tolerance)) * select(1.0, 2.0, i == 0 && j == 0);
+                let weight = exp(-d * d / (2.0 * tolerance * tolerance)) * exp(-f32(i * i + j * j) / 4.5);
                 acc += s / ls * weight;
                 total += weight;
             }
@@ -544,23 +547,62 @@ fn reduce_noise(cam_in: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<f
     let luminance = params.noise.x;
     if (luminance > 0.0) {
         let size = exp2(lod);
-        let step = size * (1.0 + 1.5 * luminance) / texels;
-        let c = sqrt(max(dot(cam, w), 0.0));
+        let old_l = max(dot(cam, w), 0.0);
+        let c = sqrt(old_l);
+        // Specks: a pixel brighter or darker than all eight of its neighbours is noise, not
+        // detail (a real edge always has neighbours on both sides of it). Pulled into their range,
+        // it no longer stands out, and the averaging below compares against that, not the speck.
+        // Specks also come as short streaks of two or three pixels, which are each other's
+        // neighbours, so the range is that of the neighbours after the two darkest and two
+        // brightest (the 3rd darkest to the 3rd brightest); at low settings, after one.
+        let near = size / texels;
+        var lo = vec3<f32>(1.0e9);
+        var hi = vec3<f32>(-1.0e9);
+        for (var j = -1; j <= 1; j++) {
+            for (var i = -1; i <= 1; i++) {
+                if (i == 0 && j == 0) {
+                    continue;
+                }
+                let t = sqrt(max(dot(raw_at(uv + vec2<f32>(f32(i), f32(j)) * near, lod), w), 0.0));
+                // Keep the three lowest (lo.x <= lo.y <= lo.z) and three highest (hi.x >= ...).
+                if (t < lo.z) {
+                    lo.z = t;
+                    if (lo.z < lo.y) { lo = vec3<f32>(lo.x, lo.z, lo.y); }
+                    if (lo.y < lo.x) { lo = vec3<f32>(lo.y, lo.x, lo.z); }
+                }
+                if (t > hi.z) {
+                    hi.z = t;
+                    if (hi.z > hi.y) { hi = vec3<f32>(hi.x, hi.z, hi.y); }
+                    if (hi.y > hi.x) { hi = vec3<f32>(hi.y, hi.x, hi.z); }
+                }
+            }
+        }
+        let deep = smoothstep(0.3, 0.8, luminance);
+        let floor_ = mix(lo.y, lo.z, deep);
+        let ceiling = mix(hi.y, hi.z, deep);
+        let centre = mix(c, clamp(c, floor_, ceiling), min(luminance * 2.0, 1.0));
         // Brightness differences up to about this much (on the square-root scale) count as
         // noise: from fine grain at low settings to heavy high-ISO grain at 100; real edges are
         // usually far bigger and are kept.
         // Detail: lower treats bigger differences as noise (smoother); higher keeps more.
-        let sigma = (0.006 + 0.13 * luminance) * (1.5 - params.noise.z);
-        var sum = c;
+        // (Too generous a tolerance flattens whole areas into patches, like watercolour.)
+        let sigma = (0.006 + 0.09 * luminance) * (1.5 - params.noise.z);
+        // The reach grows with the slider so coarse grain (blotches) is smoothed too, not just
+        // fine; each sample from a copy one size finer than the spacing, so it is partly averaged
+        // already but still changes smoothly between samples (no blocks).
+        let llod = lod + log2(1.0 + 2.0 * luminance);
+        let step = exp2(llod) / texels;
+        let slod = max(llod - 1.0, lod);
+        var sum = centre;
         var total = 1.0;
         for (var j = -2; j <= 2; j++) {
             for (var i = -2; i <= 2; i++) {
                 if (i == 0 && j == 0) {
                     continue;
                 }
-                let t = sqrt(max(dot(raw_at(uv + vec2<f32>(f32(i), f32(j)) * step, lod), w), 0.0));
+                let t = sqrt(max(dot(raw_at(uv + vec2<f32>(f32(i), f32(j)) * step, slod), w), 0.0));
                 let ds = f32(i * i + j * j);
-                let weight = exp(-ds / 4.5) * exp(-(t - c) * (t - c) / (2.0 * sigma * sigma));
+                let weight = exp(-ds / 4.5) * exp(-(t - centre) * (t - centre) / (2.0 * sigma * sigma));
                 sum += t * weight;
                 total += weight;
             }
@@ -568,12 +610,20 @@ fn reduce_noise(cam_in: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<f
         var evened = sum / total;
         // Contrast: give back what the averaging flattened where it is bigger than the noise
         // (texture, local contrast), leaving the small differences (the grain) smoothed.
-        let removed = c - evened;
+        let removed = centre - evened;
         let structure = smoothstep(sigma * 0.6, sigma * 2.0, abs(removed));
         evened += removed * structure * params.noise.w;
-        let aim = mix(c, evened, min(luminance * 1.5, 1.0));
-        let gain = aim / max(c, 1.0e-4);
-        cam *= gain * gain;
+        // A trace of the fine grain stays even at 100 (without the specks), so smooth areas look
+        // like a photograph rather than plastic.
+        let aim = mix(centre, evened, min(luminance * 1.5, 1.0) * 0.9);
+        let new_l = aim * aim;
+        // New brightness, same colour. A pixel that was far too dark has no colour worth keeping
+        // (a black speck would stay black however it is scaled), so it takes its surroundings'.
+        let around = raw_at(uv, llod + 1.0);
+        let around_colour = around / max(dot(around, w), 1.0e-5);
+        let own_colour = cam / max(old_l, 1.0e-6);
+        let trust = smoothstep(0.05, 0.35, old_l / max(new_l, 1.0e-6));
+        cam = mix(around_colour, own_colour, trust) * new_l;
     }
     return cam;
 }

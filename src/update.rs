@@ -36,6 +36,8 @@ pub struct Release {
     pub asset_name: String,
     pub asset_url: String,
     pub asset_size: u64,
+    /// The small update (everything but the AI models, which this computer has already).
+    pub small: bool,
 }
 
 /// Download progress, sent from the download thread.
@@ -75,6 +77,44 @@ fn pick_asset(name: &str) -> bool {
     }
 }
 
+/// The small update package for this system: everything but the AI models.
+fn pick_small(name: &str) -> bool {
+    let name = name.to_lowercase();
+    if cfg!(windows) {
+        name.ends_with("-update.zip") && name.contains("x64")
+    } else if cfg!(target_os = "macos") {
+        name.ends_with("-update.zip") && (name.contains("aarch64") || name.contains("arm64"))
+    } else {
+        false
+    }
+}
+
+/// The installed models folder that a small update keeps: `models` beside develop.exe, or the
+/// app's `Contents/Resources/models` on a Mac.
+fn kept_models() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    if cfg!(target_os = "macos") {
+        Some(dir.parent()?.join("Resources").join("models"))
+    } else {
+        Some(dir.join("models"))
+    }
+}
+
+/// Whether this computer has the AI model files a release lists (`models.tsv`: name and size
+/// per line), so the small update (without them) is enough.
+pub fn models_match(list: &str) -> bool {
+    let mut any = false;
+    for line in list.lines().filter(|l| !l.trim().is_empty()) {
+        let Some((name, size)) = line.trim().split_once('\t') else { return false };
+        let have = kept_models().and_then(|d| std::fs::metadata(d.join(name)).ok()).map(|m| m.len());
+        if have != size.trim().parse::<u64>().ok() {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(20))).build().into()
 }
@@ -100,13 +140,29 @@ pub fn check() -> Result<Option<Release>, String> {
     if asset.and_then(|a| a["browser_download_url"].as_str()).map_or(true, str::is_empty) {
         return Ok(None);
     }
-    Ok(Some(Release {
+    let mut release = Release {
         version: tag.trim_start_matches(['v', 'V']).to_owned(),
         notes: json["body"].as_str().unwrap_or_default().replace("\r\n", "\n"),
         asset_name: asset.and_then(|a| a["name"].as_str()).unwrap_or_default().to_owned(),
         asset_url: asset.and_then(|a| a["browser_download_url"].as_str()).unwrap_or_default().to_owned(),
         asset_size: asset.and_then(|a| a["size"].as_u64()).unwrap_or(0),
-    }))
+        small: false,
+    };
+    // When this computer already has the AI models the release uses (they rarely change), the
+    // small package is enough: a fraction of the download.
+    let assets = json["assets"].as_array().cloned().unwrap_or_default();
+    let small = assets.iter().find(|a| a["name"].as_str().is_some_and(pick_small));
+    let list = assets.iter().find(|a| a["name"].as_str() == Some("models.tsv")).and_then(|a| a["browser_download_url"].as_str());
+    if let (Some(small), Some(list)) = (small, list) {
+        let text = agent().get(list).header("User-Agent", &format!("Develop/{CURRENT}")).call().ok().and_then(|mut r| r.body_mut().read_to_string().ok());
+        if text.is_some_and(|t| models_match(&t)) {
+            release.asset_name = small["name"].as_str().unwrap_or_default().to_owned();
+            release.asset_url = small["browser_download_url"].as_str().unwrap_or_default().to_owned();
+            release.asset_size = small["size"].as_u64().unwrap_or(0);
+            release.small = true;
+        }
+    }
+    Ok(Some(release))
 }
 
 /// Download the release's installer into a temporary folder, reporting progress.
@@ -150,6 +206,9 @@ pub fn download(release: &Release, progress: &Sender<Progress>) {
 
 /// Start installing the downloaded file. On success the caller closes Develop.
 pub fn install(installer: &Path) -> Result<(), String> {
+    if installer.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+        return install_small(installer);
+    }
     #[cfg(windows)]
     {
         // Start the installer once this copy has quit, so it does not find Develop still
@@ -196,6 +255,75 @@ pub fn install(installer: &Path) -> Result<(), String> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = installer;
+        Err("Automatic updates are not available on this system".into())
+    }
+}
+
+/// Install the small update package once this copy has quit: its files replace the program's,
+/// the AI models (not in it) stay; then the new version starts.
+fn install_small(package: &Path) -> Result<(), String> {
+    // "develop_0.5.0_x64-update.zip" -> "0.5.0" (for Windows' list of installed apps).
+    let version = package.file_name().and_then(|n| n.to_str()).and_then(|n| n.split('_').nth(1)).unwrap_or("").to_owned();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let dir = exe.parent().ok_or("Could not find where Develop is installed")?.to_path_buf();
+        let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+        let staging = std::env::temp_dir().join("develop-update-files");
+        let script = format!(
+            "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; \
+             Remove-Item -LiteralPath {staging} -Recurse -Force -ErrorAction SilentlyContinue; \
+             Expand-Archive -LiteralPath {zip} -DestinationPath {staging} -Force; \
+             Copy-Item -Path (Join-Path {staging} '*') -Destination {dir} -Recurse -Force; \
+             Get-ChildItem 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall' -ErrorAction SilentlyContinue | \
+               Where-Object {{ $p = Get-ItemProperty $_.PSPath; $p.DisplayName -eq 'Develop' -and ([string]$p.UninstallString).Trim('\"').StartsWith({dir_text}) }} | \
+               ForEach-Object {{ if ('{version}') {{ Set-ItemProperty $_.PSPath -Name DisplayVersion -Value '{version}' }} }}; \
+             Remove-Item -LiteralPath {staging} -Recurse -Force -ErrorAction SilentlyContinue; \
+             Start-Process -FilePath {exe}",
+            pid = std::process::id(),
+            staging = q(&staging),
+            zip = q(package),
+            dir = q(&dir),
+            dir_text = q(&dir),
+            exe = q(&exe),
+            version = version.replace('\'', ""),
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("Could not start the update: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = version;
+        let bundle = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("/Applications/Develop.app"));
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        // Wait for this copy to quit; unpack the new app; give it this one's AI models (the
+        // package has none); swap it in, and start it. If unpacking fails, nothing is replaced.
+        let script = format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; \
+             tmp=$(mktemp -d) && ditto -x -k {zip} \"$tmp\" && new=$(ls -d \"$tmp\"/*.app | head -1) && [ -n \"$new\" ] && \
+             mkdir -p \"$new/Contents/Resources/models\" && \
+             for f in {bundle}/Contents/Resources/models/*; do [ -e \"$new/Contents/Resources/models/$(basename \"$f\")\" ] || cp -p \"$f\" \"$new/Contents/Resources/models/\"; done && \
+             rm -rf {bundle} && ditto \"$new\" {bundle}; rm -rf \"$tmp\"; \
+             xattr -cr {bundle} 2>/dev/null; open {bundle}",
+            pid = std::process::id(),
+            zip = quote(package),
+            bundle = quote(&bundle),
+        );
+        std::process::Command::new("/bin/sh").arg("-c").arg(script).spawn().map_err(|e| format!("Could not start the update: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (package, version);
         Err("Automatic updates are not available on this system".into())
     }
 }
