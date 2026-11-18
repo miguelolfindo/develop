@@ -10,8 +10,8 @@ covers everything the app does, in the order you would use it.
 1. [Installing and updating](#1-installing-and-updating)
 2. [The window](#2-the-window)
 3. [Finding and organising photos](#3-finding-and-organising-photos)
-   - [Grid view](#grid-view) · [Search](#search) · [Keywords](#keywords) · [The library](#the-library)
-     · [People](#people)
+   - [Grid view](#grid-view) · [Search](#search) · [EXIF](#exif) · [Keywords](#keywords)
+     · [The library](#the-library) · [People](#people)
 4. [Looking at a photo](#4-looking-at-a-photo)
 5. [Editing](#5-editing)
    - [Presets](#presets) · [Versions](#versions) · [Profile and treatment](#profile-and-treatment)
@@ -87,7 +87,7 @@ are; the settings folder (see [section 9](#9-where-your-edits-are-kept)) can be 
   shows or hides the right panel. The tab showing is highlighted and joins its panel; click it
   again to hide the panel (`[` and `]` do the same).
 - **Left panel:** **Folders** shows your drives, home folder and network. **Faces & Metadata**
-  shows the photo's keywords, the People and the Library.
+  shows the photo's name, then **EXIF**, **Keywords**, **People** and **Library**.
 - **Viewer** (middle): the photo, with the zoom readout, **A/B Split** and **Clipping** in the
   bottom-left corner. It also shows the [grid view](#grid-view) and the
   [People view](#the-people-view).
@@ -101,8 +101,9 @@ are; the settings folder (see [section 9](#9-where-your-edits-are-kept)) can be 
 of the filmstrip to make it taller (its thumbnails grow with it). Develop remembers the sizes, the
 tab and the grid view for next time.
 
-Sections collapse and expand by clicking their titles. Double-clicking a slider's name puts it
-back to its default.
+Sections, in the Inspector and in Faces & Metadata, collapse and expand by clicking their titles.
+Develop remembers which are open for next time; the first time, they are all open.
+Double-clicking a slider's name puts it back to its default.
 
 ---
 
@@ -181,10 +182,22 @@ names of the people in it, or its file name.
 
 Searching by content works in English, on library photos Develop has already read.
 
+### EXIF
+
+At the top of **Faces & Metadata**, under the photo's name, **EXIF** shows how the photo was taken,
+as the camera recorded it: when it was taken, the camera, lens, focal length, shutter speed,
+aperture and ISO, exposure compensation, the size in pixels (for the open photo), the file size,
+and the artist, copyright and location when the camera recorded them. **Copy location** copies
+the coordinates, to paste into a map. Hover a long value to see it whole.
+
+It shows the open photo, or the photo selected in the filmstrip or picked in the People view; with
+several picked, pick one to see its details. JPEGs show what their EXIF holds, which may not
+include shutter speed and ISO.
+
 ### Keywords
 
 Keywords are words to find photos by. They are in **Faces & Metadata**, under **KEYWORDS**, for
-the open photo (or the selected photos; the first line says which).
+the open photo (or the selected photos; the name at the top of the panel says which).
 
 - Type a word and press **Enter** to add it; separate several with commas.
 - Click **×** on a keyword to remove it.
@@ -600,6 +613,7 @@ on a Mac.
 | `photo-settings.tsv` | Edits for photos in folders that cannot be written to |
 | `update-skip.txt` | A version you chose to skip |
 | `layout.tsv` | Panel sizes, the left panel's tab, the grid view and its thumbnail size |
+| `sections.tsv` | Which sections you closed (the others are open) |
 | `library.txt` | The library's folders |
 | `library-index.tsv` | What Develop knows about each library photo, for searching |
 | `faces.tsv`, `people.tsv` | The faces found in library photos (where they are, and a fingerprint of each), and the people they are grouped into |

@@ -1,4 +1,73 @@
-## Develop 0.4.0
+## Develop 0.4.1
+
+### EXIF in Faces & Metadata
+- A new **EXIF** section at the top of Faces & Metadata shows how the photo was taken, as the
+  camera recorded it: when, camera, lens, focal length, shutter speed, aperture, ISO, exposure
+  compensation, size, file size, artist, copyright and location. **Copy location** copies the
+  coordinates, to paste into a map.
+- It shows the open photo, or the photo picked in the filmstrip or the People view. The photo's
+  name heads the panel, above EXIF and Keywords.
+
+### Sections remember being open or closed
+- EXIF, Keywords, People and Library in Faces & Metadata now collapse and expand by clicking
+  their titles, like the Inspector's sections.
+- Every section, in both panels, remembers whether you left it open or closed. On first launch
+  they all start open (Presets, Versions, Crop, Lens Correction and Retouch used to start closed).
+
+### Fixes
+- Updating on Windows: Develop now waits until it has fully closed before starting the installer,
+  so the installer no longer says Develop is still running. It may still ask if another copy is
+  open, such as a second window or an AI app's Develop connection; clicking OK closes it.
+- Windows now shows Develop's real version in the file's details (it showed 0.3.1).
+
+### Installing
+- **Windows:** run `develop_0.4.1_x64-setup.exe`. It installs over an earlier version and
+  keeps your settings and sidecar files.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.4.1_aarch64.dmg`, see below.
+
+#### macOS
+
+**1. Install**
+
+1. Double-click the `.dmg`. A window opens showing Develop.
+2. Drag Develop into the Applications folder.
+3. Eject the disk image (the eject icon next to it in Finder's sidebar).
+
+**2. First launch (the app is unsigned)**
+
+Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
+
+1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
+   it can't verify the developer.
+2. Click **Done** or **Cancel**.
+3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
+   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
+4. Double-click Develop again and click **Open** in the dialog.
+
+From then on it opens normally.
+
+**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
+flag, not real damage. Open Terminal and run:
+
+```
+xattr -cr /Applications/Develop.app
+```
+
+Then open the app again.
+
+**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
+
+```
+codesign --force --deep --sign - /Applications/Develop.app
+```
+
+### Known limitations
+- JPEGs show the camera details their EXIF holds; shutter speed and ISO show for camera raw files.
+- See also the limitations listed for 0.4.0 below.
+
+---
+
+## What came in Develop 0.4.0
 
 Develop now helps you find and sort photos, not only edit them: keywords, a search bar, a
 library of folders searched together, faces recognised and grouped into people you name, and
@@ -56,47 +125,6 @@ keyword suggestions from what is in each photo. Everything runs on your computer
 ### Fixes
 - Typing a person's name and pressing Enter now saves it.
 - Scrolling the filmstrip or grid to the open photo no longer scrolls the editing panel too.
-
-### Installing
-- **Windows:** run `develop_0.4.0_x64-setup.exe`. It installs over an earlier version and
-  keeps your settings and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.4.0_aarch64.dmg`, see below.
-
-#### macOS
-
-**1. Install**
-
-1. Double-click the `.dmg`. A window opens showing Develop.
-2. Drag Develop into the Applications folder.
-3. Eject the disk image (the eject icon next to it in Finder's sidebar).
-
-**2. First launch (the app is unsigned)**
-
-Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
-
-1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
-   it can't verify the developer.
-2. Click **Done** or **Cancel**.
-3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
-   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
-4. Double-click Develop again and click **Open** in the dialog.
-
-From then on it opens normally.
-
-**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
-flag, not real damage. Open Terminal and run:
-
-```
-xattr -cr /Applications/Develop.app
-```
-
-Then open the app again.
-
-**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
-
-```
-codesign --force --deep --sign - /Applications/Develop.app
-```
 
 ### Known limitations
 - Face recognition and keyword suggestions read each photo's embedded preview; very small or

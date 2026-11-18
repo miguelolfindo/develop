@@ -739,6 +739,8 @@ struct App {
     person_rename: Option<(u32, String)>,
     /// Faces' small pictures for the People list, by file.
     face_textures: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// The shot details of the photo shown in the EXIF section (read once per photo).
+    exif_shown: Option<(PathBuf, export::PhotoMeta)>,
     /// The person shown in the main pane (the People view), its pictures, and the People list's
     /// filter and whether it shows everyone.
     person_view: Option<u32>,
@@ -970,6 +972,7 @@ impl App {
             library: library::Library::load(),
             person_rename: None,
             face_textures: std::collections::HashMap::new(),
+            exif_shown: None,
             person_view: None,
             people_pictures: pictures::Pictures::new(egui_ctx),
             people_filter: String::new(),
@@ -4083,10 +4086,8 @@ impl App {
     fn library_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
         let mut open = None;
         let ctx = ui.ctx().clone();
-        ui::hairline(ui);
         ui.horizontal(|ui| {
             ui.set_height(24.0);
-            ui.label(egui::RichText::new("LIBRARY").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui::icon_button(ui, ui::Icon::Refresh, 22.0, ui::Look::ghost()).on_hover_text("Index the library again").clicked() {
                     self.library.reindex(&ctx);
@@ -4138,12 +4139,19 @@ impl App {
     fn faces_metadata_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
         let mut open = None;
         egui::ScrollArea::vertical().id_source("faces_metadata").auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(egui::RichText::new("KEYWORDS").font(theme::bold(11.5)).color(theme::TEXT_HEADER))
-                .on_hover_text("Words to find photos by: type and press Enter to add (commas for several), click × to remove one. With several photos selected, changes apply to all of them.");
-            ui.add_space(4.0);
-            self.keywords_panel(ui);
-            ui.add_space(10.0);
-            ui::hairline(ui);
+            // Which photo the EXIF and Keywords below are for.
+            let targets = self.keyword_targets();
+            if !targets.is_empty() {
+                let which = match targets.len() {
+                    1 => targets[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    n => format!("{n} photos picked"),
+                };
+                ui.label(egui::RichText::new(which).font(theme::bold(12.5)).color(theme::ACCENT));
+                ui.add_space(6.0);
+            }
+            // Each part collapses and expands by clicking its title, as in the Inspector.
+            ui::section(ui, "EXIF", true, "How the photo was taken, as the camera recorded it", |ui| self.exif_panel(ui));
+            ui::section(ui, "Keywords", true, "Words to find photos by: type and press Enter to add (commas for several), click × to remove one. With several photos selected, changes apply to all of them.", |ui| self.keywords_panel(ui));
             ui.add_space(6.0);
             if let Some((read, total, left)) = self.library.reading() {
                 ui.label(egui::RichText::new("Finding faces and reading content").font(theme::font(12.0)).color(theme::TEXT));
@@ -4154,16 +4162,123 @@ impl App {
                 ui.add_space(8.0);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
-            if self.library.people.lock().map(|p| p.list().is_empty()).unwrap_or(true) {
-                ui.label(egui::RichText::new("PEOPLE").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
-                ui.label(ui::dim("Faces found in the library's photos are grouped here, for you to name.", 11.5));
-            } else {
-                self.people_list(ui);
-            }
-            ui.add_space(8.0);
-            open = self.library_panel(ui);
+            ui::section(ui, "People", true, "Faces found across the library, grouped into people: click one to see and name them", |ui| {
+                if self.library.people.lock().map(|p| p.list().is_empty()).unwrap_or(true) {
+                    ui.label(ui::dim("Faces found in the library's photos are grouped here, for you to name.", 11.5));
+                } else {
+                    self.people_list(ui);
+                }
+            });
+            ui::section(ui, "Library", true, "The folders searched together, whose faces Develop recognises", |ui| open = self.library_panel(ui));
         });
         open
+    }
+
+    /// The EXIF section: the camera's record of how the photo was taken, for the photo the
+    /// Keywords section is showing.
+    fn exif_panel(&mut self, ui: &mut egui::Ui) {
+        let targets = self.keyword_targets();
+        let photo = match targets.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                ui.label(ui::dim("Open or select a photo to see how it was taken.", 11.5));
+                return;
+            }
+            _ => {
+                ui.label(ui::dim("Pick one photo to see how it was taken.", 11.5));
+                return;
+            }
+        };
+        if self.exif_shown.as_ref().map(|(p, _)| p) != Some(&photo) {
+            // The open photo's are read already; others are read from their metadata.
+            let meta = match &self.loaded {
+                Some(l) if l.path == photo && !l.photo.make.is_empty() => l.photo.clone(),
+                _ => raw::photo_meta(&photo),
+            };
+            self.exif_shown = Some((photo.clone(), meta));
+        }
+        let Some((_, m)) = &self.exif_shown else { return };
+        let ratio = |r: (u32, u32)| if r.1 > 0 { r.0 as f64 / r.1 as f64 } else { 0.0 };
+        let trim = |v: f64, places: usize| {
+            let s = format!("{v:.places$}");
+            if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
+        };
+        let mut rows: Vec<(&str, String)> = Vec::new();
+        if let Some(d) = &m.date_time_original {
+            let pretty = filmstrip::taken_text_of(d).unwrap_or_else(|| d.clone());
+            rows.push(("Taken", pretty));
+        }
+        let camera = if m.model.to_lowercase().starts_with(&m.make.to_lowercase()) { m.model.clone() } else { format!("{} {}", m.make, m.model).trim().to_owned() };
+        if !camera.is_empty() {
+            rows.push(("Camera", camera));
+        }
+        if let Some(lens) = m.lens_model.as_ref().filter(|l| !l.trim().is_empty()) {
+            rows.push(("Lens", lens.trim().to_owned()));
+        }
+        if let Some(f) = m.focal_length.map(ratio).filter(|v| *v > 0.0) {
+            rows.push(("Focal length", format!("{} mm", trim(f, 1))));
+        }
+        let mut exposure = Vec::new();
+        if let Some(t) = m.exposure_time.filter(|t| t.0 > 0 && t.1 > 0) {
+            let s = ratio(t);
+            exposure.push(if s >= 0.3 { format!("{} s", trim(s, 1)) } else { format!("1/{} s", (1.0 / s).round()) });
+        }
+        if let Some(f) = m.fnumber.map(ratio).filter(|v| *v > 0.0) {
+            exposure.push(format!("f/{}", trim(f, 1)));
+        }
+        if let Some(iso) = m.iso.filter(|i| *i > 0) {
+            exposure.push(format!("ISO {iso}"));
+        }
+        if !exposure.is_empty() {
+            rows.push(("Exposure", exposure.join("  ·  ")));
+        }
+        if let Some(b) = m.exposure_bias.filter(|b| b.1 != 0 && b.0 != 0) {
+            rows.push(("Compensation", format!("{:+} EV", trim(b.0 as f64 / b.1 as f64, 1))));
+        }
+        if let Some(l) = self.loaded.as_ref().filter(|l| l.path == photo) {
+            rows.push(("Size", format!("{} × {} ({:.1} MP)", l.full_size.0, l.full_size.1, l.full_size.0 as f32 * l.full_size.1 as f32 / 1.0e6)));
+        }
+        if let Ok(md) = std::fs::metadata(&photo) {
+            rows.push(("File size", format!("{:.1} MB", md.len() as f64 / 1.0e6)));
+        }
+        if let Some(a) = m.artist.as_ref().filter(|a| !a.trim().is_empty()) {
+            rows.push(("Artist", a.trim().to_owned()));
+        }
+        if let Some(c) = m.copyright.as_ref().filter(|c| !c.trim().is_empty()) {
+            rows.push(("Copyright", c.trim().to_owned()));
+        }
+        let gps = m.gps.as_ref().map(|g| {
+            let deg = |v: &[(u32, u32); 3]| ratio(v[0]) + ratio(v[1]) / 60.0 + ratio(v[2]) / 3600.0;
+            let (lat, lon) = (deg(&g.latitude), deg(&g.longitude));
+            let mut text = format!("{lat:.5}° {}, {lon:.5}° {}", g.latitude_ref, g.longitude_ref);
+            if let Some((below, alt)) = g.altitude {
+                text.push_str(&format!("  ·  {}{:.0} m", if below == 1 { "-" } else { "" }, ratio(alt)));
+            }
+            let signed = (if g.latitude_ref == "S" { -lat } else { lat }, if g.longitude_ref == "W" { -lon } else { lon });
+            (text, signed)
+        });
+        if let Some((text, _)) = &gps {
+            rows.push(("Location", text.clone()));
+        }
+        if rows.is_empty() {
+            ui.label(ui::dim("This file has no camera details.", 11.5));
+            return;
+        }
+        egui::Grid::new("exif_rows").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            for (label, value) in &rows {
+                ui.label(egui::RichText::new(*label).font(theme::font(11.5)).color(theme::FADED));
+                ui.add(egui::Label::new(egui::RichText::new(value).font(theme::font(11.5)).color(theme::TEXT)).wrap(true)).on_hover_text(value);
+                ui.end_row();
+            }
+        });
+        if let Some((_, (lat, lon))) = gps {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui::button(ui, "Copy location", egui::vec2(0.0, 20.0), ui::Look::ghost(), theme::font(11.0), None).on_hover_text("Copy the coordinates, to paste into a map").clicked() {
+                    ui.output_mut(|o| o.copied_text = format!("{lat:.6}, {lon:.6}"));
+                }
+            });
+        }
     }
 
     /// The bar above the panels: Folders and Faces & Metadata choose the left panel (clicking
@@ -4319,10 +4434,7 @@ impl App {
             return;
         }
         let named = list.iter().filter(|(_, n, ..)| n.is_some()).count();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("PEOPLE").font(theme::bold(11.5)).color(theme::TEXT_HEADER));
-            ui.label(ui::dim(&format!("{named} named, {} to name", list.len() - named), 11.0));
-        });
+        ui.label(ui::dim(&format!("{named} named, {} to name", list.len() - named), 11.0));
         ui.add_space(4.0);
         ui.add(egui::TextEdit::singleline(&mut self.people_filter).hint_text("Find a person").desired_width(f32::INFINITY));
         ui.add_space(6.0);
@@ -4807,13 +4919,7 @@ impl App {
             ui.label(ui::dim("Open or select a photo to add keywords.", 12.0));
             return;
         }
-        // Which photos the keywords below belong to.
-        let which = match targets.len() {
-            1 => targets[0].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            n => format!("{n} photos picked"),
-        };
-        ui.label(egui::RichText::new(which).font(theme::font(11.5)).color(theme::ACCENT));
-        ui.add_space(3.0);
+
         // Every keyword among the targets, with how many of them have it.
         let mut words: Vec<(String, usize)> = Vec::new();
         for t in &targets {
@@ -4952,10 +5058,8 @@ impl App {
         // In the order most photos are worked on: profile, crop, white balance, tone, presence,
         // detail, lens. Retouching comes last, after the darkroom adjustments.
         if std::mem::take(&mut self.sections_reveal) {
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(egui::Id::new(("section", "Presets")), true);
-                d.insert_temp(egui::Id::new(("section", "Versions")), true);
-            });
+            ui::set_section_open("Presets", true);
+            ui::set_section_open("Versions", true);
         }
         ui::section(ui, "Presets", false, "Save the current look as a preset, and apply presets to the open or selected photos", |ui| self.presets_panel(ui));
         ui::section(ui, "Versions", false, "Save versions of this photo's edit, switch between them, compare one with the current edit", |ui| self.versions_panel(ui));
@@ -5132,7 +5236,7 @@ impl App {
         // Switching the spot tool on opens this section and scrolls it into view.
         let reveal = std::mem::take(&mut self.spot_reveal);
         if reveal {
-            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("section", "Retouch")), true));
+            ui::set_section_open("Retouch", true);
         }
         ui::section(ui, "Retouch", false, "Remove dust spots and blemishes by healing or cloning  (Q)", |ui| self.spot_panel(ui));
         if reveal {

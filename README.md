@@ -106,6 +106,8 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   or Camera Raw when they are present, including an approximation of Adobe Color.
 - **Layout:** tabs for **Folders**, **Faces & Metadata** and the **Inspector**; drag the panels
   and the filmstrip to the size you like; a **grid view** fills the window with thumbnails.
+- **EXIF:** when, camera, lens, shutter speed, aperture, ISO, location and more, for the open or
+  selected photo, at the top of Faces & Metadata.
 - **Keywords and search:** add keywords (Develop suggests them from what is in the photo; you
   click to accept), and search a folder or your whole library by keyword, person, file name or a
   description such as "people eating noodles".

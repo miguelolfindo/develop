@@ -81,19 +81,24 @@ struct Meta {
     photo: crate::export::PhotoMeta,
 }
 
-/// The only function that touches the decoder crate.
-fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
-    use rawler::imgop::xyz::Illuminant;
-    use rawler::{Orientation, RawImageData};
+/// A photo's shot details (camera, lens, exposure, date, artist, copyright, GPS), read from its
+/// metadata without decoding the picture: for the EXIF section of Faces & Metadata.
+pub fn photo_meta(path: &Path) -> crate::export::PhotoMeta {
+    let md = crate::filmstrip::is_raw(path)
+        .then(|| {
+            let source = rawler::rawsource::RawSource::new(path).ok()?;
+            let decoder = rawler::get_decoder(&source).ok()?;
+            decoder.raw_metadata(&source, &rawler::decoders::RawDecodeParams::default()).ok()
+        })
+        .flatten();
+    photo_meta_with(path, md.as_ref())
+}
 
-    let failed = |e: rawler::RawlerError| format!("Could not decode file: {e}");
-    let source = rawler::rawsource::RawSource::new(path).map_err(|e| format!("Could not read file: {e}"))?;
-    let decoder = rawler::get_decoder(&source).map_err(failed)?;
-    let params = rawler::decoders::RawDecodeParams::default();
-    let raw = decoder.raw_image(&source, &params, false).map_err(failed)?;
-    // Shot details for export. Missing metadata is not a reason to refuse the picture.
-    let photo = match decoder.raw_metadata(&source, &params) {
-        Ok(md) => {
+/// Shot details from the decoder's metadata, with what it leaves out (the lens for some
+/// cameras; everything for JPEGs) taken from the file's own EXIF block.
+fn photo_meta_with(path: &Path, md: Option<&rawler::decoders::RawMetadata>) -> crate::export::PhotoMeta {
+    let mut photo = match md {
+        Some(md) => {
             let e = &md.exif;
             let r = |v: &rawler::formats::tiff::Rational| (v.n, v.d);
             crate::export::PhotoMeta {
@@ -121,17 +126,40 @@ fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
                 }),
             }
         }
-        Err(_) => crate::export::PhotoMeta::default(),
+        None => crate::export::PhotoMeta::default(),
     };
-    // The decoder leaves some of these out for some cameras (Nikon NEF: the lens); the
-    // file's own EXIF block has them.
-    let mut photo = photo;
-    if photo.lens_model.is_none() || photo.lens_make.is_none() {
+    let missing = photo.lens_model.is_none() || photo.lens_make.is_none() || photo.make.is_empty() || photo.date_time_original.is_none() || photo.focal_length.is_none() || photo.fnumber.is_none();
+    if missing {
         if let Some(info) = crate::filmstrip::tiff_info(path) {
             photo.lens_model = photo.lens_model.or(info.lens_model);
             photo.lens_make = photo.lens_make.or(info.lens_make);
+            if photo.make.is_empty() {
+                photo.make = info.make.unwrap_or_default();
+            }
+            if photo.model.is_empty() {
+                photo.model = info.model.unwrap_or_default();
+            }
+            photo.date_time_original = photo.date_time_original.or(info.date);
+            let thousandths = |v: f32| ((v * 1000.0).round() as u32, 1000);
+            photo.focal_length = photo.focal_length.or(info.focal.filter(|v| *v > 0.0).map(thousandths));
+            photo.fnumber = photo.fnumber.or(info.fnumber.filter(|v| *v > 0.0).map(thousandths));
         }
     }
+    photo
+}
+
+/// The only function that touches the decoder crate.
+fn decode(path: &Path) -> Result<(Pixels, Meta), String> {
+    use rawler::imgop::xyz::Illuminant;
+    use rawler::{Orientation, RawImageData};
+
+    let failed = |e: rawler::RawlerError| format!("Could not decode file: {e}");
+    let source = rawler::rawsource::RawSource::new(path).map_err(|e| format!("Could not read file: {e}"))?;
+    let decoder = rawler::get_decoder(&source).map_err(failed)?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    let raw = decoder.raw_image(&source, &params, false).map_err(failed)?;
+    // Shot details for export. Missing metadata is not a reason to refuse the picture.
+    let photo = photo_meta_with(path, decoder.raw_metadata(&source, &params).ok().as_ref());
     let (width, height) = (raw.width, raw.height);
     if width < 8 || height < 8 {
         return Err("Raw image is too small.".into());

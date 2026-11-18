@@ -140,18 +140,55 @@ fn tracked(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
     job
 }
 
+/// Which sections are open, by title, remembered between runs in `sections.tsv` in the
+/// settings folder. Every section starts open until the user closes it.
+static SECTIONS: std::sync::Mutex<Option<std::collections::HashMap<String, bool>>> = std::sync::Mutex::new(None);
+
+fn sections_file() -> Option<std::path::PathBuf> {
+    crate::settings::settings_dir().map(|d| d.join("sections.tsv"))
+}
+
+/// Whether the section `title` is open (open unless the user closed it).
+pub fn section_open(title: &str) -> bool {
+    let Ok(mut guard) = SECTIONS.lock() else { return true };
+    let map = guard.get_or_insert_with(|| {
+        let text = sections_file().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+        text.lines().filter_map(|l| l.split_once('\t')).map(|(k, v)| (k.to_owned(), v.trim() != "0")).collect()
+    });
+    *map.get(title).unwrap_or(&true)
+}
+
+/// Open or close the section `title`, and remember it.
+pub fn set_section_open(title: &str, open: bool) {
+    if section_open(title) == open {
+        return;
+    }
+    let Ok(mut guard) = SECTIONS.lock() else { return };
+    let Some(map) = guard.as_mut() else { return };
+    map.insert(title.to_owned(), open);
+    let mut lines: Vec<String> = map.iter().map(|(k, v)| format!("{k}\t{}\n", *v as u8)).collect();
+    lines.sort();
+    if let Some(file) = sections_file() {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(file, lines.concat());
+    }
+}
+
 /// A collapsible section: an uppercase header with a chevron at the right, its contents
-/// when open, and a hairline underneath. `tooltip` explains the section on hover.
-pub fn section(ui: &mut Ui, title: &str, default_open: bool, tooltip: &str, add_contents: impl FnOnce(&mut Ui)) {
-    let id = egui::Id::new(("section", title));
-    let mut open = ui.ctx().data_mut(|d| *d.get_temp_mut_or(id, default_open));
+/// when open, and a hairline underneath. `tooltip` explains the section on hover. Whether it
+/// is open is remembered between runs; every section starts open (`_default_open` is no longer
+/// used).
+pub fn section(ui: &mut Ui, title: &str, _default_open: bool, tooltip: &str, add_contents: impl FnOnce(&mut Ui)) {
+    let mut open = section_open(title);
     let (rect, mut response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
     if !tooltip.is_empty() {
         response = response.on_hover_text(tooltip);
     }
     if response.clicked() {
         open = !open;
-        ui.ctx().data_mut(|d| d.insert_temp(id, open));
+        set_section_open(title, open);
     }
     let color = if response.hovered() { TEXT } else { TEXT_HEADER };
     let galley = ui.fonts(|f| f.layout_job(tracked(title, 11.5, color)));

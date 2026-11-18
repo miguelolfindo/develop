@@ -1353,7 +1353,12 @@ pub fn exif_orientation(path: &Path) -> Option<u16> {
 /// When the picture was taken, for people to read ("18 Nov 2026, 21:42"), from the EXIF
 /// capture date; None when the file doesn't record one.
 pub fn taken_text(path: &Path) -> Option<String> {
-    let date = tiff_info(path).and_then(|info| info.date).filter(|d| d.len() >= 16 && !d.starts_with("0000"))?;
+    taken_text_of(&tiff_info(path).and_then(|info| info.date)?)
+}
+
+/// "2026:09:01 18:44:12" as "1 Sep 2026, 18:44".
+pub fn taken_text_of(date: &str) -> Option<String> {
+    let date = Some(date).filter(|d| d.len() >= 16 && !d.starts_with("0000"))?;
     let num = |r: std::ops::Range<usize>| date.get(r).and_then(|s| s.parse::<usize>().ok());
     let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];

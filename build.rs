@@ -7,10 +7,22 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.rc");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("windows") => {
-            if let Err(e) = embed_resource::compile("assets/app.rc", embed_resource::NONE).manifest_optional() {
+            // Fill the template with this version (so Explorer never shows an old number).
+            let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+            let mut parts: Vec<String> = version.split(['.', '-']).take(3).map(str::to_owned).collect();
+            parts.resize(3, "0".to_owned());
+            let commas = format!("{},0", parts.join(","));
+            let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+            let icon = std::path::Path::new(&dir).join("assets").join("icon.ico").display().to_string().replace('\\', "\\\\");
+            let template = std::fs::read_to_string("assets/app.rc").expect("assets/app.rc");
+            let rc = template.replace("@ICON@", &icon).replace("@COMMAS@", &commas).replace("@VERSION@", &version);
+            let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("app.rc");
+            std::fs::write(&out, rc).expect("write app.rc");
+            if let Err(e) = embed_resource::compile(&out, embed_resource::NONE).manifest_optional() {
                 panic!("{e}");
             }
         }

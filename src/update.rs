@@ -152,7 +152,20 @@ pub fn download(release: &Release, progress: &Sender<Progress>) {
 pub fn install(installer: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        std::process::Command::new(installer).spawn().map_err(|e| format!("Could not start the installer: {e}"))?;
+        // Start the installer once this copy has quit, so it does not find Develop still
+        // running and ask to close it. (A hidden PowerShell waits for this process.)
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let path = installer.display().to_string().replace('\'', "''");
+        let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath '{path}'", std::process::id());
+        let waited = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        if waited.is_err() {
+            // No PowerShell: start it straight away (it may ask to close Develop).
+            std::process::Command::new(installer).spawn().map_err(|e| format!("Could not start the installer: {e}"))?;
+        }
         Ok(())
     }
     #[cfg(target_os = "macos")]
