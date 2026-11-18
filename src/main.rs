@@ -886,6 +886,8 @@ struct App {
     move_plan: Option<mover::Plan>,
     move_job: Option<mover::Job>,
     move_progress: (u64, u64, String),
+    /// Before copying: files checked against the destination, of all.
+    move_check: Option<(usize, usize)>,
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
@@ -1134,6 +1136,7 @@ impl App {
             move_plan: None,
             move_job: None,
             move_progress: (0, 0, String::new()),
+            move_check: None,
             move_result: None,
             quit_asked: false,
             quit_ok: false,
@@ -4094,7 +4097,8 @@ impl App {
                 });
                 // Faces being read in the background: visible from any tab; click to see them.
                 if let Some((read, total, _)) = self.library.reading() {
-                    let text = format!("Finding faces  {read} of {total}");
+                    let paused = library::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+                    let text = if paused { format!("Finding faces paused while moving  {read} of {total}") } else { format!("Finding faces  {read} of {total}") };
                     let r = ui::pill(ui, theme::tint(theme::ACCENT, 0.10), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.45)), 5.0, egui::Margin::symmetric(8.0, 2.0), |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -4741,6 +4745,10 @@ impl App {
                 }
                 self.folder_watch = None;
                 self.move_progress = (0, plan.bytes, String::new());
+                self.move_check = Some((0, plan.files.len()));
+                // Finding faces waits while a move runs: both read the same photos, and the move
+                // goes faster alone.
+                library::PAUSED.store(true, std::sync::atomic::Ordering::Relaxed);
                 self.move_job = Some(mover::start(plan, ctx));
             }
         }
@@ -4749,22 +4757,31 @@ impl App {
         if let Some(job) = &self.move_job {
             while let Ok(p) = job.rx.try_recv() {
                 match p {
-                    mover::Progress::Copying(done, all, file) => self.move_progress = (done, all, file),
+                    mover::Progress::Checking(n, all) => self.move_check = Some((n, all)),
+                    mover::Progress::Copying(done, all, file) => {
+                        self.move_check = None;
+                        self.move_progress = (done, all, file);
+                    }
                     mover::Progress::Removing => self.move_progress.2 = "Removing the originals…".to_owned(),
                     other => finished = Some(other),
                 }
             }
             let mut stop = false;
             let (done, all, file) = &self.move_progress;
+            let check = self.move_check;
             let title = format!("Moving \u{201c}{}\u{201d}", job.plan.from.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
             egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
                 ui.set_width(420.0);
                 ui.label(format!("To {}", job.plan.to.display()));
                 ui.add_space(6.0);
                 // The numbers sit beside the bar, not inside it: a thin bar has no room for text.
-                let fraction = *done as f32 / (*all).max(1) as f32;
+                let (fraction, numbers) = match check {
+                    // First, what is already there (a folder of that name may exist).
+                    Some((n, files)) => (n as f32 / files.max(1) as f32, format!("Checking what is already there: {n} of {files} files")),
+                    None => (*done as f32 / (*all).max(1) as f32, format!("{} of {}", size(*done), size(*all))),
+                };
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{} of {}", size(*done), size(*all))).font(theme::font(12.5)).color(theme::TEXT));
+                    ui.label(egui::RichText::new(numbers).font(theme::font(12.5)).color(theme::TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new(format!("{:.0}%", fraction * 100.0)).font(theme::bold(12.5)).color(theme::TEXT));
                     });
@@ -4784,6 +4801,7 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         if let Some(end) = finished {
+            library::PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
             let job = self.move_job.take();
             let plan = job.map(|j| j.plan);
             match (end, plan) {
@@ -4803,6 +4821,8 @@ impl App {
                     }
                     let mut text = if report.renamed {
                         format!("Moved to {} (renamed on the same drive).", plan.to.display())
+                    } else if report.moved == report.copied {
+                        format!("Moved to {}: {} files moved on the same drive{}.", plan.to.display(), report.moved, if report.skipped > 0 { format!(", {} already there", report.skipped) } else { String::new() })
                     } else {
                         format!("Moved to {}: {} files copied and checked{}.", plan.to.display(), report.copied, if report.skipped > 0 { format!(", {} already there", report.skipped) } else { String::new() })
                     };

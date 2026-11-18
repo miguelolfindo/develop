@@ -13,6 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 
+/// Set while a folder is being moved: finding faces and reading content wait, so the move
+/// (which reads the same photos) goes faster alone.
+pub static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// How often the library is checked for changes while Develop is open.
 const RECHECK: Duration = Duration::from_secs(10 * 60);
 /// While reading faces and content, save what is done this often.
@@ -419,6 +423,10 @@ impl Library {
                     }
                 }
                 if (!faces_known || !clip_known) && mine {
+                    // Wait while a folder is being moved (see PAUSED).
+                    while PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                     // One preview for both.
                     let pic = crate::filmstrip::preview(&photo, 1600);
                     if !faces_known {

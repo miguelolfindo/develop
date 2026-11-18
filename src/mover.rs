@@ -105,6 +105,8 @@ fn free_space(dir: &Path) -> Option<u64> {
 
 /// How a move is going.
 pub enum Progress {
+    /// Before copying: files checked against what is already at the destination, of all.
+    Checking(usize, usize),
     /// Bytes done of all, and the file now being copied.
     Copying(u64, u64, String),
     Removing,
@@ -128,6 +130,8 @@ pub struct Report {
     /// Files changed by something else while the move ran: copied again before their original
     /// was removed.
     pub recopied: usize,
+    /// Files moved by renaming them (same drive or share) rather than copying.
+    pub moved: usize,
 }
 
 pub struct Job {
@@ -185,10 +189,21 @@ fn group_of(rel: &Path) -> (PathBuf, String) {
     (rel.parent().map(Path::to_path_buf).unwrap_or_default(), base)
 }
 
-/// Whether `dst` holds exactly `src`.
+/// Whether `dst` holds exactly `src`. The same size and modified time is enough (a move keeps
+/// the time, so that is what a move that stopped part-way left); otherwise, with the same size,
+/// both are read and compared, which over a network is slow.
 fn same_file(src: &Path, dst: &Path) -> Result<bool, String> {
     match (std::fs::metadata(src), std::fs::metadata(dst)) {
-        (Ok(a), Ok(b)) if a.len() == b.len() => Ok(checksum(src)? == checksum(dst)?),
+        (Ok(a), Ok(b)) if a.len() == b.len() => {
+            if let (Ok(ta), Ok(tb)) = (a.modified(), b.modified()) {
+                // File servers keep times to a second or two.
+                let apart = if ta > tb { ta.duration_since(tb) } else { tb.duration_since(ta) };
+                if apart.is_ok_and(|d| d.as_secs_f32() <= 2.0) {
+                    return Ok(true);
+                }
+            }
+            Ok(checksum(src)? == checksum(dst)?)
+        }
         _ => Ok(false),
     }
 }
@@ -209,7 +224,14 @@ fn run(plan: &Plan, stop: &AtomicBool, say: &dyn Fn(Progress)) -> Result<Report,
     // Otherwise copy and check each file. First, which names are taken by different files.
     let mut report = Report::default();
     let mut taken: std::collections::HashSet<(PathBuf, String)> = std::collections::HashSet::new();
-    for (rel, _) in &plan.files {
+    let total = plan.files.len();
+    for (n, (rel, _)) in plan.files.iter().enumerate() {
+        if n % 25 == 0 {
+            if stop.load(Ordering::Relaxed) {
+                return Err("Cancelled. Nothing was moved or removed.".into());
+            }
+            say(Progress::Checking(n, total));
+        }
         let dst = plan.to.join(rel);
         if !plan.from.join(rel).exists() {
             continue; // gone already: see below
@@ -249,9 +271,17 @@ fn run(plan: &Plan, stop: &AtomicBool, say: &dyn Fn(Progress)) -> Result<Report,
     // Each file copied (or found there), where it went, and how the original looked then.
     let mut copied: Vec<(&PathBuf, PathBuf, Option<(u64, std::time::SystemTime)>)> = Vec::new();
     let look = |p: &Path| std::fs::metadata(p).ok().and_then(|m| Some((m.len(), m.modified().ok()?)));
+    // Within one drive or network share (into a folder that is already there, so the whole
+    // folder can't simply be renamed), each file is renamed instead of copied: instant, and
+    // nothing passes through this computer. Tried until it fails (another drive), then copies.
+    let mut try_rename = true;
     for (rel, size) in &plan.files {
         if stop.load(Ordering::Relaxed) {
-            return Err("Cancelled. Nothing was removed; run the move again to carry on.".into());
+            return Err(if report.moved > 0 {
+                format!("Cancelled. {} files were already moved there; nothing else was moved or removed. Run the move again to carry on.", report.moved)
+            } else {
+                "Cancelled. Nothing was removed; run the move again to carry on.".into()
+            });
         }
         say(Progress::Copying(done, plan.bytes, rel.display().to_string()));
         let src = plan.from.join(rel);
@@ -275,6 +305,18 @@ fn run(plan: &Plan, stop: &AtomicBool, say: &dyn Fn(Progress)) -> Result<Report,
             copied.push((rel, dst, before));
             done += size;
             continue;
+        }
+        if try_rename {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&src, &dst).is_ok() {
+                report.copied += 1;
+                report.moved += 1;
+                done += size;
+                continue;
+            }
+            try_rename = false;
         }
         copy_checked(&src, &dst).map_err(|e| format!("{}: {e}", rel.display()))?;
         report.copied += 1;
@@ -437,8 +479,9 @@ mod tests {
     }
 
     #[test]
-    fn the_copy_path_copies_checks_then_removes() {
-        // The destination folder exists already, so it can't be a rename: every file is copied.
+    fn into_an_existing_folder_on_the_same_drive_each_file_is_renamed() {
+        // The destination folder exists already, so the folder can't be renamed as a whole: on
+        // the same drive each file is renamed instead (nothing copied).
         let base = scratch("copypath");
         let from = base.join("2022");
         std::fs::create_dir_all(from.join("a").join("b")).unwrap();
@@ -451,9 +494,75 @@ mod tests {
         let report = run(&p, &AtomicBool::new(false), &|_| {}).unwrap();
         assert!(!report.renamed);
         assert_eq!(report.copied, 4);
-        assert!(!from.exists(), "originals removed after checking");
+        assert_eq!(report.moved, 4);
+        assert!(!from.exists(), "nothing left behind");
         assert_eq!(std::fs::read(to.join("a").join("b").join("z.JPG.dvlp")).unwrap(), vec![3u8; 70_003]);
         assert!(std::fs::read_dir(&to).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".part")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_already_there_from_a_stopped_move_is_skipped() {
+        let base = scratch("copyonly");
+        let from = base.join("2021");
+        std::fs::create_dir_all(from.join("a")).unwrap();
+        for (i, rel) in ["x.ARW", "a/y.JPG"].iter().enumerate() {
+            std::fs::write(from.join(rel), vec![i as u8; 60_000 + i]).unwrap();
+        }
+        let to = base.join("nas").join("2021");
+        std::fs::create_dir_all(&to).unwrap();
+        // One file is there already from a move that stopped part-way (same size and time).
+        copy_checked(&from.join("x.ARW"), &to.join("x.ARW")).unwrap();
+        let p = plan(&from, &base.join("nas")).unwrap();
+        let report = run(&p, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.copied, 1);
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(to.join("a").join("y.JPG")).unwrap(), vec![1u8; 60_001]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Run with DEVELOP_TEST_OTHER_DRIVE=<a folder on another drive> to check the copy path
+    /// (a file can't be renamed across drives).
+    #[test]
+    fn to_another_drive_files_are_copied_and_checked() {
+        let Some(other) = std::env::var_os("DEVELOP_TEST_OTHER_DRIVE").map(PathBuf::from) else { return };
+        let base = scratch("otherdrive");
+        let from = base.join("2019");
+        std::fs::create_dir_all(from.join("a")).unwrap();
+        for (i, rel) in ["x.ARW", "a/y.JPG", "a/y.JPG.dvlp"].iter().enumerate() {
+            std::fs::write(from.join(rel), vec![i as u8; 80_000 + i]).unwrap();
+        }
+        let into = other.join(format!("develop-mover-test-{}", std::process::id()));
+        std::fs::create_dir_all(into.join("2019")).unwrap(); // there already: no whole-folder rename
+        let p = plan(&from, &into).unwrap();
+        let report = run(&p, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!((report.copied, report.moved), (3, 0));
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(into.join("2019").join("a").join("y.JPG.dvlp")).unwrap(), vec![2u8; 80_002]);
+        let _ = std::fs::remove_dir_all(&into);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn checking_is_reported_before_copying() {
+        let base = scratch("checking");
+        let from = base.join("2020");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("p.JPG"), vec![9u8; 1000]).unwrap();
+        std::fs::create_dir_all(base.join("nas").join("2020")).unwrap();
+        let p = plan(&from, &base.join("nas")).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        run(&p, &AtomicBool::new(false), &|progress| {
+            seen.borrow_mut().push(match progress {
+                Progress::Checking(..) => 'k',
+                Progress::Copying(..) => 'c',
+                _ => '-',
+            })
+        })
+        .unwrap();
+        let seen: String = seen.into_inner().into_iter().collect();
+        assert!(seen.starts_with('k') && seen.contains('c'), "{seen}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
