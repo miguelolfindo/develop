@@ -67,7 +67,7 @@ pub fn is_remote(path: &Path) -> bool {
     text == ROOT || text.starts_with("\\\\") || text.starts_with("smb://") || (cfg!(target_os = "macos") && text.starts_with("/Volumes/"))
 }
 
-/// Turn what someone typed ("Olfindo", "\\Olfindo\photos", "smb://nas/photos",
+/// Turn what someone typed ("server", "\\server\photos", "smb://server/photos",
 /// "192.168.1.20") into a host and an optional share.
 pub fn parse_address(text: &str) -> Option<(String, Option<String>)> {
     let text = text.trim();
@@ -195,7 +195,7 @@ mod platform {
         unsafe { WNetAddConnection2W(&resource, PCWSTR::null(), PCWSTR::null(), CONNECT_INTERACTIVE.0 | CONNECT_PROMPT.0) }.is_ok()
     }
 
-    /// The share behind a mapped drive letter (`W:\` -> `\\Olfindo\docker`).
+    /// The share behind a mapped drive letter (`W:\` -> `\\server\photos`).
     pub fn drive_share(drive: &Path) -> Option<String> {
         let letter = drive.to_str()?.get(..2)?;
         let local = wide(letter);

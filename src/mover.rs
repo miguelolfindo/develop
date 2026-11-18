@@ -531,9 +531,9 @@ mod tests {
     #[test]
     fn paths_follow_a_move() {
         let from = Path::new(r"O:\Photo WIP\2025");
-        let to = Path::new(r"\\olfindo\Photos\2025");
+        let to = Path::new(r"\\server\Photos\2025");
         let moved = relocated(Path::new(r"O:\Photo WIP\2025\09\a.ARW"), from, to).unwrap();
-        assert_eq!(moved, PathBuf::from(r"\\olfindo\Photos\2025").join(r"09\a.ARW"));
+        assert_eq!(moved, PathBuf::from(r"\\server\Photos\2025").join(r"09\a.ARW"));
         assert!(relocated(Path::new(r"O:\Photo WIP\2024\a.ARW"), from, to).is_none());
         assert!(relocated(Path::new(r"O:\Photo WIP\20250\a.ARW"), from, to).is_none());
     }

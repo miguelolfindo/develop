@@ -56,7 +56,7 @@ pub struct Explorer {
 }
 
 /// Comparison key for paths: case-insensitive on Windows and macOS, without a trailing
-/// separator, so `\\OLFINDO\docker\` and `\\Olfindo\docker` are the same entry.
+/// separator, so `\\SERVER\photos\` and `\\Server\photos` are the same entry.
 fn key(path: &Path) -> String {
     let text = path.to_string_lossy();
     let trimmed = text.trim_end_matches(['\\', '/']);
@@ -99,7 +99,7 @@ fn roots() -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
 /// Folders nobody browses photos in: hidden and system ones, and a few by name.
 fn is_clutter(entry: &std::fs::DirEntry, name: &str) -> bool {
     const NAMES: [&str; 6] = ["Config.Msi", "msdownld.tmp", "WindowsApps", "System Volume Information", "Recovery", "PerfLogs"];
-    // NAS system folders too: Synology and QNAP keep "#recycle", "#snapshot", "@eaDir"...
+    // File servers' own system folders too ("#recycle", "#snapshot", "@eaDir"...)
     if name.starts_with('.') || name.starts_with('$') || name.starts_with('#') || name.starts_with('@') || NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         return true;
     }

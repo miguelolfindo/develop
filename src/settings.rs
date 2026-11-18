@@ -781,7 +781,7 @@ pub fn skip_update(version: &str) {
 }
 
 /// Network computers and shares the user added or opened photos from, kept in
-/// `network.tsv` (one address per line, such as `\\Olfindo` or `\\Olfindo\photos`).
+/// `network.tsv` (one address per line, such as `\\server` or `\\server\photos`).
 pub struct NetworkPlaces {
     file: Option<PathBuf>,
     pub list: Vec<String>,

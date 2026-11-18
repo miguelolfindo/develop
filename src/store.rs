@@ -47,7 +47,7 @@ pub const SHARED_DIR: &str = ".develop";
 /// Where a set of library data files lives: Develop's settings folder (a local library), or a
 /// shared library's `.develop` folder beside its photos, where every computer using it reads and
 /// writes. In a shared place, folders are written relative to its top (`2025/01`), so the same
-/// files work whether the share is `\\olfindo\Photos` (Windows) or `/Volumes/Photos` (Mac).
+/// files work whether the share is `\\server\Photos` (Windows) or `/Volumes/Photos` (Mac).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Place {
     /// The shared library's top folder, as this computer sees it; None for the local place.
@@ -679,9 +679,9 @@ mod tests {
 
     #[test]
     fn shared_places_name_folders_the_same_on_every_computer() {
-        let win = Place { photos: Some(PathBuf::from(r"\\olfindo\Photos")), data: PathBuf::new() };
+        let win = Place { photos: Some(PathBuf::from(r"\\server\Photos")), data: PathBuf::new() };
         let mac = Place { photos: Some(PathBuf::from("/Volumes/Photos")), data: PathBuf::new() };
-        let a = PathBuf::from(r"\\olfindo\Photos").join("2025").join("01");
+        let a = PathBuf::from(r"\\server\Photos").join("2025").join("01");
         let b = PathBuf::from("/Volumes/Photos").join("2025").join("01");
         assert_eq!(win.written(&a), "2025/01");
         assert_eq!(mac.written(&b), "2025/01");

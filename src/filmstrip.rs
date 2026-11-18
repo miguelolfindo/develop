@@ -1514,7 +1514,7 @@ pub fn tiff_info(path: &Path) -> Option<TiffInfo> {
     }
 }
 
-/// How much of a photo's start `date_from_head` reads. Measured on a Synology over the network:
+/// How much of a photo's start `date_from_head` reads. Measured on a file server over the network:
 /// 256 KB found every Sony date; 64 KB or 32 KB missed a few (which then need the slow read), and
 /// the time per photo is about the same (the drive's time to open a file dominates).
 const HEAD_KB: usize = 256;
