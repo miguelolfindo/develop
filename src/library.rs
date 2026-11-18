@@ -161,6 +161,49 @@ impl Library {
         let _ = std::fs::write(file, text);
     }
 
+    /// A folder was moved from `from` to `to` (Move to…): faces, content and the index follow it
+    /// at once. A library folder that was moved is replaced by its new place; a folder moved out
+    /// of the library into a place outside it adds that place. Returns whether `to` was added.
+    pub fn relocate(&mut self, from: &Path, to: &Path, ctx: &egui::Context) -> bool {
+        if let Ok(mut p) = self.people.lock() {
+            p.relocate(from, to);
+            p.save();
+        }
+        if let Ok(mut p) = self.pictures.lock() {
+            p.relocate(from, to);
+            p.save();
+        }
+        if let Ok(mut s) = self.shared.lock() {
+            let moved: Vec<PathBuf> = s.entries.keys().filter(|p| crate::mover::relocated(p, from, to).is_some()).cloned().collect();
+            for old in moved {
+                if let (Some(mut e), Some(new)) = (s.entries.remove(&old), crate::mover::relocated(&old, from, to)) {
+                    e.path = new.clone();
+                    s.entries.insert(new, e);
+                }
+            }
+        }
+        let was_in = self.folders.iter().any(|f| crate::mover::relocated(from, f, f).is_some());
+        let mut added = false;
+        let mut changed = false;
+        for f in &mut self.folders {
+            if let Some(new) = crate::mover::relocated(f, from, to) {
+                *f = new;
+                changed = true;
+            }
+        }
+        if was_in && !self.folders.iter().any(|f| crate::mover::relocated(to, f, f).is_some()) {
+            self.folders.push(to.to_path_buf());
+            added = true;
+            changed = true;
+        }
+        if changed {
+            self.folders.sort();
+            self.save_folders();
+        }
+        self.reindex(ctx);
+        added
+    }
+
     pub fn add_folder(&mut self, folder: PathBuf, ctx: &egui::Context) {
         // A folder inside one already in the library adds nothing.
         if self.folders.iter().any(|f| folder.starts_with(f)) {

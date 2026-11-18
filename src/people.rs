@@ -573,6 +573,21 @@ impl People {
         (moves.len(), touched, skipped)
     }
 
+    /// A folder was moved from `from` to `to`: its photos are there now.
+    pub fn relocate(&mut self, from: &Path, to: &Path) {
+        for (photo, _) in self.seen.values_mut() {
+            if let Some(p) = crate::mover::relocated(photo, from, to) {
+                *photo = p;
+                self.changed = true;
+            }
+        }
+        for f in &mut self.faces {
+            if let Some(p) = crate::mover::relocated(&f.photo, from, to) {
+                f.photo = p;
+            }
+        }
+    }
+
     /// A person's faces, one per photo (the first if a photo has two), in path order.
     pub fn faces_of(&self, id: u32) -> Vec<Face> {
         let mut faces: Vec<Face> = self.faces.iter().filter(|f| f.person == id).cloned().collect();

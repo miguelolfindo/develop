@@ -23,6 +23,7 @@ mod heic;
 mod lens;
 mod library;
 mod mcp;
+mod mover;
 mod measure;
 mod network;
 mod people;
@@ -778,6 +779,12 @@ struct App {
     people_show_all: bool,
     /// The person a dragged photo would go to (the face under the pointer), for the drag label.
     drop_hint: Option<String>,
+    /// Move to…: the summary waiting for a yes, the move under way (with its last progress), and
+    /// how the last one ended.
+    move_plan: Option<mover::Plan>,
+    move_job: Option<mover::Job>,
+    move_progress: (u64, u64, String),
+    move_result: Option<(String, bool)>,
     /// What the last Regroup did, shown for a few seconds.
     regroup_note: Option<(String, std::time::Instant)>,
     /// Closing while faces are being read: the question is showing, or the user said quit.
@@ -1010,6 +1017,10 @@ impl App {
             people_show_all: false,
             drop_hint: None,
             regroup_note: None,
+            move_plan: None,
+            move_job: None,
+            move_progress: (0, 0, String::new()),
+            move_result: None,
             quit_asked: false,
             quit_ok: false,
             person_selected: Default::default(),
@@ -4376,6 +4387,200 @@ impl App {
         }
     }
 
+    /// Move to…: ask where, then show what the move involves.
+    fn ask_move(&mut self, folder: PathBuf) {
+        if self.move_job.is_some() {
+            self.move_result = Some(("A move is already under way; wait for it to finish.".to_owned(), false));
+            return;
+        }
+        let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some(into) = rfd::FileDialog::new().set_title(format!("Move \u{201c}{name}\u{201d} into…")).pick_folder() else { return };
+        // Save edits not written yet first (this can also remove a .dvlp left with nothing in
+        // it), so the list of files to move is right.
+        self.store.flush(true);
+        match mover::plan(&folder, &into) {
+            Ok(plan) => self.move_plan = Some(plan),
+            Err(e) => self.move_result = Some((e, false)),
+        }
+    }
+
+    /// The move's windows: the summary to confirm, progress, and how it ended.
+    fn move_windows(&mut self, ctx: &egui::Context) {
+        let size = |b: u64| if b >= 1 << 30 { format!("{:.1} GB", b as f64 / (1u64 << 30) as f64) } else { format!("{:.0} MB", b as f64 / (1u64 << 20) as f64) };
+        // The summary.
+        if let Some(plan) = self.move_plan.clone() {
+            let (mut go, mut cancel) = (false, false);
+            let in_library = self.library.folders().iter().any(|f| mover::relocated(&plan.from, f, f).is_some());
+            let dest_in_library = self.library.folders().iter().any(|f| mover::relocated(&plan.to, f, f).is_some());
+            let short = plan.free.is_some_and(|free| free < plan.bytes);
+            let mut keep_both = plan.keep_both;
+            egui::Window::new("Move folder").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                egui::Grid::new("move_summary").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label(ui::dim("From", 12.0));
+                    ui.label(plan.from.display().to_string());
+                    ui.end_row();
+                    ui.label(ui::dim("To", 12.0));
+                    ui.label(egui::RichText::new(plan.to.display().to_string()).color(theme::TEXT_BRIGHT));
+                    ui.end_row();
+                    ui.label(ui::dim("Contents", 12.0));
+                    ui.label(format!("{} photos, {} files in all, {}", plan.photos, plan.files.len(), size(plan.bytes)));
+                    ui.end_row();
+                    if let Some(free) = plan.free {
+                        ui.label(ui::dim("Free there", 12.0));
+                        let text = egui::RichText::new(size(free));
+                        ui.label(if short { text.color(ui.visuals().error_fg_color) } else { text });
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(ui::dim("Every file is copied, read back and checked before the original is removed. If the move stops part-way, nothing is lost: run it again and it carries on. On the same drive the folder is simply renamed.", 11.5));
+                if plan.already > 0 {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("{} files are already there from an earlier move: they will be checked and skipped.", plan.already)).font(theme::font(11.5)).color(theme::TEAL));
+                }
+                if in_library {
+                    ui.add_space(4.0);
+                    let text = if dest_in_library { "The library follows the folder: faces, names and search stay as they are." } else { "The library follows the folder, and its new place is added to the library." };
+                    ui.label(egui::RichText::new(text).font(theme::font(11.5)).color(theme::TEAL));
+                }
+                if !plan.clashes.is_empty() {
+                    ui.add_space(6.0);
+                    let color = if keep_both { theme::TEXT } else { ui.visuals().error_fg_color };
+                    ui.label(egui::RichText::new(format!("{} files with the same names but different content are already at the destination:", plan.clashes.len())).color(color));
+                    for c in plan.clashes.iter().take(8) {
+                        ui.label(ui::dim(&format!("  {}", c.display()), 11.5));
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut keep_both, "Keep both: give the moved files a number (DSC01234-2.ARW)")
+                        .on_hover_text("Nothing at the destination is replaced. A photo's .dvlp, JPEG and .xmp get the same number, so its edits stay with it. Renamed photos are read again for faces and content.");
+                }
+                if short {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("There isn't enough free space at the destination.").color(ui.visuals().error_fg_color));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let ok = (plan.clashes.is_empty() || keep_both) && !short;
+                    if ui.add_enabled_ui(ok, |ui| ui::button(ui, "Move", egui::vec2(90.0, 28.0), ui::Look::primary(), theme::font(12.5), None)).inner.clicked() {
+                        go = true;
+                    }
+                    if ui::button(ui, "Cancel", egui::vec2(90.0, 28.0), ui::Look::bordered(), theme::font(12.5), None).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if let Some(p) = self.move_plan.as_mut() {
+                p.keep_both = keep_both;
+            }
+            let mut plan = plan;
+            plan.keep_both = keep_both;
+            if cancel {
+                self.move_plan = None;
+            }
+            if go {
+                self.move_plan = None;
+                // Save any edit not written yet, and let go of the folder (its change watcher, the
+                // filmstrip) so it can be renamed.
+                self.store.flush(true);
+                if self.filmstrip.dir().is_some_and(|d| mover::relocated(d, &plan.from, &plan.from).is_some()) {
+                    self.filmstrip.set_folder(plan.from.parent());
+                }
+                self.folder_watch = None;
+                self.move_progress = (0, plan.bytes, String::new());
+                self.move_job = Some(mover::start(plan, ctx));
+            }
+        }
+        // Progress, and the end.
+        let mut finished = None;
+        if let Some(job) = &self.move_job {
+            while let Ok(p) = job.rx.try_recv() {
+                match p {
+                    mover::Progress::Copying(done, all, file) => self.move_progress = (done, all, file),
+                    mover::Progress::Removing => self.move_progress.2 = "Removing the originals…".to_owned(),
+                    other => finished = Some(other),
+                }
+            }
+            let mut stop = false;
+            let (done, all, file) = &self.move_progress;
+            let title = format!("Moving \u{201c}{}\u{201d}", job.plan.from.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+            egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(format!("To {}", job.plan.to.display()));
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(*done as f32 / (*all).max(1) as f32).desired_height(10.0).fill(theme::TEAL).text(format!("{} of {}", size(*done), size(*all))));
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(ui::dim(file, 11.5)).truncate(true));
+                ui.add_space(8.0);
+                if ui::button(ui, "Cancel", egui::vec2(90.0, 26.0), ui::Look::bordered(), theme::font(12.0), None).on_hover_text("Stop after this file. Nothing is removed; run the move again to carry on.").clicked() {
+                    stop = true;
+                }
+            });
+            if stop {
+                job.cancel();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if let Some(end) = finished {
+            let job = self.move_job.take();
+            let plan = job.map(|j| j.plan);
+            match (end, plan) {
+                (mover::Progress::Done(report), Some(plan)) => {
+                    let added = self.library.relocate(&plan.from, &plan.to, ctx);
+                    if let Some(parent) = plan.from.parent() {
+                        self.explorer.refresh(parent);
+                    }
+                    if let Some(parent) = plan.to.parent() {
+                        self.explorer.refresh(parent);
+                    }
+                    self.filmstrip.set_folder(Some(&plan.to));
+                    if let Some(open) = self.loaded.as_ref().map(|l| l.path.clone()) {
+                        if let Some(new) = mover::relocated(&open, &plan.from, &plan.to) {
+                            self.start_loading(new, ctx);
+                        }
+                    }
+                    let mut text = if report.renamed {
+                        format!("Moved to {} (renamed on the same drive).", plan.to.display())
+                    } else {
+                        format!("Moved to {}: {} files copied and checked{}.", plan.to.display(), report.copied, if report.skipped > 0 { format!(", {} already there", report.skipped) } else { String::new() })
+                    };
+                    if report.numbered > 0 {
+                        text.push_str(&format!(" {} files were given a number because their names were taken there.", report.numbered));
+                    }
+                    if added {
+                        text.push_str(" Its new place was added to the library.");
+                    }
+                    if report.recopied > 0 {
+                        text.push_str(&format!(" {} files changed during the move and were copied again, so the newest arrived.", report.recopied));
+                    }
+                    if !report.vanished.is_empty() {
+                        text.push_str(&format!(" {} files were deleted by something else before they could be moved.", report.vanished.len()));
+                    }
+                    if !report.left.is_empty() {
+                        text.push_str(&format!(" {} files that appeared during the move were left in the old folder.", report.left.len()));
+                    }
+                    self.move_result = Some((text, true));
+                }
+                (mover::Progress::Failed(e), _) => self.move_result = Some((format!("{e} Nothing was removed from the original folder."), false)),
+                _ => {}
+            }
+        }
+        if let Some((text, ok)) = self.move_result.clone() {
+            let mut close = false;
+            egui::Window::new(if ok { "Folder moved" } else { "Move stopped" }).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(text);
+                ui.add_space(8.0);
+                if ui::button(ui, "OK", egui::vec2(80.0, 26.0), ui::Look::primary(), theme::font(12.5), None).clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                self.move_result = None;
+            }
+        }
+    }
+
     /// Closing the window while faces are still being read asks first. Quitting keeps what is
     /// done; the rest is read the next time Develop opens.
     fn quit_guard(&mut self, ctx: &egui::Context) {
@@ -5991,6 +6196,9 @@ impl App {
                     LeftTab::Folders => {
                         self.explorer.library = self.library.folders().to_vec();
                         folder = self.explorer.show(ui, self.filmstrip.dir());
+                        if let Some(folder) = self.explorer.move_request.take() {
+                            self.ask_move(folder);
+                        }
                         if let Some((f, add)) = self.explorer.library_change.take() {
                             if add {
                                 self.library.add_folder(f, ui.ctx());
@@ -6124,6 +6332,7 @@ impl App {
             self.export_open = true;
         }
         self.export_window(ctx);
+        self.move_windows(ctx);
         self.poll_export(ctx);
         self.advance_batch(ctx);
         if self.remember && !ctx.input(|i| i.pointer.any_down()) {

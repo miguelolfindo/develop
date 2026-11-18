@@ -32,6 +32,8 @@ pub struct Explorer {
     /// add to or take out of the library with the right-click menu (taken by the app).
     pub library: Vec<PathBuf>,
     pub library_change: Option<(PathBuf, bool)>,
+    /// A folder the user asked to move (Move to…), taken by the app.
+    pub move_request: Option<PathBuf>,
     roots: Vec<PathBuf>,
     /// Sub-entries of each entry opened so far.
     children: HashMap<PathBuf, Vec<PathBuf>>,
@@ -165,6 +167,7 @@ impl Explorer {
         Self {
             library: Vec::new(),
             library_change: None,
+            move_request: None,
             roots,
             children: HashMap::new(),
             labels: labels.into_iter().collect(),
@@ -192,6 +195,11 @@ impl Explorer {
     }
 
     /// Read `path` again next time it is shown.
+    /// Read `path`'s subfolders again (after a folder was moved in or out of it).
+    pub fn refresh(&mut self, path: &Path) {
+        self.forget(path);
+    }
+
     fn forget(&mut self, path: &Path) {
         self.children.remove(path);
         self.errors.remove(path);
@@ -418,6 +426,10 @@ impl Explorer {
             let mut change = None;
             response.context_menu(|ui| {
                 if let Some(f) = &folder {
+                    if f.parent().is_some() && ui.button("Move to…").on_hover_text("Move this folder, with everything in it, somewhere else: every file is copied and checked before the original is removed").clicked() {
+                        self.move_request = Some(f.clone());
+                        ui.close_menu();
+                    }
                     let (text, add) = if in_library { ("Remove from Library", false) } else { ("Add to Library", true) };
                     if ui.button(text).on_hover_text("The library is the folders searched together, with their faces and keywords (Faces & Metadata)").clicked() {
                         change = Some((f.clone(), add));

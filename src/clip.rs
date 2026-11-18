@@ -439,6 +439,16 @@ impl Pictures {
         self.changed |= self.map.len() != before;
     }
 
+    /// A folder was moved from `from` to `to`: its photos are there now.
+    pub fn relocate(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        for (photo, _, _) in self.map.values_mut() {
+            if let Some(p) = crate::mover::relocated(photo, from, to) {
+                *photo = p;
+                self.changed = true;
+            }
+        }
+    }
+
     /// Every photo with its numbers, by where it was last seen.
     pub fn all(&self) -> Vec<(std::path::PathBuf, Vec<f32>)> {
         self.map.values().map(|(p, _, e)| (p.clone(), e.clone())).collect()
