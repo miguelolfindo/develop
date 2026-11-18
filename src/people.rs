@@ -57,11 +57,30 @@ pub struct People {
     /// place first, then each shared library; see store.rs).
     face_files: Vec<crate::store::Files>,
     people_files: Vec<crate::store::Files>,
+    /// The People list and each person's best face, worked out once for the state they were
+    /// worked out from (see `generation`): with tens of thousands of faces, working them out
+    /// takes a while, and the window asks for them on every frame.
+    cache: std::cell::RefCell<Option<Summary>>,
+}
+
+/// One entry of the People list: id, name, photos, the face that stands for them.
+pub type ListEntry = (u32, Option<String>, usize, Option<(String, u8)>);
+
+struct Summary {
+    generation: u64,
+    /// When it was worked out, from how many faces, and the state of those faces and the
+    /// names then: while faces are being found, new ones alone don't make it worked out again
+    /// more than every couple of seconds.
+    made: std::time::Instant,
+    faces: usize,
+    core: u64,
+    list: Vec<ListEntry>,
+    best: std::collections::HashMap<u32, usize>,
 }
 
 impl Default for People {
     fn default() -> Self {
-        Self { faces: Vec::new(), people: Vec::new(), next_id: 0, seen: Default::default(), changed: false, face_files: vec![crate::store::Files::new("faces")], people_files: vec![crate::store::Files::new("people")] }
+        Self { faces: Vec::new(), people: Vec::new(), next_id: 0, seen: Default::default(), changed: false, face_files: vec![crate::store::Files::new("faces")], people_files: vec![crate::store::Files::new("people")], cache: Default::default() }
     }
 }
 
@@ -579,23 +598,114 @@ impl People {
 
     /// People to show: named ones first, then groups of at least two faces, largest first.
     /// Each with its number of photos and a face to show.
-    pub fn list(&self) -> Vec<(u32, Option<String>, usize, Option<(String, u8)>)> {
-        let mut out: Vec<(u32, Option<String>, usize, Option<(String, u8)>)> = self
+    /// Faces and person groups, for measuring.
+    pub fn sizes(&self) -> String {
+        format!("{} faces, {} person groups", self.faces.len(), self.people.len())
+    }
+
+    /// A number that changes whenever the faces, who they belong to, or the people do: cheap
+    /// (no face comparisons), so it can be checked on every frame.
+    pub fn generation(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |x: u64| {
+            h ^= x;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        mix(self.faces.len() as u64);
+        for f in &self.faces {
+            mix(f.person as u64 | (f.not.len() as u64) << 32);
+        }
+        mix(self.people.len() as u64);
+        for p in &self.people {
+            mix(p.id as u64);
+            mix(p.centre.first().map_or(0, |c| c.to_bits() as u64));
+            for b in p.name.as_deref().unwrap_or("").bytes() {
+                mix(b as u64);
+            }
+        }
+        h
+    }
+
+    /// Who the first `n` faces belong to, and the names: what the user changes.
+    fn core(&self, n: usize) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |x: u64| {
+            h ^= x;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        };
+        for f in self.faces.iter().take(n) {
+            mix(f.person as u64 | (f.not.len() as u64) << 32);
+        }
+        for p in self.people.iter().filter(|p| p.name.is_some()) {
+            mix(p.id as u64);
+            for b in p.name.as_deref().unwrap_or("").bytes() {
+                mix(b as u64);
+            }
+        }
+        h
+    }
+
+    fn summary(&self) -> std::cell::Ref<'_, Summary> {
+        let generation = self.generation();
+        let fresh = match self.cache.borrow().as_ref() {
+            None => false,
+            Some(s) if s.generation == generation => true,
+            // Only new faces since (being found now): good enough for a couple of seconds.
+            Some(s) => self.faces.len() > s.faces && s.made.elapsed() < std::time::Duration::from_secs(2) && self.core(s.faces) == s.core,
+        };
+        if !fresh {
+            *self.cache.borrow_mut() = Some(self.summarise(generation));
+        }
+        std::cell::Ref::map(self.cache.borrow(), |s| s.as_ref().expect("just made"))
+    }
+
+    /// The list and best faces, in one pass over the faces.
+    fn summarise(&self, generation: u64) -> Summary {
+        let centre: std::collections::HashMap<u32, &[f32]> = self.people.iter().map(|p| (p.id, p.centre.as_slice())).collect();
+        let mut photos: std::collections::HashMap<u32, Vec<&Path>> = std::collections::HashMap::new();
+        let mut best: std::collections::HashMap<u32, (usize, f32)> = std::collections::HashMap::new();
+        for (i, f) in self.faces.iter().enumerate() {
+            photos.entry(f.person).or_default().push(f.photo.as_path());
+            if let Some(c) = centre.get(&f.person) {
+                let s = crate::faces::similarity_of(&f.print, c);
+                let e = best.entry(f.person).or_insert((i, s));
+                if s > e.1 {
+                    *e = (i, s);
+                }
+            }
+        }
+        let mut list: Vec<ListEntry> = self
             .people
             .iter()
             .map(|p| {
-                let faces: Vec<&Face> = self.faces.iter().filter(|f| f.person == p.id).collect();
-                let mut photos: Vec<&Path> = faces.iter().map(|f| f.photo.as_path()).collect();
-                photos.sort();
-                photos.dedup();
-                // The face most like the person's centre stands for them.
-                let face = faces.iter().max_by(|a, b| crate::faces::similarity_of(&a.print, &p.centre).total_cmp(&crate::faces::similarity_of(&b.print, &p.centre))).map(|f| (f.key.clone(), f.n));
-                (p.id, p.name.clone(), photos.len(), face)
+                let count = photos.get_mut(&p.id).map_or(0, |v| {
+                    v.sort();
+                    v.dedup();
+                    v.len()
+                });
+                let face = best.get(&p.id).map(|&(i, _)| (self.faces[i].key.clone(), self.faces[i].n));
+                (p.id, p.name.clone(), count, face)
             })
             .filter(|(_, name, count, _)| name.is_some() || *count >= 2)
             .collect();
-        out.sort_by(|a, b| b.1.is_some().cmp(&a.1.is_some()).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-        out
+        list.sort_by(|a, b| b.1.is_some().cmp(&a.1.is_some()).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+        Summary { generation, made: std::time::Instant::now(), faces: self.faces.len(), core: self.core(self.faces.len()), list, best: best.into_iter().map(|(id, (i, _))| (id, i)).collect() }
+    }
+
+    /// The People list: named people first, then groups by how many photos they are in.
+    pub fn list(&self) -> Vec<ListEntry> {
+        self.summary().list.clone()
+    }
+
+    /// The generation the People list shown now was worked out for (it may lag new faces by
+    /// a couple of seconds while faces are being found): for keeping other views in step.
+    pub fn shown_generation(&self) -> u64 {
+        self.summary().generation
+    }
+
+    /// Whether anyone is in the People list.
+    pub fn list_is_empty(&self) -> bool {
+        self.summary().list.is_empty()
     }
 
     /// The photos a person is in, by capture order of their paths.
@@ -783,8 +893,8 @@ impl People {
 
     /// The face that stands for a person: the one most like their average.
     pub fn best_face(&self, id: u32) -> Option<Face> {
-        let p = self.people.iter().find(|p| p.id == id)?;
-        self.faces.iter().filter(|f| f.person == id).max_by(|a, b| crate::faces::similarity_of(&a.print, &p.centre).total_cmp(&crate::faces::similarity_of(&b.print, &p.centre))).cloned()
+        let i = *self.summary().best.get(&id)?;
+        self.faces.get(i).cloned()
     }
 
     /// Faces elsewhere that look somewhat like person `id` but not enough to have joined them:

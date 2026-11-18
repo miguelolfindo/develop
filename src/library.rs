@@ -16,6 +16,38 @@ use eframe::egui;
 /// Set while a folder is being moved: finding faces and reading content wait, so the move
 /// (which reads the same photos) goes faster alone.
 pub static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Paused by the user (remembered: a `faces-paused` file in the settings folder), until they
+/// resume it.
+static USER_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn paused_file() -> Option<PathBuf> {
+    crate::settings::settings_dir().map(|d| d.join("faces-paused"))
+}
+
+/// Whether finding faces is paused by the user.
+pub fn user_paused() -> bool {
+    USER_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pause or resume finding faces and reading content, and remember it for the next start.
+pub fn set_user_paused(paused: bool) {
+    USER_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+    if let Some(file) = paused_file() {
+        if paused {
+            if let Some(dir) = file.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&file, "");
+        } else {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+}
+
+/// Whether reading waits now (the user paused it, or a folder is being moved).
+pub fn waiting() -> bool {
+    user_paused() || PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// How often the library is checked for changes while Develop is open.
 const RECHECK: Duration = Duration::from_secs(10 * 60);
@@ -144,6 +176,7 @@ pub fn matches(query: &str, e: &Entry) -> bool {
 
 impl Library {
     pub fn load() -> Self {
+        USER_PAUSED.store(paused_file().is_some_and(|f| f.is_file()), std::sync::atomic::Ordering::Relaxed);
         let folders: Vec<PathBuf> = folders_file()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect())
@@ -423,9 +456,16 @@ impl Library {
                     }
                 }
                 if (!faces_known || !clip_known) && mine {
-                    // Wait while a folder is being moved (see PAUSED).
-                    while PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(500));
+                    // Wait while paused (by the user, or while a folder is moved); the time spent
+                    // waiting doesn't count towards the estimate of the time left.
+                    if waiting() {
+                        let since = Instant::now();
+                        while waiting() {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        if let Ok(mut s) = shared.lock() {
+                            s.read_started = s.read_started.map(|t| t + since.elapsed());
+                        }
                     }
                     // One preview for both.
                     let pic = crate::filmstrip::preview(&photo, 1600);

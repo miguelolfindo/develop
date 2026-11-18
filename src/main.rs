@@ -54,6 +54,10 @@ use color::{CameraColor, KELVIN_DEFAULT, KELVIN_MAX, KELVIN_MIN};
 use pipeline::{ImageCallback, ImageRenderer, Uniforms};
 use raw::DecodedImage;
 
+/// The person page: their faces, the face that stands for them, their name, named people who
+/// look like them, possible matches, and every other name.
+type PersonViewData = (Vec<people::Face>, Option<people::Face>, Option<String>, Vec<String>, Vec<(people::Face, f32)>, Vec<String>);
+
 /// With DEVELOP_TIMING set to a file, note how long `what` took (for measuring slow folders).
 pub fn timing(what: &str, since: std::time::Instant) {
     if let Some(file) = std::env::var_os("DEVELOP_TIMING") {
@@ -138,6 +142,80 @@ fn main() -> eframe::Result<()> {
     }
     // Diagnostic: `app --dump-clip "<phrase>" <photos...>`: the CLIP models' inputs and outputs,
     // the phrase's tokens, and for each photo its suggested keywords and its score for the phrase.
+    // `--ai-bench <folder> <out>`: how long finding faces and reading content takes per photo
+    // (DEVELOP_BENCH_N photos), and what it found.
+    if args.len() >= 4 && args[1] == "--ai-bench" {
+        let n = std::env::var("DEVELOP_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let mut photos: Vec<PathBuf> = std::fs::read_dir(&args[2]).map(|d| d.flatten().map(|e| e.path()).filter(|p| filmstrip::is_supported(p)).collect()).unwrap_or_default();
+        photos.sort();
+        photos.truncate(n);
+        let mut out = String::new();
+        let (mut t_pre, mut t_faces, mut t_clip) = (0.0f64, 0.0f64, 0.0f64);
+        for (i, photo) in photos.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let Some(pic) = filmstrip::preview(photo, 1600) else { continue };
+            let pre = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let found = people::find_faces_in(&pic, &format!("bench|{i}"));
+            let faces = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let clip = clip::image_embedding(&pic).unwrap_or_default();
+            let cl = t.elapsed().as_secs_f64();
+            // The first photo also loads the models: not counted.
+            if i > 0 {
+                t_pre += pre;
+                t_faces += faces;
+                t_clip += cl;
+            }
+            let boxes: Vec<String> = found.iter().map(|(_, b, p)| format!("{:.3},{:.3},{:.3},{:.3}:{}", b[0], b[1], b[2], b[3], p.iter().map(|x| format!("{x:.5}")).collect::<Vec<_>>().join(","))).collect();
+            out.push_str(&format!("{}	{:.3}	{:.3}	{:.3}	{}	{}	{}
+", photo.file_name().unwrap_or_default().to_string_lossy(), pre, faces, cl, found.len(), boxes.join(" "), clip.iter().map(|x| format!("{x:.5}")).collect::<Vec<_>>().join(",")));
+        }
+        let m = (photos.len().max(2) - 1) as f64;
+        out.push_str(&format!("average per photo (after the first): preview {:.3} s, faces {:.3} s, content {:.3} s
+", t_pre / m, t_faces / m, t_clip / m));
+        let _ = std::fs::write(&args[3], out);
+        return Ok(());
+    }
+    // `--people-bench <out>`: how long the People list takes to work out for this library.
+    if args.len() >= 3 && args[1] == "--people-bench" {
+        let t = std::time::Instant::now();
+        let p = people::People::load();
+        let mut out = format!("load {:.3} s
+", t.elapsed().as_secs_f64());
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let list = p.list();
+            out.push_str(&format!("list {:.3} s ({} shown)
+", t.elapsed().as_secs_f64(), list.len()));
+        }
+        let t = std::time::Instant::now();
+        let g = p.generation();
+        out.push_str(&format!("generation check {:.4} s ({g})
+", t.elapsed().as_secs_f64()));
+        let t = std::time::Instant::now();
+        let ids: Vec<u32> = p.list().iter().take(40).map(|e| e.0).collect();
+        for id in &ids {
+            let _ = p.best_face(*id);
+        }
+        out.push_str(&format!("40 best faces {:.4} s
+", t.elapsed().as_secs_f64()));
+        if let Some(id) = ids.first() {
+            let t = std::time::Instant::now();
+            let m = p.maybe(*id);
+            out.push_str(&format!("possible matches for the first person {:.3} s ({})
+", t.elapsed().as_secs_f64(), m.len()));
+        }
+        out.push_str(&format!("{}
+", p.sizes()));
+        let mut p = p;
+        let t = std::time::Instant::now();
+        p.save_all();
+        out.push_str(&format!("save everything {:.3} s
+", t.elapsed().as_secs_f64()));
+        let _ = std::fs::write(&args[2], out);
+        return Ok(());
+    }
     // `--models-match <models.tsv> <out>`: whether the small update would be used here.
     if args.len() >= 4 && args[1] == "--models-match" {
         let list = std::fs::read_to_string(&args[2]).unwrap_or_default();
@@ -888,6 +966,9 @@ struct App {
     move_progress: (u64, u64, String),
     /// Before copying: files checked against the destination, of all.
     move_check: Option<(usize, usize)>,
+    /// The person page's faces, possible matches and names, for the people library as it was
+    /// (its generation) and that person: worked out once, not on every frame.
+    person_view_data: Option<(u64, u32, std::rc::Rc<PersonViewData>)>,
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
@@ -1137,6 +1218,7 @@ impl App {
             move_job: None,
             move_progress: (0, 0, String::new()),
             move_check: None,
+            person_view_data: None,
             move_result: None,
             quit_asked: false,
             quit_ok: false,
@@ -4097,16 +4179,36 @@ impl App {
                 });
                 // Faces being read in the background: visible from any tab; click to see them.
                 if let Some((read, total, _)) = self.library.reading() {
-                    let paused = library::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
-                    let text = if paused { format!("Finding faces paused while moving  {read} of {total}") } else { format!("Finding faces  {read} of {total}") };
-                    let r = ui::pill(ui, theme::tint(theme::ACCENT, 0.10), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.45)), 5.0, egui::Margin::symmetric(8.0, 2.0), |ui| {
+                    let moving = library::PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+                    let paused = library::user_paused();
+                    let text = if paused {
+                        format!("Finding faces paused  {read} of {total}")
+                    } else if moving {
+                        format!("Finding faces paused while moving  {read} of {total}")
+                    } else {
+                        format!("Finding faces  {read} of {total}")
+                    };
+                    let mut toggle = false;
+                    ui::pill(ui, theme::tint(theme::ACCENT, 0.10), egui::Stroke::new(1.0_f32, theme::tint(theme::ACCENT, 0.45)), 5.0, egui::Margin::symmetric(8.0, 2.0), |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
+                            if !paused && !moving {
+                                ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
+                            }
                             ui.label(egui::RichText::new(text).font(theme::mono(11.5)).color(theme::ACCENT));
+                            let (word, tip) = if paused {
+                                ("Resume", "Carry on finding faces and reading what is in the photos")
+                            } else {
+                                ("Pause", "Stop finding faces for now; what is done is kept. Stays paused until you resume it, also after closing Develop.")
+                            };
+                            if ui.add(egui::Button::new(egui::RichText::new(word).font(theme::bold(11.5)).color(theme::ACCENT)).frame(false)).on_hover_text(tip).clicked() {
+                                toggle = true;
+                            }
                         });
                     });
-                    let _ = r;
+                    if toggle {
+                        library::set_user_paused(!paused);
+                    }
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
                 } else if ui.available_width() > 330.0 {
                     ui.label(ui::dim("Double-click label to reset • Drag canvas to pan", 11.5));
@@ -4367,16 +4469,30 @@ impl App {
             ui::section(ui, "Keywords", true, "Words to find photos by: type and press Enter to add (commas for several), click × to remove one. With several photos selected, changes apply to all of them.", |ui| self.keywords_panel(ui));
             ui.add_space(6.0);
             if let Some((read, total, left)) = self.library.reading() {
-                ui.label(egui::RichText::new("Finding faces and reading content").font(theme::font(12.0)).color(theme::TEXT));
+                let paused = library::user_paused();
+                ui.horizontal(|ui| {
+                    let title = if paused { "Finding faces: paused" } else { "Finding faces and reading content" };
+                    ui.label(egui::RichText::new(title).font(theme::font(12.0)).color(theme::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let word = if paused { "Resume" } else { "Pause" };
+                        if ui::button(ui, word, egui::vec2(64.0, 20.0), ui::Look::bordered(), theme::font(11.5), None)
+                            .on_hover_text("Finding faces can take a long time on a big library. Paused, it stays paused (also after closing Develop) until you resume it; what is done is kept.")
+                            .clicked()
+                        {
+                            library::set_user_paused(!paused);
+                        }
+                    });
+                });
                 ui.add_space(3.0);
-                ui.add(egui::ProgressBar::new(read as f32 / total.max(1) as f32).desired_height(8.0).fill(theme::TEAL));
+                ui.add(egui::ProgressBar::new(read as f32 / total.max(1) as f32).desired_height(8.0).fill(if paused { theme::FADED } else { theme::TEAL }));
                 ui.add_space(2.0);
-                ui.label(ui::dim(&format!("{read} of {total} new photos  •  {} left", time_left(left)), 11.0));
+                let note = if paused { format!("{read} of {total} new photos  •  paused") } else { format!("{read} of {total} new photos  •  {} left", time_left(left)) };
+                ui.label(ui::dim(&note, 11.0));
                 ui.add_space(8.0);
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui::section(ui, "People", true, "Faces found across the library, grouped into people: click one to see and name them", |ui| {
-                if self.library.people.lock().map(|p| p.list().is_empty()).unwrap_or(true) {
+                if self.library.people.lock().map(|p| p.list_is_empty()).unwrap_or(true) {
                     ui.label(ui::dim("Faces found in the library's photos are grouped here, for you to name.", 11.5));
                 } else {
                     self.people_list(ui);
@@ -4866,7 +4982,7 @@ impl App {
     /// Closing the window while faces are still being read asks first. Quitting keeps what is
     /// done; the rest is read the next time Develop opens.
     fn quit_guard(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && self.library.reading().is_some() {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && self.library.reading().is_some() && !library::user_paused() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_asked = true;
         }
@@ -5131,15 +5247,24 @@ impl App {
     fn person_view_ui(&mut self, ui: &mut egui::Ui) {
         self.people_pictures.poll(ui.ctx());
         let Some(id) = self.person_view else { return };
-        let Some((faces, best, name, others, maybe, all_names)) = self.library.people.lock().ok().map(|p| {
-            // Only named people who look somewhat like them.
-            let others = p.similar_named(id);
-            // Every other name, for completing what is typed.
-            let all: Vec<String> = p.list().into_iter().filter(|(i, ..)| *i != id).filter_map(|(_, n, ..)| n).collect();
-            (p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id), all)
+        let Some(data) = self.library.people.lock().ok().map(|p| {
+            let generation = p.shown_generation();
+            match &self.person_view_data {
+                Some((g, i, data)) if *g == generation && *i == id => data.clone(),
+                _ => {
+                    // Only named people who look somewhat like them.
+                    let others = p.similar_named(id);
+                    // Every other name, for completing what is typed.
+                    let all: Vec<String> = p.list().into_iter().filter(|(i, ..)| *i != id).filter_map(|(_, n, ..)| n).collect();
+                    let data = std::rc::Rc::new((p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id), all));
+                    self.person_view_data = Some((generation, id, data.clone()));
+                    data
+                }
+            }
         }) else {
             return;
         };
+        let (faces, best, name, others, maybe, all_names) = (*data).clone();
         if faces.is_empty() {
             self.person_view = None;
             return;
@@ -6320,7 +6445,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // DEVELOP_FRAMES=<file>: note every frame, how long it took (for measuring stutter).
+        let start = std::time::Instant::now();
         self.frame(ctx);
+        if let Some(file) = std::env::var_os("DEVELOP_FRAMES") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+                let _ = writeln!(f, "{:.1}", start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
     }
 }
 

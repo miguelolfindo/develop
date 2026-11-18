@@ -1667,8 +1667,35 @@ fn thumbnail(path: &Path) -> Option<egui::ColorImage> {
     decoder_preview(path).map(finish)
 }
 
+/// The width and height a JPEG says it has, from its frame header (no decoding).
+fn jpeg_size(head: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2;
+    while i + 9 < head.len() {
+        if head[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = head[i + 1];
+        // Start of frame (baseline, progressive...), not DHT (C4), JPG (C8) or DAC (CC).
+        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+            let h = u16::from_be_bytes([head[i + 5], head[i + 6]]) as u32;
+            let w = u16::from_be_bytes([head[i + 7], head[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) || marker == 0xFF {
+            i += if marker == 0xFF { 1 } else { 2 };
+            continue;
+        }
+        let len = u16::from_be_bytes([head[i + 2], head[i + 3]]) as usize;
+        i += 2 + len;
+    }
+    None
+}
+
 /// A picture of the photo for analysis (faces, content), long side at most `max_side`, upright:
-/// the largest preview inside a raw file, or the picture itself. Fast: no raw decoding.
+/// the smallest preview inside a raw file that is still at least that big (many raw files hold
+/// a full-size one too, which takes ten times as long to decode), or the picture itself. Fast:
+/// no raw decoding.
 pub fn preview(path: &Path, max_side: u32) -> Option<image::RgbImage> {
     let info = tiff_info(path);
     let orientation = info.as_ref().map_or(1, |i| i.orientation);
@@ -1677,9 +1704,23 @@ pub fn preview(path: &Path, max_side: u32) -> Option<image::RgbImage> {
         return crate::heic::open_picture(path).ok().map(finish);
     }
     let mut file = File::open(path).ok()?;
-    let mut jpegs = info?.jpegs;
-    jpegs.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
-    for (offset, len) in jpegs {
+    // Each preview's size, from the start of its header.
+    let mut sized: Vec<(u64, u64, Option<(u32, u32)>)> = info?
+        .jpegs
+        .into_iter()
+        .map(|(offset, len)| {
+            let mut head = vec![0u8; (len as usize).min(64 * 1024)];
+            let size = (file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(&mut head).is_ok()).then(|| jpeg_size(&head)).flatten();
+            (offset, len, size)
+        })
+        .collect();
+    // Big enough ones first, smallest of those first; then the rest, largest first.
+    let big_enough = |s: &Option<(u32, u32)>| s.is_some_and(|(w, h)| w.max(h) >= max_side);
+    sized.sort_by_key(|(_, len, size)| {
+        let area = size.map_or(*len, |(w, h)| w as u64 * h as u64);
+        if big_enough(size) { (0, area) } else { (1, u64::MAX - area) }
+    });
+    for (offset, len, _) in sized {
         let mut bytes = vec![0u8; len as usize];
         if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut bytes).is_err() {
             continue;
