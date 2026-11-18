@@ -29,7 +29,8 @@ pub struct Saved {
     pub crop: [f32; 4],
     pub angle: f32,
     /// Sharpening: amount, radius, detail, masking.
-    pub sharpen: [f32; 4],
+    /// Sharpening (amount, radius, detail, masking), then noise reduction (luminance, color).
+    pub sharpen: [f32; 10],
     /// Tint relative to the as-shot white balance: negative = greener, positive = more magenta.
     pub tint: f32,
     /// Texture, clarity, dehaze (-100..100).
@@ -67,7 +68,10 @@ pub fn now_seconds() -> u64 {
 }
 
 /// Sharpening a photo starts with (Lightroom's defaults for raw files).
-pub const SHARPEN_DEFAULT: [f32; 4] = [40.0, 1.0, 25.0, 0.0];
+/// Sharpening (amount, radius, detail, masking), then noise reduction: luminance, color,
+/// luminance detail, luminance contrast, color detail, color smoothness (as Lightroom's Manual
+/// Noise Reduction).
+pub const SHARPEN_DEFAULT: [f32; 10] = [40.0, 1.0, 25.0, 0.0, 0.0, 0.0, 50.0, 0.0, 50.0, 50.0];
 
 pub struct Store {
     /// The central file. It only holds photos whose folder cannot take a sidecar, and
@@ -177,7 +181,7 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     };
     let angle = number().unwrap_or(0.0).clamp(-45.0, 45.0);
     let sharpen = match (number(), number(), number(), number()) {
-        (Some(a), Some(r), Some(d), Some(m)) => [a.clamp(0.0, 150.0), r.clamp(0.5, 3.0), d.clamp(0.0, 100.0), m.clamp(0.0, 100.0)],
+        (Some(a), Some(r), Some(d), Some(m)) => [a.clamp(0.0, 150.0), r.clamp(0.5, 3.0), d.clamp(0.0, 100.0), m.clamp(0.0, 100.0), 0.0, 0.0, 50.0, 0.0, 50.0, 50.0],
         _ => SHARPEN_DEFAULT,
     };
     let tint = number().unwrap_or(0.0).clamp(-150.0, 150.0);
@@ -190,6 +194,12 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     let hsl = std::array::from_fn(|k| std::array::from_fn(|i| hsl_flat[k * 8 + i]));
     let mono = fields.next() == Some("1");
     let mono_mix = fields.next().map(|f| crate::tone::numbers_from_field::<8>(f, -100.0, 100.0)).unwrap_or_default();
+    // Noise reduction, at the end of the line (added later: older lines have none, and an
+    // older Develop ignores it).
+    let mut sharpen = sharpen;
+    for (i, value) in sharpen.iter_mut().enumerate().skip(4) {
+        *value = fields.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(SHARPEN_DEFAULT[i]).clamp(0.0, 100.0);
+    }
     Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix }))
 }
 
@@ -243,7 +253,7 @@ const SIDECAR_HEADER: &str = "Develop settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -267,7 +277,13 @@ fn saved_fields(s: &Saved) -> String {
         crate::tone::numbers_to_field(&s.regions),
         crate::tone::numbers_to_field(&s.hsl.concat()),
         s.mono as u8,
-        crate::tone::numbers_to_field(&s.mono_mix)
+        crate::tone::numbers_to_field(&s.mono_mix),
+        s.sharpen[4],
+        s.sharpen[5],
+        s.sharpen[6],
+        s.sharpen[7],
+        s.sharpen[8],
+        s.sharpen[9]
     )
 }
 

@@ -29,6 +29,10 @@ pub struct Uniforms {
     pub crop: [f32; 4],
     /// Sharpening: strength, radius in pixels, halo limit, masking threshold.
     pub sharpen: [f32; 4],
+    /// Noise reduction: x = luminance, y = colour, z = luminance detail, w = luminance
+    /// contrast; noise2: x = colour detail, y = colour smoothness (all 0..1).
+    pub noise: [f32; 4],
+    pub noise2: [f32; 4],
     /// x = input mode: 0 Bayer raw, 1 linear raw (already RGB), 2 finished picture.
     pub input: [f32; 4],
     /// Texture, clarity, dehaze (-1..1).

@@ -920,7 +920,8 @@ struct App {
     /// (rotating shrinks the real one to fit; rotating back restores this), and the
     /// straighten angle in degrees.
     /// Sharpening: amount (0-150), radius (px), detail (0-100), masking (0-100).
-    sharpen: [f32; 4],
+    /// Sharpening (amount, radius, detail, masking), then noise reduction (luminance, color).
+    sharpen: [f32; 10],
     /// Tint, -150 (green) to +150 (magenta), relative to the as-shot white balance.
     tint: f32,
     /// Strength per unit of Amount; fitted to Lightroom exports (`--sharpen-scale` overrides).
@@ -1605,6 +1606,12 @@ impl App {
                         "--sharpen-radius" => self.sharpen[1] = value.clamp(0.5, 3.0),
                         "--sharpen-detail" => self.sharpen[2] = value.clamp(0.0, 100.0),
                         "--sharpen-masking" => self.sharpen[3] = value.clamp(0.0, 100.0),
+                        "--noise-luminance" => self.sharpen[4] = value.clamp(0.0, 100.0),
+                        "--noise-color" => self.sharpen[5] = value.clamp(0.0, 100.0),
+                        "--noise-luminance-detail" => self.sharpen[6] = value.clamp(0.0, 100.0),
+                        "--noise-luminance-contrast" => self.sharpen[7] = value.clamp(0.0, 100.0),
+                        "--noise-color-detail" => self.sharpen[8] = value.clamp(0.0, 100.0),
+                        "--noise-color-smoothness" => self.sharpen[9] = value.clamp(0.0, 100.0),
                         "--sharpen-scale" => self.sharpen_scale = value,
                         "--angle" => self.angle = value.clamp(-45.0, 45.0),
                         "--crop-l" => self.crop[0] = value,
@@ -2150,7 +2157,7 @@ impl App {
             return;
         }
         let (w, h) = if loaded.width >= loaded.height { (192, ((192.0 * loaded.height / loaded.width.max(1.0)) as u32).max(16)) } else { (((192.0 * loaded.width / loaded.height.max(1.0)) as u32).max(16), 192) };
-        let uniforms = self.uniforms_with(loaded, [1.0, 1.0, 0.5, 0.5], true, &blank, self.tint, [0.0, 1.0, 0.0, 0.0], [0.0; 3], &self.lens);
+        let uniforms = self.uniforms_with(loaded, [1.0, 1.0, 0.5, 0.5], true, &blank, self.tint, [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 50.0, 0.0, 50.0, 50.0], [0.0; 3], &self.lens);
         let rendered = {
             let rs = &self.render_state;
             let renderer = rs.renderer.read();
@@ -2204,7 +2211,7 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn uniforms_with(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool, a: &Adjust, tint: f32, sharpen: [f32; 4], presence: [f32; 3], lens_settings: &lens::LensSettings) -> Uniforms {
+    fn uniforms_with(&self, loaded: &Loaded, view: [f32; 4], shader_encodes_srgb: bool, a: &Adjust, tint: f32, sharpen: [f32; 10], presence: [f32; 3], lens_settings: &lens::LensSettings) -> Uniforms {
         // Lenses whose distortion correction Lightroom always applies get it here too.
         let builtin;
         let lens_settings = if !lens_settings.enabled && self.builtin_distortion(loaded) {
@@ -2299,8 +2306,10 @@ impl App {
                 let inv = color::invert(&render.work_to_srgb).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
                 rows(&inv)
             },
+            noise: [sharpen[4] * 0.01, sharpen[5] * 0.01, sharpen[6] * 0.01, sharpen[7] * 0.01],
+            noise2: [sharpen[8] * 0.01, sharpen[9] * 0.01, 0.0, 0.0],
             sharpen: {
-                let [amount, radius, detail, masking] = sharpen;
+                let [amount, radius, detail, masking, ..] = sharpen;
                 [
                     // Slightly less than proportional at the top, as measured.
                     amount * (1.0 - 0.0005 * amount) * self.sharpen_scale,
@@ -5761,12 +5770,30 @@ impl App {
                 ui.label(ui::dim("Model files not found (models/rawnind_bayer.onnx, rawnind_linear.onnx).", 11.5));
             }
             ui.add_space(8.0);
-            let [amount, radius, detail, masking] = &mut self.sharpen;
+            let [amount, radius, detail, masking, luminance, colour, lum_detail, lum_contrast, colour_detail, smoothness] = &mut self.sharpen;
             let defaults = settings::SHARPEN_DEFAULT;
             ui::pro_slider(ui, "Sharpening", amount, 0.0..=150.0, defaults[0], "", amber);
             ui::pro_slider_with(ui, "Radius", radius, 0.5..=3.0, defaults[1], " px", amber, 1, 0.1, true);
             ui::pro_slider(ui, "Detail", detail, 0.0..=100.0, defaults[2], "", amber);
             ui::pro_slider(ui, "Masking", masking, 0.0..=100.0, defaults[3], "", amber);
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Noise Reduction").font(theme::font(12.0)).color(theme::TEXT_HEADER))
+                .on_hover_text("Works on every photo, JPEGs and other pictures included (AI Denoise is for raw files).");
+            ui::pro_slider(ui, "Luminance", luminance, 0.0..=100.0, defaults[4], "", amber);
+            // As in Lightroom, each slider's Detail / Contrast / Smoothness only acts (and is only
+            // enabled) once its amount is above 0.
+            let lum_on = *luminance > 0.0;
+            ui.add_enabled_ui(lum_on, |ui| {
+                ui::pro_slider(ui, "Detail", lum_detail, 0.0..=100.0, defaults[6], "", amber);
+                ui::pro_slider(ui, "Contrast", lum_contrast, 0.0..=100.0, defaults[7], "", amber);
+            });
+            ui.add_space(4.0);
+            ui::pro_slider(ui, "Color", colour, 0.0..=100.0, defaults[5], "", amber);
+            let colour_on = *colour > 0.0;
+            ui.add_enabled_ui(colour_on, |ui| {
+                ui::pro_slider(ui, "Detail", colour_detail, 0.0..=100.0, defaults[8], "", amber);
+                ui::pro_slider(ui, "Smoothness", smoothness, 0.0..=100.0, defaults[9], "", amber);
+            });
         });
 
         ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));

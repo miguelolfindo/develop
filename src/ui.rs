@@ -12,7 +12,7 @@ use crate::theme::{self, ACCENT, ELEVATED, FADED, TEAL, TEXT, TEXT_BRIGHT, TEXT_
 // ---------------------------------------------------------------------------------------
 
 /// The app's slider. Row 1: name on the left (double-click resets), value on the right
-/// (borderless; click to type, drag to nudge). Row 2: a thin dark track with the fill in
+/// (borderless; click to type, drag to nudge). Now on one row (see `pro_slider_with`): a thin dark track with the fill in
 /// `accent_color`, from the centre tick outward when the default sits inside the range
 /// (Exposure, Contrast, Tint...) and from the left edge otherwise (Sharpening...).
 /// Returns true when the value changed. Precision follows the size of the range.
@@ -20,7 +20,7 @@ pub fn pro_slider(ui: &mut Ui, label: &str, value: &mut f32, range: RangeInclusi
     let span = range.end() - range.start();
     let (decimals, step) = if span <= 20.0 {
         (2, 0.01)
-    } else if span <= 100.0 {
+    } else if span < 100.0 {
         (1, 0.1)
     } else {
         (0, 1.0)
@@ -46,48 +46,34 @@ pub fn pro_slider_with(
 ) -> bool {
     let before = *value;
     let (min, max) = (*range.start(), *range.end());
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
+    // One row, as in Lightroom: the name in a column on the left, the track in the middle, the
+    // value on the right. About half the height of a name-above-track slider, so more of the
+    // panel fits on a small screen.
+    const ROW: f32 = 22.0;
+    let enabled = ui.is_enabled();
+    let fade = |c: Color32| if enabled { c } else { c.linear_multiply(0.4) };
+    ui.horizontal(|ui| {
+        ui.set_height(ROW);
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let total = ui.available_width();
+        let label_w = (total * 0.30).clamp(62.0, 104.0);
+        let value_w = 46.0;
 
-        // Row 1: name and value.
-        ui.horizontal(|ui| {
-            ui.set_height(18.0);
-            let name = ui
-                .add(egui::Label::new(egui::RichText::new(label).font(theme::font(12.5)).color(TEXT)).sense(Sense::click()))
-                .on_hover_text("Double-click to reset");
-            if name.double_clicked() {
-                *value = default_val;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let widgets = &mut ui.visuals_mut().widgets;
-                widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-                widgets.inactive.bg_fill = Color32::TRANSPARENT;
-                for state in [&mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
-                    state.weak_bg_fill = ELEVATED;
-                    state.bg_fill = ELEVATED;
-                    state.rounding = Rounding::same(4.0);
-                }
-                ui.visuals_mut().extreme_bg_color = ELEVATED;
-                ui.visuals_mut().override_text_color = Some(TEXT_VALUE);
-                ui.style_mut().override_font_id = Some(theme::font(12.0));
-                ui.spacing_mut().button_padding = egui::vec2(5.0, 1.0);
-                ui.add(
-                    egui::DragValue::new(value)
-                        .speed(step as f64)
-                        .clamp_range(range.clone())
-                        .min_decimals(decimals)
-                        .max_decimals(decimals)
-                        // Always the same number of decimals, with a plus sign on the positive
-                        // side of sliders that go both ways.
-                        .custom_formatter(move |v, _| if min < 0.0 && v > 0.0 { format!("+{v:.decimals$}") } else { format!("{v:.decimals$}") })
-                        .suffix(suffix),
-                );
-            });
-        });
-        ui.add_space(4.0);
+        // The name: double-click to reset; cut with "…" if long (the whole name on hover).
+        let (name_rect, name) = ui.allocate_exact_size(egui::vec2(label_w, ROW), Sense::click());
+        let mut job = egui::text::LayoutJob::single_section(label.to_owned(), egui::TextFormat { font_id: theme::font(10.5), color: fade(TEXT), ..Default::default() });
+        job.wrap = egui::text::TextWrapping { max_width: label_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let cut = galley.size().x + 0.5 >= label_w;
+        ui.painter().galley(egui::pos2(name_rect.left(), name_rect.center().y - galley.size().y * 0.5), galley, fade(TEXT));
+        let name = name.on_hover_text(if cut { format!("{label}. Double-click to reset") } else { "Double-click to reset".to_owned() });
+        if name.double_clicked() {
+            *value = default_val;
+        }
 
-        // Row 2: the track.
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), Sense::click_and_drag());
+        // The track.
+        let track_w = (ui.available_width() - value_w - 6.0).max(30.0);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(track_w, ROW), Sense::click_and_drag());
         let (left, right) = (rect.left() + 5.0, rect.right() - 5.0);
         if response.double_clicked() {
             *value = default_val;
@@ -102,24 +88,51 @@ pub fn pro_slider_with(
         let y = rect.center().y;
         let painter = ui.painter();
         let track = Rect::from_min_max(egui::pos2(left, y - 1.75), egui::pos2(right, y + 1.75));
-        painter.rect_filled(track, 2.0, TRACK);
+        painter.rect_filled(track, 2.0, fade(TRACK));
         let thumb_x = x_of(*value);
         let epsilon = (max - min) * 1.0e-4;
         let bipolar = !from_left && default_val > min + epsilon && default_val < max - epsilon;
         let from = if bipolar { x_of(default_val) } else { left };
         if (thumb_x - from).abs() > 0.5 {
             let fill = Rect::from_min_max(egui::pos2(from.min(thumb_x), y - 1.75), egui::pos2(from.max(thumb_x), y + 1.75));
-            painter.rect_filled(fill, 2.0, accent_color);
+            painter.rect_filled(fill, 2.0, fade(accent_color));
         }
         if bipolar {
-            painter.line_segment([egui::pos2(from, y - 4.0), egui::pos2(from, y + 4.0)], Stroke::new(1.0_f32, Color32::from_white_alpha(70)));
+            painter.line_segment([egui::pos2(from, y - 4.0), egui::pos2(from, y + 4.0)], Stroke::new(1.0_f32, Color32::from_white_alpha(if enabled { 70 } else { 30 })));
         }
         let radius = if response.hovered() || response.dragged() { 5.75 } else { 5.0 };
         let centre = egui::pos2(thumb_x, y);
-        painter.circle_filled(centre + egui::vec2(0.0, 1.0), radius + 1.0, Color32::from_black_alpha(90));
-        painter.circle_filled(centre, radius, TEXT_BRIGHT);
-        ui.add_space(10.0);
+        painter.circle_filled(centre + egui::vec2(0.0, 1.0), radius + 1.0, Color32::from_black_alpha(if enabled { 90 } else { 30 }));
+        painter.circle_filled(centre, radius, fade(TEXT_BRIGHT));
+
+        // The value: click to type, drag to nudge.
+        ui.allocate_ui_with_layout(egui::vec2(value_w, ROW), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            for state in [&mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                state.weak_bg_fill = ELEVATED;
+                state.bg_fill = ELEVATED;
+                state.rounding = Rounding::same(4.0);
+            }
+            ui.visuals_mut().extreme_bg_color = ELEVATED;
+            ui.visuals_mut().override_text_color = Some(fade(TEXT_VALUE));
+            ui.style_mut().override_font_id = Some(theme::font(11.0));
+            ui.spacing_mut().button_padding = egui::vec2(4.0, 1.0);
+            ui.add(
+                egui::DragValue::new(value)
+                    .speed(step as f64)
+                    .clamp_range(range.clone())
+                    .min_decimals(decimals)
+                    .max_decimals(decimals)
+                    // Always the same number of decimals, with a plus sign on the positive side
+                    // of sliders that go both ways.
+                    .custom_formatter(move |v, _| if min < 0.0 && v > 0.0 { format!("+{v:.decimals$}") } else { format!("{v:.decimals$}") })
+                    .suffix(suffix),
+            );
+        });
     });
+    ui.add_space(2.0);
     *value != before
 }
 

@@ -40,6 +40,10 @@ struct Params {
     crop: vec4<f32>,
     // Sharpening: x = strength, y = radius in image pixels, z = halo limit, w = masking threshold.
     sharpen: vec4<f32>,
+    // Noise reduction: x = luminance, y = colour, z = luminance detail, w = luminance contrast;
+    // noise2: x = colour detail, y = colour smoothness (all 0..1).
+    noise: vec4<f32>,
+    noise2: vec4<f32>,
     // y = 1 to mark clipped highlights and crushed blacks (viewport only).
     // x = input mode. 0: demosaiced Bayer raw. 1: linear raw that was already RGB (linear DNG);
     // same pipeline, the file's baseline exposure is folded into `basic.x`. 2: a finished
@@ -501,6 +505,79 @@ fn heal_gain(i: i32, uv: vec2<f32>, off: vec2<f32>, r: f32, aspect: f32, height:
 // The stored picture at `uv`, with the spots healed or cloned in. Everything that reads the
 // picture goes through this, so later adjustments (sharpening, clarity, dehaze) see the
 // healed picture, not the original underneath.
+// Noise reduction.
+// Colour: the colour of a wide neighbourhood (a few pixels to several, with the slider),
+// brightness kept; neighbours of very different brightness count less, so colour does not
+// bleed across edges. Luminance: an edge-preserving average of brightness on a perceptual
+// (square-root) scale: neighbours of similar brightness are averaged in, those across an edge
+// are not; the reach and the brightness difference counted as noise both grow with the slider.
+// Applied as a gain, so colour is untouched by it.
+fn reduce_noise(cam_in: vec3<f32>, uv: vec2<f32>, footprint: f32, texels: vec2<f32>) -> vec3<f32> {
+    var cam = cam_in;
+    let w = vec3<f32>(0.25, 0.5, 0.25);
+    let lod = max(log2(footprint), 0.0);
+    let colour = params.noise.y;
+    if (colour > 0.0) {
+        let l = max(dot(cam, w), 1.0e-5);
+        // Smoothness: how wide the colour is averaged (blotches need a wide reach). Detail: how
+        // strictly neighbours must match in brightness, which keeps small coloured details.
+        let smoothness = params.noise2.y;
+        let colour_detail = params.noise2.x;
+        let clod = lod + 0.5 + (1.0 + 2.0 * smoothness) * colour;
+        let tolerance = 0.6 - 0.45 * colour_detail;
+        let cstep = exp2(clod) / texels;
+        var acc = vec3<f32>(0.0);
+        var total = 0.0;
+        for (var j = -1; j <= 1; j++) {
+            for (var i = -1; i <= 1; i++) {
+                let s = raw_at(uv + vec2<f32>(f32(i), f32(j)) * cstep, clod);
+                let ls = max(dot(s, w), 1.0e-5);
+                let d = log(ls / l);
+                let weight = exp(-d * d / (2.0 * tolerance * tolerance)) * select(1.0, 2.0, i == 0 && j == 0);
+                acc += s / ls * weight;
+                total += weight;
+            }
+        }
+        let ratio = acc / max(total, 1.0e-6);
+        cam = mix(cam, l * ratio, min(colour * 1.25, 1.0));
+    }
+    let luminance = params.noise.x;
+    if (luminance > 0.0) {
+        let size = exp2(lod);
+        let step = size * (1.0 + 1.5 * luminance) / texels;
+        let c = sqrt(max(dot(cam, w), 0.0));
+        // Brightness differences up to about this much (on the square-root scale) count as
+        // noise: from fine grain at low settings to heavy high-ISO grain at 100; real edges are
+        // usually far bigger and are kept.
+        // Detail: lower treats bigger differences as noise (smoother); higher keeps more.
+        let sigma = (0.006 + 0.13 * luminance) * (1.5 - params.noise.z);
+        var sum = c;
+        var total = 1.0;
+        for (var j = -2; j <= 2; j++) {
+            for (var i = -2; i <= 2; i++) {
+                if (i == 0 && j == 0) {
+                    continue;
+                }
+                let t = sqrt(max(dot(raw_at(uv + vec2<f32>(f32(i), f32(j)) * step, lod), w), 0.0));
+                let ds = f32(i * i + j * j);
+                let weight = exp(-ds / 4.5) * exp(-(t - c) * (t - c) / (2.0 * sigma * sigma));
+                sum += t * weight;
+                total += weight;
+            }
+        }
+        var evened = sum / total;
+        // Contrast: give back what the averaging flattened where it is bigger than the noise
+        // (texture, local contrast), leaving the small differences (the grain) smoothed.
+        let removed = c - evened;
+        let structure = smoothstep(sigma * 0.6, sigma * 2.0, abs(removed));
+        evened += removed * structure * params.noise.w;
+        let aim = mix(c, evened, min(luminance * 1.5, 1.0));
+        let gain = aim / max(c, 1.0e-4);
+        cam *= gain * gain;
+    }
+    return cam;
+}
+
 fn raw_at(uv: vec2<f32>, lod: f32) -> vec3<f32> {
     var c = textureSampleLevel(raw_texture, texture_sampler, uv, lod).rgb;
     let n = i32(params.spot_info.x);
@@ -935,7 +1012,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let texels = vec2<f32>(textureDimensions(raw_texture, 0));
     let footprint = max(length(dpdx(uv * texels)), length(dpdy(uv * texels)));
     let base_lod = max(log2(footprint), 0.0);
-    let cam = vec3<f32>(
+    var cam = vec3<f32>(
         raw_at(lens.r, base_lod).r,
         raw_at(uv, base_lod).g,
         raw_at(lens.b, base_lod).b,
@@ -951,6 +1028,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let LUMA = params.luma.xyz;
+
+    // 0. Noise reduction, on the picture as stored (before white balance), at the level of
+    // detail on screen.
+    if (params.noise.x > 0.0 || params.noise.y > 0.0) {
+        cam = reduce_noise(cam, uv, footprint, texels);
+    }
 
     // 1. White balance with highlight reconstruction, then into the working space.
     var color = to_work(balance(cam));

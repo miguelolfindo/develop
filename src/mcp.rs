@@ -1019,10 +1019,11 @@ curve is a list of [x, y] points 0..1; hsl_hue / hsl_saturation / hsl_luminance 
     ])
 }
 
-const SETTING_NAMES: [&str; 31] = [
+const SETTING_NAMES: [&str; 37] = [
     "temperature", "tint", "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
     "texture", "clarity", "dehaze", "vibrance", "saturation", "sharpening", "sharpen_radius",
-    "sharpen_detail", "sharpen_masking", "profile", "curve", "curve_highlights", "curve_lights",
+    "sharpen_detail", "sharpen_masking", "noise_luminance", "noise_luminance_detail",
+    "noise_luminance_contrast", "noise_color", "noise_color_detail", "noise_color_smoothness", "profile", "curve", "curve_highlights", "curve_lights",
     "curve_darks", "curve_shadows", "hsl_hue", "hsl_saturation", "hsl_luminance", "black_and_white",
     "mono_mix", "crop", "straighten", "lens_correction",
 ];
@@ -1066,6 +1067,8 @@ fn to_json(s: &Saved) -> Value {
         "texture": s.presence[0], "clarity": s.presence[1], "dehaze": s.presence[2],
         "vibrance": s.values[4], "saturation": s.values[3],
         "sharpening": s.sharpen[0], "sharpen_radius": s.sharpen[1], "sharpen_detail": s.sharpen[2], "sharpen_masking": s.sharpen[3],
+        "noise_luminance": s.sharpen[4], "noise_luminance_detail": s.sharpen[6], "noise_luminance_contrast": s.sharpen[7],
+        "noise_color": s.sharpen[5], "noise_color_detail": s.sharpen[8], "noise_color_smoothness": s.sharpen[9],
         "profile": s.profile,
         "curve": s.curve, "curve_highlights": s.regions[0], "curve_lights": s.regions[1], "curve_darks": s.regions[2], "curve_shadows": s.regions[3],
         "hsl_hue": colours(&s.hsl[0]), "hsl_saturation": colours(&s.hsl[1]), "hsl_luminance": colours(&s.hsl[2]),
@@ -1111,6 +1114,12 @@ fn apply_json(s: &mut Saved, changes: &Value) -> Result<(), String> {
             "sharpen_radius" => s.sharpen[1] = num(key, v, 0.5, 3.0)?,
             "sharpen_detail" => s.sharpen[2] = num(key, v, 0.0, 100.0)?,
             "sharpen_masking" => s.sharpen[3] = num(key, v, 0.0, 100.0)?,
+            "noise_luminance" => s.sharpen[4] = num(key, v, 0.0, 100.0)?,
+            "noise_color" => s.sharpen[5] = num(key, v, 0.0, 100.0)?,
+            "noise_luminance_detail" => s.sharpen[6] = num(key, v, 0.0, 100.0)?,
+            "noise_luminance_contrast" => s.sharpen[7] = num(key, v, 0.0, 100.0)?,
+            "noise_color_detail" => s.sharpen[8] = num(key, v, 0.0, 100.0)?,
+            "noise_color_smoothness" => s.sharpen[9] = num(key, v, 0.0, 100.0)?,
             "profile" => s.profile = v.as_str().ok_or("profile must be a name")?.to_owned(),
             "curve" => {
                 let points: Vec<[f32; 2]> = v
