@@ -176,11 +176,23 @@ pub fn matches(query: &str, e: &Entry) -> bool {
 
 impl Library {
     pub fn load() -> Self {
+        Self::load_with(&|_, _| {})
+    }
+
+    /// Nothing yet: what the window has while the library is read at start.
+    pub fn empty() -> Self {
+        Self { folders: Vec::new(), shared: Default::default(), people: Default::default(), pictures: Default::default(), last_pass: None, changes: std::sync::mpsc::channel(), watched: Vec::new(), changed_elsewhere: None }
+    }
+
+    /// Read the library, saying how far along it is (0..1) and what it is reading.
+    pub fn load_with(report: &dyn Fn(f32, &str)) -> Self {
+        report(0.0, "the photo index");
         USER_PAUSED.store(paused_file().is_some_and(|f| f.is_file()), std::sync::atomic::Ordering::Relaxed);
         let folders: Vec<PathBuf> = folders_file()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect())
             .unwrap_or_default();
+        let t = Instant::now();
         let mut entries = HashMap::new();
         if let Some(text) = index_file().and_then(|f| std::fs::read_to_string(f).ok()) {
             for line in text.lines() {
@@ -195,7 +207,18 @@ impl Library {
                 let _ = f[8];
             }
         }
-        Self { folders, shared: Arc::new(Mutex::new(Shared { entries, ..Default::default() })), people: Arc::new(Mutex::new(crate::people::People::load())), pictures: Arc::new(Mutex::new(crate::clip::Pictures::load())), last_pass: None, changes: std::sync::mpsc::channel(), watched: Vec::new(), changed_elsewhere: None }
+        crate::timing("start: library index read", t);
+        // (How long each part takes in a big library sets how far along each one is.)
+        report(0.05, "people");
+        let t = Instant::now();
+        let people = crate::people::People::load();
+        crate::timing("start: people read", t);
+        report(0.5, "keywords and search");
+        let t = Instant::now();
+        let pictures = crate::clip::Pictures::load();
+        report(1.0, "done");
+        crate::timing("start: content (search) read", t);
+        Self { folders, shared: Arc::new(Mutex::new(Shared { entries, ..Default::default() })), people: Arc::new(Mutex::new(people)), pictures: Arc::new(Mutex::new(pictures)), last_pass: None, changes: std::sync::mpsc::channel(), watched: Vec::new(), changed_elsewhere: None }
     }
 
     pub fn folders(&self) -> &[PathBuf] {

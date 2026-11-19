@@ -255,11 +255,10 @@ impl People {
                 self.take_folder_text(&place, &text, &mut ids, false);
             }
         }
-        // Unnamed groups' average faces, from their faces.
+        // Unnamed groups' average faces, from their faces (all in one pass: group by group
+        // took half a minute in a library of 60,000 faces).
         let rebuild: Vec<u32> = self.people.iter().filter(|p| p.centre.is_empty()).map(|p| p.id).collect();
-        for id in rebuild {
-            self.recentre(id);
-        }
+        self.recentre_all(&rebuild);
         self.people.retain(|p| !p.centre.is_empty() && p.centre.iter().any(|v| *v != 0.0) || p.name.is_some());
         self.reset_summaries();
     }
@@ -982,6 +981,23 @@ impl People {
         self.people.iter().find(|p| p.id == id).and_then(|p| p.name.clone())
     }
 
+    /// `recentre` for many people at once, in one pass over the faces.
+    fn recentre_all(&mut self, ids: &[u32]) {
+        let mut sums: std::collections::HashMap<u32, Vec<f32>> = ids.iter().map(|&id| (id, vec![0f32; 128])).collect();
+        for f in &self.faces {
+            if let Some(sum) = sums.get_mut(&f.person) {
+                for (s, x) in sum.iter_mut().zip(&f.print) {
+                    *s += x;
+                }
+            }
+        }
+        for p in self.people.iter_mut() {
+            if let Some(sum) = sums.remove(&p.id) {
+                p.centre = normalised(sum);
+            }
+        }
+    }
+
     fn recentre(&mut self, id: u32) {
         let mut sum = vec![0f32; 128];
         for f in self.faces.iter().filter(|f| f.person == id) {
@@ -994,7 +1010,6 @@ impl People {
         }
     }
 
-    /// Names of the named people in `photo`.
     /// The names of the people in each of these photos, in one pass over the faces.
     pub fn names_for(&self, photos: &[PathBuf]) -> Vec<(PathBuf, Vec<String>)> {
         let wanted: std::collections::HashSet<&Path> = photos.iter().map(PathBuf::as_path).collect();
@@ -1018,6 +1033,7 @@ impl People {
             .collect()
     }
 
+    /// Names of the named people in `photo`.
     #[cfg(test)]
     pub fn names_in(&self, photo: &Path) -> Vec<String> {
         let ids: Vec<u32> = self.faces.iter().filter(|f| f.photo == photo).map(|f| f.person).collect();

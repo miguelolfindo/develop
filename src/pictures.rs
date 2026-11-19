@@ -15,6 +15,8 @@ struct Want {
     path: PathBuf,
     /// The face box in thousandths, so it can be a key.
     face: Option<[u16; 4]>,
+    /// For a close-up: its size in pixels.
+    side: u16,
 }
 
 enum State {
@@ -32,6 +34,8 @@ pub struct Pictures {
 /// Longest side of a thumbnail, and of a face close-up, in pixels.
 const THUMB: u32 = 480;
 const CLOSE_UP: u32 = 640;
+/// A face close-up on a photo card.
+const CARD_FACE: u32 = 320;
 
 impl Pictures {
     pub fn new(ctx: &egui::Context) -> Self {
@@ -60,7 +64,7 @@ impl Pictures {
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok((want, image)) = self.done.try_recv() {
             let state = match image {
-                Some(image) => State::Ready(ctx.load_texture(format!("people-{}-{:?}", want.path.display(), want.face), image, egui::TextureOptions::LINEAR)),
+                Some(image) => State::Ready(ctx.load_texture(format!("people-{}-{:?}-{}", want.path.display(), want.face, want.side), image, egui::TextureOptions::LINEAR)),
                 None => State::Failed,
             };
             self.map.insert(want, state);
@@ -81,13 +85,22 @@ impl Pictures {
 
     /// A photo's thumbnail (asked for if not made yet).
     pub fn thumb(&mut self, path: &Path) -> Option<egui::TextureHandle> {
-        self.get(Want { path: path.to_path_buf(), face: None })
+        self.get(Want { path: path.to_path_buf(), face: None, side: 0 })
     }
 
     /// A close-up of the face in `area` (asked for if not made yet).
     pub fn face(&mut self, path: &Path, area: [f32; 4]) -> Option<egui::TextureHandle> {
+        self.face_sized(path, area, CLOSE_UP)
+    }
+
+    /// A smaller close-up of the face in `area`, for a photo card.
+    pub fn card_face(&mut self, path: &Path, area: [f32; 4]) -> Option<egui::TextureHandle> {
+        self.face_sized(path, area, CARD_FACE)
+    }
+
+    fn face_sized(&mut self, path: &Path, area: [f32; 4], side: u32) -> Option<egui::TextureHandle> {
         let q = |v: f32| (v.clamp(0.0, 1.0) * 1000.0).round() as u16;
-        self.get(Want { path: path.to_path_buf(), face: Some([q(area[0]), q(area[1]), q(area[2]), q(area[3])]) })
+        self.get(Want { path: path.to_path_buf(), face: Some([q(area[0]), q(area[1]), q(area[2]), q(area[3])]), side: side as u16 })
     }
 }
 
@@ -95,7 +108,13 @@ fn make(want: &Want) -> Option<egui::ColorImage> {
     let picture = match want.face {
         None => crate::filmstrip::preview(&want.path, THUMB)?,
         Some(face) => {
-            let pic = crate::filmstrip::preview(&want.path, 4000)?;
+            // Only as big a preview as the close-up needs: the crop is about twice the face, so
+            // a face a tenth of the picture wide needs a picture five times the close-up wide.
+            // (A full-size preview takes ten times as long to read as the usual one.)
+            let out = want.side.max(1) as f32;
+            let biggest = (face[2].max(face[3]) as f32 / 1000.0).max(0.001);
+            let need = (out / (2.0 * biggest)).ceil().clamp(THUMB as f32, 4000.0) as u32;
+            let pic = crate::filmstrip::preview(&want.path, need)?;
             let (w, h) = (pic.width() as f32, pic.height() as f32);
             let [x, y, fw, fh] = face.map(|v| v as f32 / 1000.0);
             // A square around the face with room for hair and chin.
@@ -105,7 +124,7 @@ fn make(want: &Want) -> Option<egui::ColorImage> {
             let y0 = (cy - side / 2.0).clamp(0.0, (h - 1.0).max(0.0));
             let s = side.min(w - x0).min(h - y0).max(1.0);
             let crop = image::imageops::crop_imm(&pic, x0 as u32, y0 as u32, s as u32, s as u32).to_image();
-            let out = (s as u32).min(CLOSE_UP).max(1);
+            let out = (s as u32).min(want.side as u32).max(1);
             image::imageops::resize(&crop, out, out, image::imageops::FilterType::CatmullRom)
         }
     };

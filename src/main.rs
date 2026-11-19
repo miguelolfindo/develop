@@ -74,6 +74,12 @@ enum PersonShow {
 /// most such faces were other people, things that aren't faces, or the person as a small child.
 const UNLIKE: f32 = 0.30;
 
+/// When this run started (for measuring).
+pub fn started() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
 /// With DEVELOP_TIMING set to a file, note how long `what` took (for measuring slow folders).
 pub fn timing(what: &str, since: std::time::Instant) {
     if let Some(file) = std::env::var_os("DEVELOP_TIMING") {
@@ -85,6 +91,7 @@ pub fn timing(what: &str, since: std::time::Instant) {
 }
 
 fn main() -> eframe::Result<()> {
+    started();
     // Diagnostic: `app --dump-dcp <profile.dcp> <out.txt>` writes a summary of a camera profile.
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 4 && args[1] == "--dump-dcp" {
@@ -499,6 +506,41 @@ fn main() -> eframe::Result<()> {
 }
 
 /// The window icon (also the taskbar icon while the app runs).
+/// The start-up box: shown at once while the library is read in the background.
+struct Starting {
+    rx: std::sync::mpsc::Receiver<StartMsg>,
+    /// How far along (0..1), and what is being read; the bar eases toward it.
+    target: f32,
+    shown: f32,
+    step: String,
+    logo: Option<egui::TextureHandle>,
+}
+
+enum StartMsg {
+    Progress(f32, String),
+    Done(library::Library),
+}
+
+impl Starting {
+    fn begin(ctx: &egui::Context) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let report = |f: f32, step: &str| {
+                let _ = tx.send(StartMsg::Progress(f, step.to_owned()));
+                c.request_repaint();
+            };
+            let library = library::Library::load_with(&report);
+            let _ = tx.send(StartMsg::Done(library));
+            c.request_repaint();
+        });
+        Self { rx, target: 0.0, shown: 0.0, step: "the photo index".into(), logo: None }
+    }
+}
+
+/// The copyright year on the start-up box.
+const COPYRIGHT_YEAR: &str = "2026";
+
 fn app_icon() -> egui::IconData {
     match image::load_from_memory(include_bytes!("../assets/icon-256.png")) {
         Ok(icon) => {
@@ -621,7 +663,8 @@ fn justified(width: f32, count: usize, wish: f32, gap: f32) -> f32 {
 /// One photo card in the People view: the photo with the face outlined, a caption under it and
 /// a corner button. Returns the card's response and whether the corner button was clicked.
 #[allow(clippy::too_many_arguments)]
-fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Path, area: [f32; 4], card: f32, picked: bool, dimmed: bool, button: CardButton, caption: &str, id: egui::Id) -> (egui::Response, bool) {
+#[allow(clippy::too_many_arguments)]
+fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Path, area: [f32; 4], card: f32, picked: bool, dimmed: bool, button: CardButton, caption: &str, id: egui::Id, face_only: bool) -> (egui::Response, bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(card, card + 18.0), egui::Sense::click_and_drag());
     let tile = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(card));
     if !ui.is_rect_visible(rect) {
@@ -638,11 +681,21 @@ fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Pat
     };
     painter.rect(tile, 6.0, if picked { egui::Color32::from_rgb(0x1C, 0x1F, 0x26) } else { theme::WELL }, border);
     let inner = tile.shrink(6.0);
-    if let Some(t) = pictures.thumb(photo) {
+    let tint = if dimmed { egui::Color32::from_gray(90) } else { egui::Color32::WHITE };
+    if face_only {
+        // The face filling the card (a square close-up around it).
+        match pictures.card_face(photo, area) {
+            Some(t) => {
+                egui::Image::new(&t).rounding(4.0).tint(tint).paint_at(ui, inner);
+            }
+            None => {
+                painter.text(inner.center(), egui::Align2::CENTER_CENTER, "…", theme::font(14.0), theme::FADED);
+            }
+        }
+    } else if let Some(t) = pictures.thumb(photo) {
         let size = t.size_vec2();
         let scale = (inner.width() / size.x).min(inner.height() / size.y);
         let pic = egui::Rect::from_center_size(inner.center(), size * scale);
-        let tint = if dimmed { egui::Color32::from_gray(90) } else { egui::Color32::WHITE };
         painter.image(t.id(), pic, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
         let [x, y, w, h] = area;
         let face_rect = egui::Rect::from_min_size(pic.min + egui::vec2(x * pic.width(), y * pic.height()), egui::vec2(w * pic.width(), h * pic.height())).expand(3.0);
@@ -659,7 +712,9 @@ fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Pat
         CardButton::Confirm => ("Yes, this is them: add the photo to this person", egui::Sense::click()),
     };
     let b = ui.interact(b_rect, id.with("corner"), sense).on_hover_text(tip);
-    // Magnifying glass, top left: hover it to see the boxed face up close.
+    // Magnifying glass, top left: hover it to see the boxed face up close (not needed when the
+    // card already shows the face).
+    if !face_only {
     let m_rect = egui::Rect::from_center_size(tile.left_top() + egui::vec2(15.0, 15.0), egui::Vec2::splat(22.0));
     let m = ui.interact(m_rect, id.with("zoom"), egui::Sense::hover());
     let m_fill = if m.hovered() { theme::ELEVATED } else { egui::Color32::from_rgba_unmultiplied(0x11, 0x13, 0x17, 0xD0) };
@@ -680,6 +735,7 @@ fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Pat
                 }
             }
         });
+    }
     }
     match button {
         CardButton::Remove if hovered => {
@@ -1014,10 +1070,16 @@ struct App {
     /// The person page's faces, possible matches and names, for the people library as it was
     /// (its generation) and that person: worked out once, not on every frame.
     person_view_data: Option<(u64, u32, std::rc::Rc<PersonViewData>)>,
+    /// `--person N`: open that person once the library has been read.
+    person_at_start: Option<usize>,
     /// Writes people's names into `.dvlp` files of folders not open, in the background.
     names_writer: Option<std::sync::mpsc::Sender<(PathBuf, Vec<String>)>>,
     /// The person page: all their photos, least alike first, or only the unlike ones.
     person_show: PersonShow,
+    /// The person page's cards: the face up close, or the whole photo with the face boxed.
+    person_cards_face: bool,
+    /// While the library is read at start: the start-up box, and what waits for the library.
+    starting: Option<Starting>,
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
@@ -1170,11 +1232,16 @@ impl App {
     fn with_gpu(egui_ctx: &egui::Context, render_state: egui_wgpu::RenderState, initial: Option<PathBuf>) -> Self {
         // Settings from versions that kept them under another folder name.
         settings::migrate_legacy_settings();
+        timing("start: before the window's set-up", started());
+        let t = std::time::Instant::now();
         theme::apply(egui_ctx);
+        timing("start: fonts", t);
+        let t = std::time::Instant::now();
         let renderer = ImageRenderer::new(&render_state.device, &render_state.queue, render_state.target_format);
         render_state.renderer.write().callback_resources.insert(renderer);
         let scopes = scopes::Scopes::new(&render_state.device, render_state.target_format);
         render_state.renderer.write().callback_resources.insert(scopes);
+        timing("start: GPU programs", t);
         let max_texture = render_state.device.limits().max_texture_dimension_2d;
 
         let mut app = Self {
@@ -1249,7 +1316,8 @@ impl App {
             keyword_draft: String::new(),
             suggestions: None,
             suggest_job: None,
-            library: library::Library::load(),
+            // Read in the background (see Starting): the window shows the start-up box at once.
+            library: library::Library::empty(),
             person_rename: None,
             face_textures: std::collections::HashMap::new(),
             exif_shown: None,
@@ -1268,8 +1336,11 @@ impl App {
             move_progress: (0, 0, String::new()),
             move_check: None,
             person_view_data: None,
+            person_at_start: None,
             names_writer: None,
             person_show: PersonShow::All,
+            person_cards_face: false,
+            starting: None,
             move_result: None,
             quit_asked: false,
             quit_ok: false,
@@ -1410,6 +1481,8 @@ impl App {
                 app.filmstrip.set_folder(Some(&folder));
             }
         }
+        app.starting = Some(Starting::begin(egui_ctx));
+        timing("start: window set up", started());
         // `--search <words>` (or `library:<words>`): start with the filmstrip searched (tests and
         // screenshots), after the photo's folder is showing.
         let args: Vec<String> = std::env::args().collect();
@@ -1418,16 +1491,15 @@ impl App {
         }
         // `--person <n>`: start with the n-th person of the People list open (tests and screenshots).
         if let Some(n) = args.iter().position(|a| a == "--person").and_then(|i| args.get(i + 1)).and_then(|n| n.parse::<usize>().ok()) {
-            let id = app.library.people.lock().ok().and_then(|p| p.list().get(n).map(|e| e.0));
-            if let Some(id) = id {
-                app.open_person(id);
-            }
+            // Once the library has been read.
+            app.person_at_start = Some(n);
             // DEVELOP_PERSON_SHOW=least|unlike: open the person page that way (screenshots).
             app.person_show = match std::env::var("DEVELOP_PERSON_SHOW").as_deref() {
                 Ok("least") => PersonShow::LeastAlike,
                 Ok("unlike") => PersonShow::Unlike,
                 _ => PersonShow::All,
             };
+            app.person_cards_face = std::env::var("DEVELOP_PERSON_CARDS").is_ok_and(|v| v == "face");
         }
         // `--move-preview <folder> <into>`: start with Move to…'s summary showing (screenshots).
         if let Some(i) = args.iter().position(|a| a == "--move-preview") {
@@ -5530,6 +5602,16 @@ impl App {
                         self.person_selected.clear();
                     }
                 }
+                // Each card: the whole photo, or the face up close.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (face, label, tip) in [(true, "Face", "Each card shows the face up close: easier to tell who it is"), (false, "Photo", "Each card shows the whole photo, the face outlined")] {
+                        let look = if self.person_cards_face == face { ui::Look::teal() } else { ui::Look::bordered() };
+                        if ui::button(ui, label, egui::vec2(56.0, 22.0), look, theme::font(11.5), None).on_hover_text(tip).clicked() {
+                            self.person_cards_face = face;
+                        }
+                    }
+                    ui.label(ui::dim("Cards", 11.5));
+                });
             });
             ui.add_space(8.0);
         }
@@ -5557,7 +5639,7 @@ impl App {
                     let caption = face.photo.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     // Allocated through the wrapping row first, so each card wraps as a whole.
                     ui.allocate_ui_with_layout(egui::vec2(card, card + 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Remove, &caption, card_id);
+                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Remove, &caption, card_id, self.person_cards_face);
                         if response.drag_started() {
                             drag_start = Some(index);
                         }
@@ -5604,7 +5686,7 @@ impl App {
                     let _ = alike;
                     let caption = face.photo.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ui.allocate_ui_with_layout(egui::vec2(card, card + 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Confirm, &caption, card_id);
+                        let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Confirm, &caption, card_id, self.person_cards_face);
                         if response.drag_started() {
                             maybe_drag = Some(index);
                         }
@@ -6571,11 +6653,15 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // DEVELOP_FRAMES=<file>: note every frame, how long it took (for measuring stutter).
         let start = std::time::Instant::now();
-        self.frame(ctx);
+        if self.starting.is_some() {
+            self.starting_frame(ctx);
+        } else {
+            self.frame(ctx);
+        }
         if let Some(file) = std::env::var_os("DEVELOP_FRAMES") {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
-                let _ = writeln!(f, "{:.1}", start.elapsed().as_secs_f64() * 1000.0);
+                let _ = writeln!(f, "{:.1}\t{:.1}", start.elapsed().as_secs_f64() * 1000.0, started().elapsed().as_secs_f64());
             }
         }
     }
@@ -6583,6 +6669,77 @@ impl eframe::App for App {
 
 impl App {
     /// One frame of the app: in a window, or run without one for exports (headless.rs).
+    /// While the library is read: only the start-up box (nothing else runs, so nothing can be
+    /// saved over the library before it is in). Then the library goes in, and the window
+    /// carries on as usual.
+    fn starting_frame(&mut self, ctx: &egui::Context) {
+        let Some(s) = self.starting.as_mut() else { return };
+        let mut done = None;
+        while let Ok(msg) = s.rx.try_recv() {
+            match msg {
+                StartMsg::Progress(f, step) => {
+                    s.target = f;
+                    s.step = step;
+                }
+                StartMsg::Done(library) => done = Some(library),
+            }
+        }
+        if let Some(library) = done {
+            self.library = library;
+            self.starting = None;
+            if let Some(n) = self.person_at_start.take() {
+                let id = self.library.people.lock().ok().and_then(|p| p.list().get(n).map(|e| e.0));
+                if let Some(id) = id {
+                    self.open_person(id);
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+        // The bar moves smoothly toward how far along it is.
+        s.shown += (s.target - s.shown) * 0.12;
+        if (s.target - s.shown).abs() > 0.002 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        let logo = s
+            .logo
+            .get_or_insert_with(|| {
+                let rgba = image::load_from_memory(include_bytes!("../assets/icon-256.png")).map(|i| i.to_rgba8()).unwrap_or_default();
+                ctx.load_texture("start-logo", egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()), egui::TextureOptions::LINEAR)
+            })
+            .clone();
+        let (shown, step) = (s.shown, s.step.clone());
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::CANVAS)).show(ctx, |ui| {
+            let size = egui::vec2(560.0, 300.0);
+            let rect = egui::Rect::from_center_size(ui.max_rect().center(), size);
+            let p = ui.painter();
+            p.rect(rect, 12.0, theme::PANEL, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x2A, 0x2D, 0x34)));
+            let left = rect.left() + 32.0;
+            let right = rect.right() - 32.0;
+            // Logo, name, version, what it is.
+            let logo_rect = egui::Rect::from_min_size(egui::pos2(left, rect.top() + 34.0), egui::Vec2::splat(88.0));
+            egui::Image::new(&logo).paint_at(ui, logo_rect);
+            let x = rect.left() + 140.0;
+            p.text(egui::pos2(x, rect.top() + 30.0), egui::Align2::LEFT_TOP, "Develop", theme::bold(30.0), theme::TEXT_BRIGHT);
+            p.text(egui::pos2(x, rect.top() + 72.0), egui::Align2::LEFT_TOP, format!("Version {}", env!("CARGO_PKG_VERSION")), theme::font(13.0), theme::TEXT_HEADER);
+            p.text(egui::pos2(x, rect.top() + 98.0), egui::Align2::LEFT_TOP, "A fast raw photo editor. Every adjustment runs", theme::font(13.0), theme::TEXT);
+            p.text(egui::pos2(x, rect.top() + 117.0), egui::Align2::LEFT_TOP, "on the GPU, so sliders respond instantly.", theme::font(13.0), theme::TEXT);
+            // Who made it.
+            p.line_segment([egui::pos2(left, rect.top() + 160.0), egui::pos2(right, rect.top() + 160.0)], egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x2A, 0x2D, 0x34)));
+            let author = env!("CARGO_PKG_AUTHORS").split(':').next().unwrap_or("");
+            p.text(egui::pos2(left, rect.top() + 172.0), egui::Align2::LEFT_TOP, format!("By {author}"), theme::font(12.0), theme::TEXT);
+            p.text(egui::pos2(left, rect.top() + 192.0), egui::Align2::LEFT_TOP, format!("\u{a9} {COPYRIGHT_YEAR} {author}. Free software under the GNU GPL 3.0 or later license."), theme::font(11.0), theme::FADED);
+            // What is being read, and how far along.
+            let what = if step == "done" { "Opening\u{2026}".to_owned() } else { format!("Reading the library: {step}\u{2026}") };
+            p.text(egui::pos2(left, rect.top() + 232.0), egui::Align2::LEFT_TOP, what, theme::font(12.0), theme::TEXT);
+            p.text(egui::pos2(right, rect.top() + 232.0), egui::Align2::RIGHT_TOP, format!("{:.0}%", shown * 100.0), theme::bold(12.0), theme::TEXT);
+            let bar = egui::Rect::from_min_max(egui::pos2(left, rect.top() + 256.0), egui::pos2(right, rect.top() + 262.0));
+            p.rect_filled(bar, 3.0, theme::TRACK);
+            let filled = egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * shown.clamp(0.0, 1.0), bar.bottom()));
+            p.rect_filled(filled, 3.0, theme::TEAL);
+        });
+    }
+
     fn frame(&mut self, ctx: &egui::Context) {
         self.quit_guard(ctx);
         self.poll_loader();
