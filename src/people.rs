@@ -144,6 +144,32 @@ fn consistency(prints: &[&Vec<f32>]) -> f32 {
     each[each.len() / 2]
 }
 
+/// How well each face fits a person: likeness to the person's average face, and the average
+/// likeness to its three most alike faces among the others (a face that fits nobody in the set
+/// scores low on both).
+fn fit(faces: &[&Face], centre: &[f32]) -> Vec<(f32, f32)> {
+    faces
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let mut best = [f32::MIN; 3];
+            for (j, b) in faces.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let s = crate::faces::similarity_of(&a.print, &b.print);
+                if s > best[2] {
+                    best[2] = s;
+                    best.sort_by(|x, y| y.total_cmp(x));
+                }
+            }
+            let known: Vec<f32> = best.iter().copied().filter(|s| *s > f32::MIN).collect();
+            let near = if known.is_empty() { 0.0 } else { known.iter().sum::<f32>() / known.len() as f32 };
+            (crate::faces::similarity_of(&a.print, centre), near)
+        })
+        .collect()
+}
+
 fn file(name: &str) -> Option<PathBuf> {
     crate::settings::settings_dir().map(|d| d.join(name))
 }
@@ -598,6 +624,20 @@ impl People {
 
     /// People to show: named ones first, then groups of at least two faces, largest first.
     /// Each with its number of photos and a face to show.
+    /// For measuring: each named person's faces with their likeness scores (see `fit`).
+    pub fn outliers_report(&self) -> String {
+        let mut out = String::new();
+        for p in self.people.iter().filter(|p| p.name.is_some()) {
+            let faces: Vec<&Face> = self.faces.iter().filter(|f| f.person == p.id).collect();
+            for (f, (centre, near)) in faces.iter().zip(fit(&faces, &p.centre)) {
+                let thumb = face_thumb(&f.key, f.n).map(|t| t.display().to_string()).unwrap_or_default();
+                out.push_str(&format!("{}	{:.3}	{:.3}	{}	{}
+", p.name.as_deref().unwrap_or(""), centre, near, f.photo.display(), thumb));
+            }
+        }
+        out
+    }
+
     /// Faces and person groups, for measuring.
     pub fn sizes(&self) -> String {
         format!("{} faces, {} person groups", self.faces.len(), self.people.len())
@@ -889,6 +929,12 @@ impl People {
         faces.sort_by(|a, b| a.photo.cmp(&b.photo).then(a.n.cmp(&b.n)));
         faces.dedup_by(|a, b| a.photo == b.photo);
         faces
+    }
+
+    /// How like person `id`'s average face each of these faces is (0..1).
+    pub fn likeness(&self, id: u32, faces: &[Face]) -> Vec<f32> {
+        let Some(p) = self.people.iter().find(|p| p.id == id) else { return vec![1.0; faces.len()] };
+        faces.iter().map(|f| crate::faces::similarity_of(&f.print, &p.centre)).collect()
     }
 
     /// The face that stands for a person: the one most like their average.

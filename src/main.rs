@@ -56,7 +56,23 @@ use raw::DecodedImage;
 
 /// The person page: their faces, the face that stands for them, their name, named people who
 /// look like them, possible matches, and every other name.
-type PersonViewData = (Vec<people::Face>, Option<people::Face>, Option<String>, Vec<String>, Vec<(people::Face, f32)>, Vec<String>);
+type PersonViewData = (Vec<people::Face>, Option<people::Face>, Option<String>, Vec<String>, Vec<(people::Face, f32)>, Vec<String>, Vec<f32>);
+
+/// Which of a person's photos the person page shows, in what order.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum PersonShow {
+    #[default]
+    All,
+    /// Least like the person's average face first: wrong ones (other people, things that
+    /// aren't faces) come up first.
+    LeastAlike,
+    /// Only those well below the rest (see UNLIKE).
+    Unlike,
+}
+
+/// Faces this unlike a person's average face are shown under "Least like …": in a real library
+/// most such faces were other people, things that aren't faces, or the person as a small child.
+const UNLIKE: f32 = 0.30;
 
 /// With DEVELOP_TIMING set to a file, note how long `what` took (for measuring slow folders).
 pub fn timing(what: &str, since: std::time::Instant) {
@@ -175,6 +191,13 @@ fn main() -> eframe::Result<()> {
         out.push_str(&format!("average per photo (after the first): preview {:.3} s, faces {:.3} s, content {:.3} s
 ", t_pre / m, t_faces / m, t_clip / m));
         let _ = std::fs::write(&args[3], out);
+        return Ok(());
+    }
+    // `--outliers-report <out>`: for each named person's faces, how like the person they are
+    // (to their average face, and to their three most alike faces), with the face's picture.
+    if args.len() >= 3 && args[1] == "--outliers-report" {
+        let p = people::People::load();
+        let _ = std::fs::write(&args[2], p.outliers_report());
         return Ok(());
     }
     // `--people-bench <out>`: how long the People list takes to work out for this library.
@@ -993,6 +1016,8 @@ struct App {
     person_view_data: Option<(u64, u32, std::rc::Rc<PersonViewData>)>,
     /// Writes people's names into `.dvlp` files of folders not open, in the background.
     names_writer: Option<std::sync::mpsc::Sender<(PathBuf, Vec<String>)>>,
+    /// The person page: all their photos, least alike first, or only the unlike ones.
+    person_show: PersonShow,
     move_result: Option<(String, bool)>,
     /// The folder whose capture dates were last asked of the library's index.
     dates_asked: Option<PathBuf>,
@@ -1244,6 +1269,7 @@ impl App {
             move_check: None,
             person_view_data: None,
             names_writer: None,
+            person_show: PersonShow::All,
             move_result: None,
             quit_asked: false,
             quit_ok: false,
@@ -1396,6 +1422,12 @@ impl App {
             if let Some(id) = id {
                 app.open_person(id);
             }
+            // DEVELOP_PERSON_SHOW=least|unlike: open the person page that way (screenshots).
+            app.person_show = match std::env::var("DEVELOP_PERSON_SHOW").as_deref() {
+                Ok("least") => PersonShow::LeastAlike,
+                Ok("unlike") => PersonShow::Unlike,
+                _ => PersonShow::All,
+            };
         }
         // `--move-preview <folder> <into>`: start with Move to…'s summary showing (screenshots).
         if let Some(i) = args.iter().position(|a| a == "--move-preview") {
@@ -5311,7 +5343,9 @@ impl App {
                     let others = p.similar_named(id);
                     // Every other name, for completing what is typed.
                     let all: Vec<String> = p.list().into_iter().filter(|(i, ..)| *i != id).filter_map(|(_, n, ..)| n).collect();
-                    let data = std::rc::Rc::new((p.faces_of(id), p.best_face(id), p.name_of(id), others, p.maybe(id), all));
+                    let faces = p.faces_of(id);
+                    let likeness = p.likeness(id, &faces);
+                    let data = std::rc::Rc::new((faces, p.best_face(id), p.name_of(id), others, p.maybe(id), all, likeness));
                     self.person_view_data = Some((generation, id, data.clone()));
                     data
                 }
@@ -5319,7 +5353,7 @@ impl App {
         }) else {
             return;
         };
-        let (faces, best, name, others, maybe, all_names) = (*data).clone();
+        let (faces, best, name, others, maybe, all_names, likeness) = (*data).clone();
         if faces.is_empty() {
             self.person_view = None;
             return;
@@ -5471,6 +5505,41 @@ impl App {
         let pointer = ui.ctx().pointer_latest_pos();
         let released = ui.input(|i| i.pointer.any_released());
         let mut set_rect = egui::Rect::NOTHING;
+        // All, least alike first, or only the unlike ones.
+        let unlike = likeness.iter().filter(|&&s| s < UNLIKE).count();
+        if unlike == 0 && self.person_show == PersonShow::Unlike {
+            self.person_show = PersonShow::All;
+        }
+        if faces.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(ui::dim("Show", 11.5));
+                ui.add_space(4.0);
+                let first = name.clone().map(|n| n.split_whitespace().next().unwrap_or("").to_owned()).unwrap_or_else(|| "them".to_owned());
+                let choices = [
+                    (PersonShow::All, format!("All {}", faces.len()), "Every photo in this set".to_owned()),
+                    (PersonShow::LeastAlike, "Least alike first".to_owned(), format!("The faces least like {first}'s usual face first: other people and things that aren't faces come up early. Pick them and take them out.")),
+                    (PersonShow::Unlike, format!("Least like {first} ({unlike})"), format!("Only the faces well below the rest in likeness to {first}. Usually other people, things that aren't faces, or {first} as a small child: check before taking them out.")),
+                ];
+                for (show, label, tip) in choices {
+                    if show == PersonShow::Unlike && unlike == 0 {
+                        continue;
+                    }
+                    let look = if self.person_show == show { ui::Look::teal() } else { ui::Look::bordered() };
+                    if ui::button(ui, &label, egui::vec2(0.0, 22.0), look, theme::font(11.5), None).on_hover_text(tip).clicked() {
+                        self.person_show = show;
+                        self.person_selected.clear();
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        }
+        let faces: Vec<people::Face> = if self.person_show == PersonShow::All {
+            faces
+        } else {
+            let mut order: Vec<(f32, people::Face)> = likeness.iter().copied().zip(faces).filter(|(s, _)| self.person_show == PersonShow::LeastAlike || *s < UNLIKE).collect();
+            order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            order.into_iter().map(|(_, f)| f).collect()
+        };
         let photos: Vec<PathBuf> = faces.iter().map(|f| f.photo.clone()).collect();
         let maybe_photos: Vec<PathBuf> = maybe.iter().map(|(f, _)| f.photo.clone()).collect();
         egui::ScrollArea::vertical().id_source("person_photos").auto_shrink([false, false]).show(ui, |ui| {
