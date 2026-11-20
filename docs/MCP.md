@@ -391,6 +391,9 @@ brought inside it.
 | `sharpening` | 0 to 150 | Default 40 |
 | `sharpen_radius` | 0.5 to 3 | Pixels, default 1 |
 | `sharpen_detail`, `sharpen_masking` | 0 to 100 | Defaults 25 and 0 |
+| `noise_luminance`, `noise_color` | 0 to 100 | Noise Reduction (any photo, JPEGs included): grain in brightness, and colour blotches. Default 0 (off) |
+| `noise_luminance_detail`, `noise_luminance_contrast` | 0 to 100 | Defaults 50 and 0; act only when `noise_luminance` is above 0 |
+| `noise_color_detail`, `noise_color_smoothness` | 0 to 100 | Defaults 50 and 50; act only when `noise_color` is above 0 |
 | `profile` | name | A camera profile name as shown in Develop, such as `Adobe Color (approx.)` or `Standard (built-in)` |
 | `curve` | list of `[x, y]` | Tone curve points, 0 to 1, e.g. `[[0,0],[0.5,0.56],[1,1]]` lifts the midtones |
 | `curve_highlights`, `curve_lights`, `curve_darks`, `curve_shadows` | -100 to 100 | The tone curve's regions |

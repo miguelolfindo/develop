@@ -8,7 +8,7 @@ moving a slider in Develop looks much like moving the same slider in Lightroom.
 ## Documentation
 
 - **[User guide](docs/USER-GUIDE.md):** every feature, step by step: browsing, searching,
-  keywords, people, editing, presets, versions, retouching, exporting, DNG, keyboard shortcuts,
+  keywords, people, sharing a library, moving folders, editing, presets, versions, retouching, exporting, DNG, keyboard shortcuts,
   where edits are kept, and troubleshooting.
 - **[AI assistants (MCP)](docs/MCP.md):** connecting an AI app, every tool and setting, good
   practice and privacy; plus a ready-made [assistant guide](docs/develop-skill/SKILL.md).
@@ -30,11 +30,12 @@ of 255) of Lightroom on average.
 
 **What it does well:** fast global editing (every adjustment runs on the GPU), Lightroom-style
 Tone, Presence and Color sliders, a tone curve and colour mixer, a white balance eyedropper,
-AI noise reduction, lens corrections, crop and straighten, spot healing and cloning (circles or
+noise reduction for every photo plus AI denoise for raw files, lens corrections, crop and straighten, spot healing and cloning (circles or
 painted strokes), black & white, develop presets, saved versions of an edit, undo and redo,
 copying settings between photos, ratings and filters, keywords (with suggestions from what is
 in each photo), face recognition, search across a library of folders (including by
-description), exporting one photo or a whole selection to JPEG, PNG or TIFF, and an MCP server so
+description), a library shared between computers (a PC and a Mac, say), moving folders safely
+with the library following them, exporting one photo or a whole selection to JPEG, PNG or TIFF, and an MCP server so
 AI assistants can help with your work.
 
 **What it does not have (Lightroom does):**
@@ -86,8 +87,10 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   - **Color Mixer:** hue, saturation and luminance for eight colours, on the colours as
     displayed. Both are fitted to Lightroom references (one photo so far): the tone curve
     lands within about 1-2 levels of Lightroom's, the Color Mixer within about 6.
-  - **Detail:** sharpening and **AI noise reduction** (RawNIND model, runs on the GPU
-    through DirectML on Windows; works on Bayer raws, X-Trans raws and linear DNGs).
+  - **Detail:** sharpening; **Noise Reduction** as in Lightroom (Luminance with Detail and
+    Contrast, Color with Detail and Smoothness), live on the GPU for every photo, JPEGs
+    included; and **AI noise reduction** (RawNIND model, runs on the GPU through DirectML on
+    Windows; works on Bayer raws, X-Trans raws and linear DNGs).
   - **Lens correction:** Lensfun lens profiles (database included), the camera's own
     correction data for Sony lenses, plus manual distortion, defringe and vignette.
     Distortion correction is applied automatically for Nikon Z, Panasonic, Olympus / OM
@@ -113,8 +116,16 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   description such as "people eating noodles".
 - **Library and people:** add folders to the library; Develop recognises faces across it and
   groups them into people you name. A People view shows each person's photos with their face
-  outlined, lets you fix mistakes by dragging, and offers possible matches to confirm. Names go
+  outlined (as whole photos or face close-ups), lets you fix mistakes by dragging, offers possible
+  matches to confirm, and shows the least alike faces first to find wrong ones. **Regroup** moves
+  unnamed faces that clearly match someone you named. Finding faces can be paused. Names go
   into the photos' `.dvlp` files; face fingerprints stay on your computer.
+- **Shared library:** **Share this library…** lets several computers (PCs and Macs) use one
+  library's people, names, keywords and search; changes show on the others within seconds, and
+  nothing one computer does overwrites another's.
+- **Move to…:** move a folder to another drive or a file server safely: every file is copied and
+  checked before the original goes, a stopped move carries on where it left off, and the
+  library follows the folder.
 - **Filmstrip** with ratings, sorting and filtering, a photo's saved versions grouped with it,
   **histogram and scopes**, **before/after split** (against the original or any saved version),
   and clipping warnings.
@@ -124,7 +135,7 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   NAS boxes on your network and the folders they share; add one by address
   (`\\computer\share` on Windows, `smb://computer/share` on macOS). Windows asks for a
   password when a computer needs one; on macOS, shares are mounted through Finder and
-  your Keychain.
+  your Keychain. Big network folders open at once.
 - **Non-destructive:** edits are saved in a small `.dvlp` sidecar file next to each photo;
   the original is never changed. Changes made by another program (an AI assistant, or a
   second copy of Develop) show at once in the open folder, and Undo goes back.

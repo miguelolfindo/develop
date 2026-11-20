@@ -11,7 +11,8 @@ covers everything the app does, in the order you would use it.
 2. [The window](#2-the-window)
 3. [Finding and organising photos](#3-finding-and-organising-photos)
    - [Grid view](#grid-view) · [Search](#search) · [EXIF](#exif) · [Keywords](#keywords)
-     · [The library](#the-library) · [People](#people)
+     · [The library](#the-library) · [Sharing a library](#sharing-a-library) · [People](#people)
+     · [Moving a folder](#moving-a-folder)
 4. [Looking at a photo](#4-looking-at-a-photo)
 5. [Editing](#5-editing)
    - [Presets](#presets) · [Versions](#versions) · [Profile and treatment](#profile-and-treatment)
@@ -61,6 +62,13 @@ you). If there is one, a dialog shows what is new, with three choices:
 
 An update is only offered once its installer for your system is ready to download.
 
+When the AI models on your computer are already the ones the new version uses, Develop downloads
+a small update package (about 26 MB) instead of the full installer (about 228 MB), and installs it
+once Develop has closed. Otherwise it downloads the full installer, as before.
+
+**Starting up:** while Develop reads your library, a box shows its name, version and a progress
+bar saying what it is reading. The full window follows a few seconds later.
+
 ### Uninstalling
 
 Windows: **Settings › Apps**, or run `uninstall.exe` in `%LOCALAPPDATA%\Develop`. macOS: drag
@@ -81,7 +89,7 @@ are; the settings folder (see [section 9](#9-where-your-edits-are-kept)) can be 
 ```
 
 - **Top bar:** the open photo's file name, camera, size and bit depth; while Develop is reading
-  new library photos, "Finding faces 37 of 410"; and which graphics system Develop is using
+  new library photos, "Finding faces 37 of 410" with a **Pause** button; and which graphics system Develop is using
   (Vulkan, DX12, Metal, OpenGL or WebGPU).
 - **Tabs:** **Folders** and **Faces & Metadata** choose what the left panel shows; **Inspector**
   shows or hides the right panel. The tab showing is highlighted and joins its panel; click it
@@ -124,13 +132,20 @@ arrow) reads the drives, network and folders again.
 
 Right-click a folder and choose **Add to Library** to have it searched with the others and its
 faces recognised (see [The library](#the-library)); a folder already in the library offers
-**Remove from Library**.
+**Remove from Library**. **Move to…** moves the folder somewhere else safely (see
+[Moving a folder](#moving-a-folder)).
+
+Big folders on a network drive open at once: the photos show first in the order of their file
+times, and settle into capture-date order a moment later, as the dates are read in the
+background. Develop remembers the dates, so the folder opens in order next time.
 
 **Network** lists the computers and NAS boxes on your network and the folders they share. To
 add one that is not listed, type its address in the box at the top of Network (`\\computer\share`
 on Windows, `smb://computer/share` on a Mac) and confirm. Windows asks for a user name and
 password if the computer needs them; on a Mac, use **Connect…**, which signs in through Finder
 and your Keychain. Right-click an added computer and choose **Remove from Network** to remove it.
+Computers you added, and those found last time, show at once; on Windows the others are added as
+they are found ("Still looking for others…").
 
 ### Filmstrip
 
@@ -227,11 +242,59 @@ in the photo, from the photo's embedded preview (about two photos a second). Whi
 **Finding faces and reading content** shows a progress bar and the time left above People, and the
 top bar shows "Finding faces 37 of 410" whatever tab is open. It checks the library again when it
 starts and every ten minutes, and only new or changed photos are read again. A photo moved to
-another folder keeps its faces and names.
+another folder keeps its faces and names. A folder Develop cannot reach (a network drive that is
+asleep, a disk that is unplugged) keeps its photos in the library; photos that are gone are kept
+for 30 days in case they come back.
+
+**Pause** (next to the progress, and in the top bar) stops finding faces for now: what is done is
+kept, and it stays paused, also after closing Develop, until you click **Resume**. On a big
+library finding faces can take many hours, so pause it when you want the computer for something
+else. It also pauses by itself while a folder is being moved.
 
 **Closing while it reads:** Develop asks first. **Keep running** carries on; **Quit now** keeps
 everything read so far (it is also saved every 20 seconds as it goes), and the rest is read the
 next time Develop opens.
+
+### Sharing a library
+
+One library can be used on several computers, for example a PC and a Mac sharing photos on a
+file server. Right-click a library folder under **LIBRARY** and choose **Share this library…**.
+
+- Develop keeps the library's face and search data in a hidden `.develop` folder inside it. Your
+  photos and their `.dvlp` files don't change.
+- On the other computer, add the same folder to its library (on a Mac, the share under
+  `/Volumes`). Its people, names, keywords and search are there straight away, without reading
+  the photos again.
+- Changes made on one computer show on the other within seconds. New photos are read by one
+  computer only, whichever gets there first.
+- Nothing is overwritten: when both computers change things at once, both changes are kept. If
+  two computers rename the same person at about the same time, the later name wins; a name given
+  on another computer shows "named on <computer>".
+- Each computer also keeps its own copy of the names, for when the folder can't be reached.
+- **Stop sharing…** offers **Stop on this computer** (the others carry on; come back later with
+  **Use the shared library again**) or **Stop for everyone** (the `.develop` folder is renamed
+  `.develop-stopped-<date>` and kept as a backup). Either way, this computer keeps a full copy and
+  carries on as a library of its own.
+
+Every computer sharing a library needs Develop 0.5.0 or later.
+
+### Moving a folder
+
+Right-click a folder under Folders and choose **Move to…**, then pick where it should go. A
+summary shows the photos and files, their size, the free space there, and any files with the
+same names already at the destination. Click **Move** to go ahead.
+
+- On the same drive or network share, files are renamed, which is instant.
+- To another drive, every file is copied, read back and checked before anything is removed. The
+  originals are removed only once all of them are safely copied. If the move stops part-way,
+  nothing is lost: run it again and it carries on, skipping what is already there.
+- The progress shows "Checking what is already there" first, then the copying. **Cancel** stops
+  it at any time.
+- **Keep both:** if files with the same names but different photos are already there, tick it to
+  give the moved files a number (`DSC01234-2.ARW`), with their `.dvlp`, JPEG and `.xmp`. Nothing
+  at the destination is ever replaced.
+- Edits are saved first. The library follows the folder: faces, names and search stay as they
+  are, and if the folder moves out of the library its new place is added.
 
 ### People
 
@@ -242,18 +305,29 @@ Faces found in library photos are grouped into people. Under **PEOPLE** in Faces
 - **Find a person** filters by name. A long list shows its first three rows until **Show all**.
 - Click a face to open it in the People view. Right-click it to **Show their photos in the
   filmstrip**.
+- **Regroup** checks the faces not named yet against the people you have named, and moves the
+  clear matches to them. Borderline faces stay for you to confirm under Possible matches. A note
+  says how many moved, and names anyone skipped because their own photos are too mixed to go by.
 
 #### The People view
 
 Clicking a face fills the main window with that person:
 
-- A large close-up of their face, and **Name**: type their name and press **Enter**. Naming two
+- A large close-up of their face, and **Name**: type their name and press **Enter**. Names you
+  already use that fit what you typed come up underneath: **Tab** or click to use one. Naming two
   groups the same joins them into one person.
 - **Could this be one of them?** lists named people who look alike; click a name to put these
   photos with theirs.
 - Every photo they are in, with the face outlined in amber. Hover the **magnifying glass** in a
   photo's corner for a close-up of the face in it, useful when a face is small.
-- **×** in a photo's corner (on hover) takes it out of the set.
+- **Cards: Photo / Face:** show each card as the whole photo, or as the face up close (easier to
+  tell who it is).
+- **Show:** **All** the photos, **Least alike first**, or **Least like <name>** (only the faces
+  well below the rest in likeness). The last two bring wrong faces to the top: other people,
+  things that aren't faces, tiny faces, or the person as a small child. Nothing is taken out
+  unless you take it out.
+- **×** in a photo's corner (on hover) takes it out of the set. Develop remembers that the face is
+  not this person: Regroup and Possible matches never put it back.
 - **Picking several:** click a photo to pick it, **Ctrl-click** (Cmd-click) to add or remove one,
   **Shift-click** to pick a run. With several picked, **Take N out of this set** (or the Delete key)
   removes them. While photos are picked, the Keywords section works on them.
@@ -285,6 +359,8 @@ Right-click a photo in the filmstrip, or the photo in the viewer:
 - **Convert to DNG…** and **Convert to DNG, embedding the original…**
 - **Copy settings** and **Paste settings** (to N photos)
 - **Rating**
+- **Show in File Explorer** (Windows) or **Show in Finder** (Mac): opens the photo's folder with
+  the photo selected. Also in the grid and the People view.
 
 When several photos are selected and you right-click one of them, the menu applies to all of them.
 
@@ -469,6 +545,21 @@ raise **Orange** for brighter skin or sand, raise **Green** and **Yellow** for l
 
 Sharpening is shown as it will look at the current zoom, so fit view looks like a resized export.
 
+**Noise Reduction** works on every photo, JPEG, PNG, TIFF and HEIC included, live as you drag:
+
+- **Luminance** (0-100): smooths grain in brightness. Single bright or dark specks are removed
+  first.
+  - **Detail** (50 by default): higher keeps more fine detail; lower smooths more.
+  - **Contrast** (0 by default): gives back texture that is bigger than the grain.
+- **Color** (0-100): removes colour blotches, keeping colours from bleeding across edges.
+  - **Detail** (50 by default): higher keeps small coloured details.
+  - **Smoothness** (50 by default): higher evens out wider blotches.
+
+Detail, Contrast and Smoothness are greyed out until their slider above is above 0. A trace of
+fine grain is kept, so smooth areas don't look plastic. For raw files, **AI Denoise** above is
+usually cleaner still; the two can be used together. Noise reduction is kept in presets and
+versions.
+
 ### Lens correction
 
 - **Enable Profile Corrections** with a **Source**:
@@ -616,10 +707,16 @@ on a Mac.
 | `sections.tsv` | Which sections you closed (the others are open) |
 | `library.txt` | The library's folders |
 | `library-index.tsv` | What Develop knows about each library photo, for searching |
-| `faces.tsv`, `people.tsv` | The faces found in library photos (where they are, and a fingerprint of each), and the people they are grouped into |
-| `clip.tsv` | What each library photo shows, as numbers, for searching by description and keyword suggestions |
+| `library/` | The faces found in library photos (where they are, and a fingerprint of each), the people they are grouped into, and what each photo shows (for searching by description and keyword suggestions): one file per photo folder and per named person |
+| `faces.tsv`, `people.tsv`, `clip.tsv` | The library as Develop 0.4 kept it, left as it was so an older Develop still works |
+| `dates/` | Capture dates of folders' photos, so folders open in order at once |
+| `faces-paused` | There while finding faces is paused |
+| `moves.log` | A record of folders moved with Move to… |
 | `keyword-vocabulary.txt` | Your own list of words for keyword suggestions, if you make one |
 | `thumbs/` | Thumbnails of edited photos and of versions, and small pictures of faces |
+
+A [shared library](#sharing-a-library) keeps its face and search data in a hidden `.develop`
+folder inside the shared folder instead of `library/`.
 | `lensfun/` | Your extra Lensfun lens profiles |
 | `mcp-http.txt` | The address and token of the HTTP MCP server, when used |
 
@@ -685,7 +782,8 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | Double-click the photo | Fit / 100% (in crop mode: finish) |
 | Middle-button drag | Pan (also in Retouch) |
 | Double-click a slider's name | Back to its default |
-| Right-click | Export, Convert to DNG, Copy / Paste settings, Rating |
+| Right-click a photo | Export, Convert to DNG, Copy / Paste settings, Rating, Show in File Explorer / Finder |
+| Right-click a folder | Add to / Remove from Library, Move to… |
 | Ctrl-click / Shift-click in the filmstrip, grid or People view | Add to the selection / select a range |
 | Double-click a photo in the grid or People view | Open it |
 | Drag photos from the People view onto a face under People | Move them to that person |
@@ -757,7 +855,15 @@ Other `--name value` options set sliders for testing.
 - **No suggested keywords, or search finds nothing by description.** The image understanding
   model files were not found; reinstall Develop.
 - **The same person is split into two groups.** Give both the same name, or drag the photos onto
-  the right face; check **Possible matches** too.
+  the right face; check **Possible matches** too. Once a few people are named, **Regroup** moves
+  the clear matches for you.
+- **Wrong faces in someone's set.** On their page, choose **Show: Least alike first** and take out
+  the ones that aren't them.
+- **Finding faces makes the computer busy.** Click **Pause**; it stays paused until you resume it.
+- **A move stopped part-way.** Run **Move to…** again with the same destination: it checks what
+  is already there and carries on. Nothing was removed that wasn't safely copied.
+- **A shared library doesn't show the other computer's changes.** Check that both computers can
+  reach the folder and run Develop 0.5.0 or later; changes show within seconds.
 - **Graphics problems.** The top bar shows which graphics system Develop uses; updating the
   graphics driver usually helps.
 - **macOS says the app is damaged or will not open.** See the README's

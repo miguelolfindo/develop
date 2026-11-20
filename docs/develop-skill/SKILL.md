@@ -94,6 +94,7 @@ usually stay well inside the range; big numbers are for deliberate looks.
 | `texture` / `clarity` | -100 to 100 | +10 to +30 for detail; negative to soften skin |
 | `dehaze` | -100 to 100 | +10 to +30 for haze; negative for a dreamy look |
 | `vibrance` / `saturation` | -100 to 100 | vibrance +10 to +30 is gentler than saturation |
+| `noise_luminance` / `noise_color` | 0 to 100 | high-ISO grain: luminance 20 to 50, color 25 to 50; works on any photo. Fine-tune with `noise_luminance_detail` (50), `noise_luminance_contrast` (0), `noise_color_detail` (50), `noise_color_smoothness` (50). Check at 100%: too much looks plastic |
 
 Colour tools: `hsl_hue`, `hsl_saturation`, `hsl_luminance` and `mono_mix` are objects keyed by
 `red, orange, yellow, green, aqua, blue, purple, magenta`, each -100 to 100. Orange covers skin
