@@ -219,6 +219,8 @@ inside the DNG (bigger files).
 
 ## What you cannot do here
 
-Retouching (heal and clone), AI noise reduction, crop by eye, naming people and correcting who is
-in a photo are done in the Develop app; tell the user when a request needs them. `get_settings` shows whether a photo has retouch spots
-or AI denoise, so you can avoid undoing their work: `reset_settings` clears those too.
+Retouching (heal and clone), masks (sliders painted onto part of a photo, such as darkening only
+the sky), AI noise reduction, crop by eye, naming people and correcting who is in a photo are done
+in the Develop app; tell the user when a request needs them. `get_settings` shows whether a photo
+has retouch spots, masks (by name) or AI denoise, so you can avoid undoing their work:
+`reset_settings` clears those too.

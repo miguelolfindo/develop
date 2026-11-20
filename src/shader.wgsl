@@ -99,6 +99,13 @@ struct Params {
     // Black & white: x = 1 when on; grey brightness per colour (-1..1), eight in two vec4.
     mono_info: vec4<f32>,
     mono_mix: array<vec4<f32>, 2>,
+    // Masks: x = number of masks, y = 1 + the mask shown as a red overlay (0 = none). Per
+    // mask k, mask_vals[3k..3k+2] = (exposure stops, log2 contrast power, highlights,
+    // shadows), (whites, blacks, texture, clarity), (dehaze, saturation), and mask_wb[k].xyz
+    // = log2 gains on the white-balanced camera colours.
+    mask_info: vec4<f32>,
+    mask_vals: array<vec4<f32>, 24>,
+    mask_wb: array<vec4<f32>, 8>,
 };
 
 // The gamma the tone curve's 0..1 scale is on (measured on Lightroom's point curves).
@@ -114,6 +121,31 @@ const CURVE_GAMMA: f32 = 2.2;
 @group(0) @binding(6) var table_sampler: sampler;
 // Healing gains (log, per colour), a 128 x 128 slot per spot.
 @group(0) @binding(7) var heal_atlas: texture_2d<f32>;
+// Where each mask applies (0..1), one layer per mask, on the picture as stored.
+@group(0) @binding(8) var mask_layers: texture_2d_array<f32>;
+
+// The sum of the masks' changes at a point, each times how much the mask covers it.
+struct Local {
+    a: vec4<f32>,
+    b: vec4<f32>,
+    c: vec4<f32>,
+    wb: vec3<f32>,
+};
+
+fn local_at(uv: vec2<f32>) -> Local {
+    var out = Local(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec3<f32>(0.0));
+    let n = i32(params.mask_info.x);
+    for (var k = 0; k < n; k++) {
+        let w = textureSampleLevel(mask_layers, texture_sampler, uv, k, 0.0).r;
+        if (w > 0.0) {
+            out.a += w * params.mask_vals[3 * k];
+            out.b += w * params.mask_vals[3 * k + 1];
+            out.c += w * params.mask_vals[3 * k + 2];
+            out.wb += w * params.mask_wb[k].xyz;
+        }
+    }
+    return out;
+}
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -944,8 +976,7 @@ const HAZE_PER_MEDIAN: f32 = 2.5;
 const DEHAZE_PER_DARK: f32 = 1.8;
 const DEHAZE_DARK_OFFSET: f32 = 0.45;
 
-fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32) -> vec3<f32> {
-    let p = params.presence;
+fn presence(color_in: vec3<f32>, uv: vec2<f32>, footprint: f32, p: vec3<f32>) -> vec3<f32> {
     if (abs(p.x) + abs(p.y) + abs(p.z) < 1.0e-4) {
         return color_in;
     }
@@ -1078,6 +1109,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
     let LUMA = params.luma.xyz;
+    // Masks: what they change here.
+    let local = local_at(uv);
+    let wb_local = exp2(local.wb);
 
     // 0. Noise reduction, on the picture as stored (before white balance), at the level of
     // detail on screen.
@@ -1086,10 +1120,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // 1. White balance with highlight reconstruction, then into the working space.
-    var color = to_work(balance(cam));
+    var color = to_work(balance(cam) * wb_local);
     if (params.input.x > 1.5) {
         // Finished picture: plain white-balance gains (relative to how it was saved).
-        color = to_work(cam * params.wb.rgb / params.wb.w);
+        color = to_work(cam * params.wb.rgb / params.wb.w * wb_local);
     }
     // 1a. Lens vignetting (profile and manual) and axial fringes, in linear light.
     color *= lens_vignette(lens.rv);
@@ -1141,7 +1175,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // 2. Exposure (includes the profile's baseline exposure).
-    color *= params.basic.x;
+    color *= params.basic.x * exp2(local.a.x);
 
     // 3. Tone sliders, all on linear light.
     // Blacks, fitted to Lightroom's slider at -100 / -50 / +50 / +100. Positive values are a
@@ -1150,7 +1184,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // channel, which is what makes shadows crush to black and gain saturation on the way.
     var luma = dot(color, LUMA);
     var lp = 0.0;
-    let bk = params.tone.w;
+    let bk = clamp(params.tone.w + local.b.y, -1.0, 1.0);
     if (bk >= 0.0) {
         color *= exp2(1.35 * bk / (1.0 + luma / 0.045));
     } else {
@@ -1163,7 +1197,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Neighbours much brighter or darker than the pixel (the other side of a silhouette) are
     // left out of that average, which keeps halos off hard edges. Hue is preserved.
     luma = dot(color, LUMA);
-    let h = params.tone.y;
+    let h = clamp(params.tone.y + local.a.z, -1.0, 1.0);
     let x_max = max(recovered_max * params.basic.x, 0.101);
     let base = luma * local_ratio(uv, cam);
     // On a darker photo Lightroom treats the top of the photo's own range as its highlights:
@@ -1185,7 +1219,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         0.1,
         1.0,
     );
-    let s = params.tone.z * shadow_strength;
+    let s = clamp(params.tone.z + local.a.w, -1.0, 1.0) * shadow_strength;
     let shadow_ref = select(0.23, 0.47, s >= 0.0);
     let below = max(log2(shadow_ref / max(base, 2e-4)), 0.0);
     // Eased in over the first half stop so there is no visible edge at the reference level.
@@ -1205,7 +1239,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // brightness. Hue is preserved.
     luma = dot(color, LUMA);
     lp = luma * luma;
-    let wh = params.tone.x;
+    let wh = clamp(params.tone.x + local.b.x, -1.0, 1.0);
     // Positive Whites also moves the white point: the further the photo's brightest areas (98th
     // and 99.7th percentile display levels) sit below white, the more everything is brought up, by up to
     // about 2.6 stops at +100 on a dark photo. Steep near the end of the slider, as measured.
@@ -1216,10 +1250,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     color *= exp2(select(whites_down, whites_up, wh >= 0.0));
 
     // 3b. Presence: dehaze, clarity, texture.
-    color = presence(color, uv, footprint);
+    color = presence(color, uv, footprint, clamp(params.presence.xyz + vec3<f32>(local.b.z, local.b.w, local.c.x), vec3<f32>(-1.0), vec3<f32>(1.0)));
 
     // 4. Contrast: power curve pivoting on linear mid-grey (0.18 stays 0.18).
-    color = 0.18 * pow(color / 0.18, vec3<f32>(params.basic.y));
+    color = 0.18 * pow(color / 0.18, vec3<f32>(params.basic.y * exp2(local.a.y)));
 
     // 5. Vibrance, fitted to Lightroom's slider at -100 / -50 / +50 / +100.
     {
@@ -1250,7 +1284,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // little under double, which is where Lightroom's slider lands.
     {
         let grey = dot(color, LUMA);
-        let s = params.basic.z;
+        let s = clamp(params.basic.z + local.c.y, -1.0, 1.0);
         // A boost fades out as the tone nears and passes display white (see bright_fade).
         let scale = 1.0 + s * select(1.0, 0.82 * bright_fade(grey), s >= 0.0);
         color = max(mix(vec3<f32>(grey), color, scale), vec3<f32>(0.0));
@@ -1351,6 +1385,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         } else if (top <= 0.0005) {
             color = vec3<f32>(0.03, 0.14, 0.90);
         }
+    }
+
+    // 6c. The mask being worked on, as a red overlay (viewport only).
+    if (params.mask_info.y > 0.5) {
+        let w = textureSampleLevel(mask_layers, texture_sampler, uv, i32(params.mask_info.y) - 1, 0.0).r;
+        color = mix(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.85, 0.05, 0.05), 0.55 * w);
     }
 
     // 7. Display encoding (skipped when the surface format already encodes sRGB).

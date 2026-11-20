@@ -22,6 +22,7 @@ mod headless;
 mod heic;
 mod lens;
 mod library;
+mod masks;
 mod mcp;
 mod mover;
 mod measure;
@@ -940,6 +941,9 @@ struct History {
 /// shows thousandths).
 const SPOT_MIN: f32 = 0.002;
 const SPOT_MAX: f32 = 0.2;
+/// Mask brush radius limits, as fractions of the picture height.
+const MASK_MIN: f32 = 0.003;
+const MASK_MAX: f32 = 0.3;
 
 /// How long the note "Changed by another program" shows.
 const OUTSIDE_NOTE_TIME: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1209,6 +1213,19 @@ struct App {
     spot_preview: spots::Preview,
     /// Open the Spot Removal section on the next frame (the tool was just switched on).
     spot_reveal: bool,
+    /// Masks: the open photo's masks, the brush switched on (K), the mask selected, the
+    /// brush for new strokes (size, feather, flow, erase, Auto Mask; its points hold a stroke
+    /// built from the command line), the stroke being painted, the red overlay (O), and
+    /// opening the Masks section on the next frame.
+    masks: Vec<masks::Mask>,
+    mask_tool: bool,
+    mask_selected: Option<usize>,
+    mask_brush: masks::Stroke,
+    mask_paint: Option<masks::Stroke>,
+    mask_overlay: bool,
+    mask_reveal: bool,
+    /// The masks' pictures as drawn and sent to the GPU (see `sync_masks`).
+    mask_state: std::cell::RefCell<masks::Drawn>,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
     /// `--focus-out <file>`: with `--export`, also measure focus on the full-size picture and
@@ -1419,6 +1436,14 @@ impl App {
             spot_brush: spots::Spot { x: 0.0, y: 0.0, sx: 0.0, sy: 0.0, path: Vec::new(), radius: 0.012, feather: 0.5, opacity: 1.0, clone: false },
             spot_preview: spots::Preview::default(),
             spot_reveal: false,
+            masks: Vec::new(),
+            mask_tool: false,
+            mask_selected: None,
+            mask_brush: masks::Stroke { points: Vec::new(), radius: 0.05, feather: 0.6, flow: 1.0, erase: false, auto: false },
+            mask_paint: None,
+            mask_overlay: true,
+            mask_reveal: false,
+            mask_state: Default::default(),
             overrides: {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
@@ -1724,6 +1749,11 @@ impl App {
                 self.spot_drag = None;
                 self.spot_preview = spots::Preview::from_mips(&image.mips, 2400);
                 self.heal_grids.borrow_mut().clear();
+                self.masks.clear();
+                self.mask_selected = None;
+                self.mask_paint = None;
+                // A new photo: its masks are drawn afresh, on a new (empty) texture.
+                *self.mask_state.borrow_mut() = masks::Drawn::default();
                 self.lens = lens::LensSettings::default();
                 self.lens_make_pick = None;
                 self.lens_auto = self.lens_db.auto_match(&image.exif);
@@ -1899,6 +1929,44 @@ impl App {
                         "--show-curve" => self.curve_reveal = value > 0.5,
                         // Black & white, for testing: `--mono 1 --mono-yellow 60`.
                         "--mono" => self.mono = value > 0.5,
+                        // Masks, for testing: `--mask-new 1` adds a mask; `--mask-x 0.4 --mask-y
+                        // 0.6` starts a stroke, `--mask-px 0.5 --mask-py 0.6` adds points, and
+                        // `--mask-r 0.05` paints it onto the selected mask (a new one if none);
+                        // `--mask-auto 1`, `--mask-erase 1`, `--mask-feather`, `--mask-flow`
+                        // set the brush first; `--mask-exposure 1` (any slider) sets the selected
+                        // mask's slider; `--mask-tool 1` shows the brush, `--mask-overlay 0`
+                        // hides the overlay.
+                        "--mask-new" => self.new_mask(),
+                        "--mask-tool" => self.set_mask_tool(value > 0.5),
+                        "--mask-overlay" => self.mask_overlay = value > 0.5,
+                        "--mask-auto" => self.mask_brush.auto = value > 0.5,
+                        "--mask-erase" => self.mask_brush.erase = value > 0.5,
+                        "--mask-feather" => self.mask_brush.feather = value.clamp(0.0, 1.0),
+                        "--mask-flow" => self.mask_brush.flow = value.clamp(0.0, 1.0),
+                        "--mask-x" => self.mask_brush.points = vec![[value, 0.5]],
+                        "--mask-y" | "--mask-py" => {
+                            if let Some(p) = self.mask_brush.points.last_mut() {
+                                p[1] = value;
+                            }
+                        }
+                        "--mask-px" => self.mask_brush.points.push([value, 0.5]),
+                        "--mask-r" => {
+                            let points = std::mem::take(&mut self.mask_brush.points);
+                            if !points.is_empty() {
+                                if self.mask_selected.filter(|&i| i < self.masks.len()).is_none() {
+                                    self.new_mask();
+                                }
+                                if let Some(i) = self.mask_selected.filter(|&i| i < self.masks.len()) {
+                                    self.masks[i].strokes.push(masks::Stroke { points, radius: value.clamp(MASK_MIN, MASK_MAX), ..self.mask_brush.clone() });
+                                }
+                            }
+                        }
+                        other if other.starts_with("--mask-") => {
+                            let name = other.trim_start_matches("--mask-");
+                            if let (Some(k), Some(i)) = (masks::SLIDERS.iter().position(|s| s.0.eq_ignore_ascii_case(name)), self.mask_selected.filter(|&i| i < self.masks.len())) {
+                                self.masks[i].values[k] = value.clamp(masks::SLIDERS[k].1, masks::SLIDERS[k].2);
+                            }
+                        }
                         other if other.starts_with("--mono-") => {
                             if let Some(i) = tone::COLOURS.iter().position(|c| c.0.eq_ignore_ascii_case(other.trim_start_matches("--mono-"))) {
                                 self.mono_mix[i] = value.clamp(-100.0, 100.0);
@@ -2186,6 +2254,9 @@ impl App {
         self.spots = saved.spots.clone();
         self.spot_selected = self.spot_selected.filter(|&i| i < self.spots.len());
         self.spot_drag = None;
+        self.masks = saved.masks.clone();
+        self.mask_selected = self.mask_selected.filter(|&i| i < self.masks.len());
+        self.mask_paint = None;
         self.lens = saved.lens.clone();
         self.tint = saved.tint;
         self.profile = match saved.profile.as_str() {
@@ -2310,6 +2381,7 @@ impl App {
             mono_mix: self.mono_mix,
             lens: self.lens.clone(),
             spots: self.spots.clone(),
+            masks: self.masks.clone(),
             values: self.adjust.to_array(),
             quarter_turns: self.quarter_turns % 4,
             profile: match self.profile {
@@ -2375,6 +2447,10 @@ impl App {
             .map(|i| grids.get(i).and_then(|g| g.as_ref()).filter(|g| !self.spots[i].clone && g.key == spots::heal_key(&self.spots, i, &self.spot_preview)))
             .collect();
         spots::fill_uniforms(&self.spots, &current, loaded.width / loaded.height.max(1.0), &mut u);
+        // Masks, once their pictures are on the GPU at the photo's size.
+        if !self.masks.is_empty() && self.mask_state.borrow().gpu_size.0 > 0 {
+            masks::fill_uniforms(&self.masks, self.adjust.kelvin, self.tint, CONTRAST_UNITS, |k, t| loaded.color.wb_gains_tinted(k, t), &mut u);
+        }
         // Tone curve and Color Mixer (the "before" view and the scene measurement leave them out).
         if !tone::curve_is_identity(&self.curve, &self.regions) {
             let lut = tone::lut(&self.curve, &self.regions);
@@ -2453,6 +2529,11 @@ impl App {
                 for (i, x) in v.mono_mix.iter().enumerate() {
                     u.mono_mix[i / 4][i % 4] = x / 100.0;
                 }
+            }
+            // Only the open edit's masks are drawn, so a version shows its masks when they are
+            // the same ones (its sliders may differ).
+            if !v.masks.is_empty() && self.mask_state.borrow().gpu_size.0 > 0 && v.masks.iter().map(|m| &m.strokes).eq(self.masks.iter().map(|m| &m.strokes)) {
+                masks::fill_uniforms(&v.masks, Adjust::from_array(v.values).kelvin, v.tint, CONTRAST_UNITS, |k, t| loaded.color.wb_gains_tinted(k, t), &mut u);
             }
             return u;
         }
@@ -2554,6 +2635,9 @@ impl App {
             hsl_info: [0.0; 4],
             mono_info: [0.0; 4],
             mono_mix: [[0.0; 4]; 2],
+            mask_info: [0.0; 4],
+            mask_vals: [[0.0; 4]; masks::MAX_MASKS * 3],
+            mask_wb: [[0.0; 4]; masks::MAX_MASKS],
             srgb_to_work: {
                 let inv = color::invert(&render.work_to_srgb).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
                 rows(&inv)
@@ -2918,6 +3002,7 @@ impl App {
     /// and compression) does not block the window.
     fn start_export(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.sync_heal();
+        self.sync_masks();
         let Some(loaded) = &self.loaded else { return };
         if self.export_job.is_some() {
             return;
@@ -3722,11 +3807,276 @@ impl App {
         }
     }
 
+    /// Draw the masks' pictures that are new or have changed, paint the newest part of the
+    /// stroke being painted, and send what changed to the GPU. Called once a frame, before
+    /// anything holds the renderer.
+    fn sync_masks(&self) {
+        if self.loaded.is_none() || self.spot_preview.width == 0 {
+            return;
+        }
+        let painting = self.mask_paint.as_ref().and_then(|s| self.mask_selected.filter(|&i| i < self.masks.len()).map(|i| (i, s)));
+        let mut state = self.mask_state.borrow_mut();
+        // Nothing to draw (a photo without masks gets no texture at all).
+        if self.masks.is_empty() && state.layers.iter().all(|l| l.key == 0) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        state.sync(&self.masks, painting, &self.spot_preview);
+        if std::env::var_os("DEVELOP_DEBUG_MASKS").is_some() && !state.pending.is_empty() {
+            eprintln!("masks: {} uploads after {:.1} ms", state.pending.len(), started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let (w, h) = state.size;
+        if state.pending.is_empty() && state.gpu_size == (w, h) {
+            return;
+        }
+        let rs = &self.render_state;
+        let mut renderer = rs.renderer.write();
+        let Some(res) = renderer.callback_resources.get_mut::<ImageRenderer>() else { return };
+        if state.gpu_size != (w, h) {
+            res.set_mask_size(&rs.device, w as u32, h as u32);
+            state.gpu_size = (w, h);
+            let all: Vec<(usize, usize, usize)> = (0..state.layers.len()).filter(|&i| !state.layers[i].data.is_empty()).map(|i| (i, 0, h)).collect();
+            state.pending = all;
+        }
+        let pending = std::mem::take(&mut state.pending);
+        // DEVELOP_MASK_DUMP=<folder>: write each mask as it is sent, as a picture (for testing).
+        if let Some(dir) = std::env::var_os("DEVELOP_MASK_DUMP") {
+            for &(i, _, _) in &pending {
+                if let Some(layer) = state.layers.get(i).filter(|l| !l.data.is_empty()) {
+                    let _ = image::GrayImage::from_raw(w as u32, h as u32, layer.data.clone()).map(|g| g.save(std::path::Path::new(&dir).join(format!("mask{}.png", i + 1))));
+                }
+            }
+        }
+        let mut zeros = Vec::new();
+        for (i, y0, y1) in pending {
+            let Some(layer) = state.layers.get(i) else { continue };
+            let data = if layer.data.is_empty() {
+                if zeros.is_empty() {
+                    zeros = vec![0u8; w * h];
+                }
+                &zeros
+            } else {
+                &layer.data
+            };
+            res.write_mask_rows(&rs.queue, i, data, y0, y1);
+        }
+    }
+
+    /// Switch the mask brush on or off (the spot tool, the eyedropper and crop mode go off).
+    fn set_mask_tool(&mut self, on: bool) {
+        if on {
+            self.wb_pick = false;
+            self.spot_tool = false;
+            self.spot_drag = None;
+            self.spot_paint = None;
+            self.spot_selected = None;
+            self.crop_mode = false;
+            self.mask_reveal = true;
+            if self.mask_selected.filter(|&i| i < self.masks.len()).is_none() {
+                self.mask_selected = self.masks.len().checked_sub(1);
+            }
+        }
+        if !on {
+            self.finish_mask_stroke();
+        }
+        self.mask_tool = on;
+    }
+
+    /// Add an empty mask and select it.
+    fn new_mask(&mut self) {
+        new_mask(&mut self.masks, &mut self.mask_selected);
+    }
+
+    /// The stroke being painted is done: it goes onto the selected mask.
+    fn finish_mask_stroke(&mut self) {
+        finish_mask_stroke(&mut self.masks, self.mask_selected, &mut self.mask_paint, &self.mask_state, &self.spot_preview);
+    }
+
+    /// [ / ] (smaller / bigger) and Shift+[ / Shift+] (harder / softer edge): the mask brush.
+    fn mask_keys(&mut self, up: bool, shift: bool) {
+        let b = &mut self.mask_brush;
+        if shift {
+            b.feather = ((b.feather + if up { 0.1 } else { -0.1 }) * 10.0).round().clamp(0.0, 10.0) / 10.0;
+        } else {
+            b.radius = (if up { b.radius * 1.15 } else { b.radius / 1.15 }).clamp(MASK_MIN, MASK_MAX);
+        }
+    }
+
+    /// The brush under the pointer and a hint, over the picture.
+    fn mask_overlay_ui(&self, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, rect: egui::Rect) {
+        let painter = ui.painter().with_clip_rect(rect);
+        let shadow = egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(110));
+        let space = ui.input(|i| i.key_down(egui::Key::Space));
+        let alt = ui.input(|i| i.modifiers.alt);
+        let erase = match &self.mask_paint {
+            Some(s) => s.erase,
+            None => self.mask_brush.erase ^ alt,
+        };
+        if space {
+            ui.ctx().set_cursor_icon(if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        } else if let Some(p) = response.hover_pos().or(response.interact_pointer_pos()) {
+            let t = map.to_texture(p);
+            let r = self.mask_brush.radius * map.points_per_height(t);
+            painter.circle_stroke(p, r, shadow);
+            painter.circle_stroke(p, r, egui::Stroke::new(1.25_f32, egui::Color32::WHITE));
+            if self.mask_brush.feather > 0.0 && self.mask_brush.feather < 1.0 {
+                painter.circle_stroke(p, r * (1.0 - self.mask_brush.feather), egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(110)));
+            }
+            // + paints in, - erases.
+            let arm = (r * 0.25).clamp(3.0, 7.0);
+            for s in [shadow, egui::Stroke::new(1.5_f32, egui::Color32::WHITE)] {
+                painter.line_segment([p - egui::vec2(arm, 0.0), p + egui::vec2(arm, 0.0)], s);
+                if !erase {
+                    painter.line_segment([p - egui::vec2(0.0, arm), p + egui::vec2(0.0, arm)], s);
+                }
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        }
+        let name = self.mask_selected.and_then(|i| self.masks.get(i)).map_or("New mask", |m| m.name.as_str());
+        let hint = format!(
+            "{name}  ·  {}  ·  Paint where the sliders should apply  ·  Alt {}  ·  Space+drag pans  ·  [ ] size  ·  Shift+[ ] feather  ·  O overlay  ·  Esc done",
+            if erase { "Erase" } else { "Add" },
+            if self.mask_brush.erase { "adds" } else { "erases" },
+        );
+        let galley = painter.layout_no_wrap(hint, theme::font(11.5), theme::TEXT);
+        let back = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 10.0 + galley.size().y * 0.5 + 4.0), galley.size() + egui::vec2(16.0, 8.0));
+        painter.rect_filled(back, 5.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xD8));
+        painter.galley(back.min + egui::vec2(8.0, 4.0), galley, theme::TEXT);
+    }
+
+    /// The "Masks" section: the brush, the list of masks, the brush settings, and the
+    /// selected mask's sliders.
+    fn mask_panel(&mut self, ui: &mut egui::Ui) {
+        let amber = theme::ACCENT;
+        ui.add_enabled_ui(self.loaded.is_some(), |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let new_width = 58.0;
+                let (text, look) = if self.mask_tool { ("Done", ui::Look::teal()) } else { ("Brush", ui::Look::raised()) };
+                let width = ui.available_width() - new_width - 6.0;
+                let hint = "K. Paint on the photo where the sliders below should apply. Alt paints with the other mode (erases while adding). Auto Mask keeps the brush to areas like the one under its centre.";
+                if ui::button(ui, text, egui::vec2(width, 28.0), look, theme::font(12.5), None).on_hover_text(hint).clicked() {
+                    self.set_mask_tool(!self.mask_tool);
+                }
+                if ui
+                    .add_enabled_ui(self.masks.len() < masks::MAX_MASKS, |ui| ui::button(ui, "+ New", egui::vec2(new_width, 28.0), ui::Look::secondary(), theme::font(12.0), None))
+                    .inner
+                    .on_hover_text("Start a new mask, with its own sliders")
+                    .clicked()
+                {
+                    self.new_mask();
+                    self.set_mask_tool(true);
+                }
+            });
+            ui.add_space(6.0);
+            let mut select = None;
+            let mut remove = None;
+            for i in 0..self.masks.len() {
+                let selected = self.mask_selected == Some(i);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.checkbox(&mut self.masks[i].on, "").on_hover_text("Apply this mask (untick to see the photo without it)");
+                    let m = &self.masks[i];
+                    let text = if m.strokes.is_empty() { format!("{}  (not painted yet)", m.name) } else { m.name.clone() };
+                    if ui.selectable_label(selected, text).clicked() {
+                        select = Some(i);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Delete this mask").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(i) = select {
+                self.mask_selected = Some(i);
+            }
+            if let Some(i) = remove {
+                self.mask_paint = None;
+                self.masks.remove(i);
+                self.mask_selected = match self.mask_selected {
+                    Some(s) if s == i => None,
+                    Some(s) if s > i => Some(s - 1),
+                    other => other,
+                };
+            }
+            if self.masks.is_empty() {
+                ui.label(ui::dim("No masks yet. Press Brush and paint on the photo.", 11.5));
+            }
+            let selected = self.mask_selected.filter(|&i| i < self.masks.len());
+            if let Some(i) = selected {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Name").color(theme::TEXT));
+                    ui.add(egui::TextEdit::singleline(&mut self.masks[i].name).desired_width(f32::INFINITY).char_limit(40));
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Brush").font(theme::font(12.0)).color(theme::TEXT_HEADER));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Mode").color(theme::TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.mask_brush.erase, true, "Erase").on_hover_text("Take parts out of the mask");
+                    ui.selectable_value(&mut self.mask_brush.erase, false, "Add").on_hover_text("Paint parts into the mask");
+                });
+            });
+            let b = &mut self.mask_brush;
+            let mut size = b.radius * 1000.0;
+            if ui::pro_slider_with(ui, "Size", &mut size, MASK_MIN * 1000.0..=MASK_MAX * 1000.0, 50.0, "", amber, 0, 1.0, true) {
+                b.radius = (size / 1000.0).clamp(MASK_MIN, MASK_MAX);
+            }
+            let mut feather = b.feather * 100.0;
+            if ui::pro_slider_with(ui, "Feather", &mut feather, 0.0..=100.0, 60.0, "", amber, 0, 1.0, true) {
+                b.feather = (feather / 100.0).clamp(0.0, 1.0);
+            }
+            let mut flow = b.flow * 100.0;
+            if ui::pro_slider_with(ui, "Flow", &mut flow, 1.0..=100.0, 100.0, "", amber, 0, 1.0, true) {
+                b.flow = (flow / 100.0).clamp(0.01, 1.0);
+            }
+            ui.add_space(2.0);
+            ui::toggle(ui, &mut self.mask_brush.auto, "Auto Mask").on_hover_text("Keep the brush to areas that look like the one under its centre, so it stops at edges (a sky against trees, a face against its background)");
+            ui::toggle(ui, &mut self.mask_overlay, "Show Overlay  (O)").on_hover_text("Show the selected mask in red while the brush is on");
+
+            ui.add_space(8.0);
+            match selected {
+                Some(i) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} sliders", self.masks[i].name)).font(theme::font(12.0)).color(theme::TEXT_HEADER));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Reset").on_hover_text("Set this mask's sliders back to 0").clicked() {
+                                self.masks[i].values = [0.0; masks::LOCAL];
+                            }
+                        });
+                    });
+                    let mono = self.mono;
+                    for (k, (name, lo, hi, unit)) in masks::SLIDERS.iter().enumerate() {
+                        if matches!(k, 2 | 4 | 8 | 11) {
+                            ui.add_space(4.0);
+                        }
+                        // No colour to change in black & white.
+                        let colour = matches!(k, 0 | 1 | 11);
+                        ui.add_enabled_ui(!(mono && colour), |ui| {
+                            ui::pro_slider(ui, name, &mut self.masks[i].values[k], *lo..=*hi, 0.0, unit, amber);
+                        });
+                    }
+                }
+                None if !self.masks.is_empty() => {
+                    ui.label(ui::dim("Select a mask to set its sliders.", 11.5));
+                }
+                None => {}
+            }
+            ui.add_space(4.0);
+            ui.label(ui::dim("K brush  ·  Alt erases  ·  [ ] size  ·  Shift+[ ] feather  ·  O overlay", 11.5));
+        });
+    }
+
     /// Switch the white balance eyedropper on or off (the spot tool and crop mode go off).
     fn set_wb_pick(&mut self, on: bool) {
         self.wb_pick = on;
         if on {
             self.set_spot_tool(false);
+            self.set_mask_tool(false);
             self.crop_mode = false;
         }
     }
@@ -3734,6 +4084,7 @@ impl App {
     fn set_spot_tool(&mut self, on: bool) {
         if on {
             self.wb_pick = false;
+            self.set_mask_tool(false);
         }
         self.spot_tool = on;
         self.spot_drag = None;
@@ -4097,6 +4448,7 @@ impl App {
             hsl: [[0.0; 8]; 3],
             mono: false,
             mono_mix: [0.0; 8],
+            masks: Vec::new(),
         }
     }
 
@@ -4256,6 +4608,9 @@ impl App {
         self.mono_mix = [0.0; 8];
         self.spots.clear();
         self.spot_selected = None;
+        self.masks.clear();
+        self.mask_selected = None;
+        self.mask_paint = None;
         self.lens = lens::LensSettings::default();
         self.reset_crop();
     }
@@ -6254,6 +6609,16 @@ impl App {
 
         ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));
 
+        // Switching the brush on opens this section and scrolls it into view.
+        let reveal = std::mem::take(&mut self.mask_reveal);
+        if reveal {
+            ui::set_section_open("Masks", true);
+        }
+        ui::section(ui, "Masks", false, "Sliders that change only the parts of the photo you brush in  (K)", |ui| self.mask_panel(ui));
+        if reveal {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        }
+
         // Switching the spot tool on opens this section and scrolls it into view.
         let reveal = std::mem::take(&mut self.spot_reveal);
         if reveal {
@@ -6546,6 +6911,8 @@ impl App {
         if self.crop_mode {
             self.spot_tool = false;
             self.spot_paint = None;
+            self.mask_tool = false;
+            self.mask_paint = None;
             self.crop_viewport(ui, rect, &response);
             return;
         }
@@ -6593,6 +6960,19 @@ impl App {
             let mut io = SpotInput { spots: &mut self.spots, selected: &mut self.spot_selected, drag: &mut self.spot_drag, paint: &mut self.spot_paint };
             io.handle(&self.spot_brush, &self.spot_preview, ui, &response, &map, pan);
         }
+        // Mask brush: drags paint, clicks dab (before panning sees them).
+        if self.mask_tool {
+            let map = self.spot_map(loaded, rect, view_px / (dims * zoom), cropped);
+            let pan = ui.input(|i| i.key_down(egui::Key::Space));
+            let mut io = MaskInput {
+                masks: &mut self.masks,
+                selected: &mut self.mask_selected,
+                paint: &mut self.mask_paint,
+                state: &self.mask_state,
+                preview: &self.spot_preview,
+            };
+            io.handle(&self.mask_brush, ui, &response, &map, pan);
+        }
         // Offset of the pointer from the viewport centre, in viewport fractions.
         let pointer = response.hover_pos().map_or(egui::Vec2::ZERO, |p| (p - rect.min) / rect.size() - half);
 
@@ -6606,7 +6986,7 @@ impl App {
         if factor != 1.0 {
             target = Some(zoom * factor);
         }
-        if response.double_clicked() && !self.spot_tool && !self.wb_pick {
+        if response.double_clicked() && !self.spot_tool && !self.mask_tool && !self.wb_pick {
             target = Some(if self.zoom.is_some() { fit } else { 1.0_f32.max(fit * 2.0) });
         }
         if let Some(target) = target {
@@ -6617,7 +6997,7 @@ impl App {
             zoom = new_zoom;
         }
         let space = ui.input(|i| i.key_down(egui::Key::Space));
-        let spot_busy = self.spot_tool && (!space || self.spot_drag.is_some() || self.spot_paint.is_some());
+        let spot_busy = (self.spot_tool && (!space || self.spot_drag.is_some() || self.spot_paint.is_some())) || (self.mask_tool && (!space || self.mask_paint.is_some()));
         if (response.dragged_by(egui::PointerButton::Primary) && !spot_busy) || response.dragged_by(egui::PointerButton::Middle) {
             self.center -= response.drag_delta() * ppp / (dims * zoom);
         }
@@ -6640,6 +7020,12 @@ impl App {
             let mut uniforms = self.uniforms(loaded, view, res.shader_encodes_srgb);
             if self.clipping {
                 uniforms.input[1] = 1.0;
+            }
+            // The selected mask in red while the brush is on (on screen only).
+            if self.mask_tool && self.mask_overlay && self.mask_state.borrow().gpu_size.0 > 0 {
+                if let Some(i) = self.mask_selected.filter(|&i| i < self.masks.len()) {
+                    uniforms.mask_info[1] = (i + 1) as f32;
+                }
             }
             res.write_uniforms(&self.render_state.queue, &uniforms);
             if self.ab_split {
@@ -6690,6 +7076,10 @@ impl App {
             // Circles drawn where the picture is now (after this frame's zoom and pan).
             let map = self.spot_map(loaded, rect, scale, cropped);
             self.spot_overlay(ui, &response, &map, rect);
+        }
+        if self.mask_tool {
+            let map = self.spot_map(loaded, rect, scale, cropped);
+            self.mask_overlay_ui(ui, &response, &map, rect);
         }
         self.canvas_hud(ui, outer, zoom);
     }
@@ -6790,6 +7180,7 @@ impl App {
         self.quit_guard(ctx);
         self.poll_loader();
         self.sync_heal();
+        self.sync_masks();
         self.update_dialog(ctx);
         self.export_windows(ctx);
         // Record finished edits in the open photo's undo history.
@@ -6914,6 +7305,10 @@ impl App {
             if self.spot_tool && self.loaded.is_some() {
                 if left || right {
                     self.spot_keys(right, shift);
+                }
+            } else if self.mask_tool && self.loaded.is_some() {
+                if left || right {
+                    self.mask_keys(right, shift);
                 }
             } else {
                 self.show_left ^= left;
@@ -7109,6 +7504,18 @@ impl App {
             } else if esc && self.wb_pick {
                 self.wb_pick = false;
             }
+            // Masks: K switches the brush on and off, O shows the overlay, Esc leaves.
+            let (k, o) = ctx.input(|i| (!i.modifiers.any() && i.key_pressed(egui::Key::K), !i.modifiers.any() && i.key_pressed(egui::Key::O)));
+            if k {
+                self.set_mask_tool(!self.mask_tool);
+            } else if self.mask_tool {
+                if esc {
+                    self.set_mask_tool(false);
+                }
+                if o {
+                    self.mask_overlay = !self.mask_overlay;
+                }
+            }
             if self.spot_tool {
                 if esc {
                     if self.spot_selected.is_some() {
@@ -7195,6 +7602,81 @@ fn spot_hit(spots: &[spots::Spot], selected: Option<usize>, map: &spots::ScreenM
         }
     }
     None
+}
+
+/// Add an empty mask and select it.
+fn new_mask(list: &mut Vec<masks::Mask>, selected: &mut Option<usize>) {
+    if list.len() >= masks::MAX_MASKS {
+        return;
+    }
+    list.push(masks::Mask::new(masks::next_name(list)));
+    *selected = Some(list.len() - 1);
+}
+
+/// The stroke being painted is done: it goes onto the selected mask.
+fn finish_mask_stroke(list: &mut [masks::Mask], selected: Option<usize>, paint: &mut Option<masks::Stroke>, state: &std::cell::RefCell<masks::Drawn>, preview: &spots::Preview) {
+    let Some(stroke) = paint.take() else { return };
+    let Some(i) = selected.filter(|&i| i < list.len()) else { return };
+    state.borrow_mut().finish(i, &list[i].strokes, &stroke, preview);
+    list[i].strokes.push(stroke);
+}
+
+/// What the mask brush changes as the pointer clicks and paints.
+struct MaskInput<'a> {
+    masks: &'a mut Vec<masks::Mask>,
+    selected: &'a mut Option<usize>,
+    paint: &'a mut Option<masks::Stroke>,
+    state: &'a std::cell::RefCell<masks::Drawn>,
+    preview: &'a spots::Preview,
+}
+
+impl MaskInput<'_> {
+    /// A drag paints a stroke, a click a single dab, onto the selected mask (a new one when
+    /// none is). Alt paints with the other mode (Add or Erase). Nothing starts while `pan`
+    /// (Space) is held.
+    fn handle(&mut self, brush: &masks::Stroke, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, pan: bool) {
+        let aspect = map.aspect();
+        let inside = |t: [f32; 2]| (0.0..=1.0).contains(&t[0]) && (0.0..=1.0).contains(&t[1]);
+        let alt = ui.input(|i| i.modifiers.alt);
+        if response.drag_started_by(egui::PointerButton::Primary) && !pan {
+            if let Some(t) = ui.input(|i| i.pointer.press_origin()).map(|o| map.to_texture(o)).filter(|&t| inside(t)) {
+                self.start(brush, t, alt);
+            }
+        }
+        let released = !ui.input(|i| i.pointer.primary_down());
+        if let Some(stroke) = self.paint.as_mut() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let t = map.to_texture(p);
+                let t = [t[0].clamp(0.0, 1.0), t[1].clamp(0.0, 1.0)];
+                let last = *stroke.points.last().unwrap_or(&t);
+                if ((t[0] - last[0]) * aspect).hypot(t[1] - last[1]) >= 0.1 * stroke.radius {
+                    stroke.points.push(t);
+                }
+            }
+            if released {
+                self.finish();
+            }
+        }
+        if response.clicked() && self.paint.is_none() && !pan {
+            if let Some(t) = response.interact_pointer_pos().map(|p| map.to_texture(p)).filter(|&t| inside(t)) {
+                self.start(brush, t, alt);
+                self.finish();
+            }
+        }
+    }
+
+    fn start(&mut self, brush: &masks::Stroke, t: [f32; 2], alt: bool) {
+        if self.selected.filter(|&i| i < self.masks.len()).is_none() {
+            new_mask(self.masks, self.selected);
+        }
+        if self.selected.is_some() {
+            *self.paint = Some(masks::Stroke { points: vec![t], erase: brush.erase ^ alt, ..brush.clone() });
+        }
+    }
+
+    fn finish(&mut self) {
+        finish_mask_stroke(self.masks, *self.selected, self.paint, self.state, self.preview);
+    }
 }
 
 /// What the spot tool changes as the pointer clicks, drags and paints.

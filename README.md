@@ -41,7 +41,7 @@ AI assistants can help with your work.
 **What it does not have (Lightroom does):**
 - A full catalog: no collections, smart collections, map or import; the library is a list of
   folders, and keywords and names live in each photo's `.dvlp` file.
-- Local adjustments: no masks, brushes, gradients, or AI subject and sky selection.
+- Gradient and radial masks, and AI subject and sky selection (masks are painted with a brush).
 - Content-aware fill and AI object removal: retouching copies from a source you can
   move (heal or clone), it does not invent content.
 - A colour grading panel and per-channel (red, green, blue) curves.
@@ -62,7 +62,7 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   - **Presets:** save the current look as a preset (optionally with its white balance), and
     apply a preset to the open photo or to every selected photo with one click. A preset
     carries tone, presence, colour, curve, mixer, detail and profile settings; crop,
-    rotation, lens correction and retouching stay as they are on each photo.
+    rotation, lens correction, masks and retouching stay as they are on each photo.
   - **Versions:** save named versions of a photo's edit, switch between them (Undo goes
     back), update or delete them, and show any version as "before" in the A/B split to
     compare it with the current edit. Versions are kept in the photo's `.dvlp` file, and
@@ -95,6 +95,11 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
     correction data for Sony lenses, plus manual distortion, defringe and vignette.
     Distortion correction is applied automatically for Nikon Z, Panasonic, Olympus / OM
     System and Fujifilm cameras, as Lightroom does.
+  - **Masks** (K): paint where a set of sliders applies (Temp, Tint, Exposure, Contrast,
+    Highlights, Shadows, Whites, Blacks, Texture, Clarity, Dehaze, Saturation), up to 8 masks
+    per photo, each with its own sliders. Add and Erase brushes with size, feather and flow,
+    and **Auto Mask**, which keeps the brush to areas like the one under its centre so it
+    stops at edges. A red overlay shows the mask being painted.
   - **Retouch** (Q): click a dust spot or blemish to remove it, or paint over a longer
     one (a wire, a branch, a scratch). Develop picks a nearby area to copy from; **Heal**
     blends it into the surroundings, **Clone** copies it as it is. Spots are layered in

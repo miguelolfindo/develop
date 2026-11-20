@@ -1054,6 +1054,7 @@ fn blank() -> Saved {
         hsl: [[0.0; 8]; 3],
         mono: false,
         mono_mix: [0.0; 8],
+        masks: Vec::new(),
     }
 }
 
@@ -1076,6 +1077,7 @@ fn to_json(s: &Saved) -> Value {
         "crop": s.crop, "straighten": s.angle,
         "lens_correction": s.lens.enabled,
         "retouch_spots": s.spots.len(),
+        "masks": s.masks.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "ai_denoise": s.denoise,
     })
 }

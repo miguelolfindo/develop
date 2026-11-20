@@ -19,7 +19,8 @@ covers everything the app does, in the order you would use it.
      · [Crop and straighten](#crop-and-straighten) · [White balance](#white-balance)
      · [Tone](#tone) · [Presence](#presence) · [Tone curve](#tone-curve)
      · [Color mixer](#color-mixer) · [Black and white mix](#black-and-white-mix)
-     · [Detail](#detail) · [Lens correction](#lens-correction) · [Retouch](#retouch)
+     · [Detail](#detail) · [Lens correction](#lens-correction) · [Masks](#masks)
+     · [Retouch](#retouch)
 6. [Undo, reset, copy and paste](#6-undo-reset-copy-and-paste)
 7. [Exporting](#7-exporting)
 8. [Converting to DNG](#8-converting-to-dng)
@@ -407,15 +408,15 @@ Save the current look and reuse it on other photos.
 - **Delete:** the **×** next to a preset.
 
 A preset carries the profile, tone, presence, tone curve, color mixer or black and white mix,
-and detail settings. Crop, rotation, lens correction, retouching and AI denoise stay as they are
-on each photo. Presets with white balance are marked **WB** in the list.
+and detail settings. Crop, rotation, lens correction, masks, retouching and AI denoise stay as
+they are on each photo. Presets with white balance are marked **WB** in the list.
 
 ### Versions
 
 Keep several versions of one photo's edit and switch between them.
 
 - **Save:** type a name (or leave it empty for "Version 1", "Version 2"…) and click **Save**. A
-  version keeps the whole edit, including crop and retouching.
+  version keeps the whole edit, including crop, masks and retouching.
 - **Switch:** click a version's name. **Undo** takes you back to the edit you had.
 - **A/B:** shows that version as "before" in the A/B split, against your current edit.
 - **Update:** replaces the version with the current edit.
@@ -582,6 +583,36 @@ For Nikon Z, Panasonic, Olympus / OM System and Fujifilm cameras, distortion cor
 applied automatically even with profile corrections off, as Lightroom does for these cameras.
 To add lenses, open the Lensfun folder from the panel, drop Lensfun `.xml` files in, and reload.
 
+### Masks
+
+Masks are sliders that change only part of the photo: you paint where they apply. Darken a bright
+sky, lift a face in shadow, warm the sand, add clarity to a rock, all without touching the rest.
+
+- Click **Brush** (or press **K**) and paint on the photo. The first stroke starts **Mask 1**.
+  Click again (or press **Esc**) when you are done.
+- **+ New** starts another mask, with its own sliders. A photo can have up to 8 masks. Click a
+  mask's name in the list to select it: painting and the sliders below act on the selected mask.
+- Each mask has **Temp**, **Tint**, **Exposure**, **Contrast**, **Highlights**, **Shadows**,
+  **Whites**, **Blacks**, **Texture**, **Clarity**, **Dehaze** and **Saturation**. They add to
+  the photo's own sliders where the mask is painted: Exposure −1 in a mask makes that part one
+  stop darker than the rest. Where two masks overlap, both apply. **Reset** puts the selected
+  mask's sliders back to 0.
+- **Brush:** **Add** paints into the mask, **Erase** takes parts out; hold **Alt** to paint
+  with the other one. **Size**, **Feather** (soft edge) and **Flow** (how much one stroke paints
+  in; paint over a place again to build it up). **[** and **]** make the brush smaller or bigger,
+  **Shift+[** and **Shift+]** change the feather.
+- **Auto Mask** keeps the brush to areas that look like the one under its centre (the small
+  cross), so it stops at edges: paint along a skyline with the cross in the sky and the trees or
+  roofs below are left out. Keep the centre on what you want: where it passes over something
+  else, that is painted in instead.
+- **Show Overlay** (or **O**) shows the selected mask in red while the brush is on.
+- The tick beside a mask switches it off and on, to compare; the **×** deletes it. You can rename
+  the selected mask under the list.
+- **Space**+drag (or the middle mouse button) pans while the brush is on.
+
+Masks are kept with the photo's other edits, in versions, and in Undo; they are copied with
+**Copy settings**. Presets leave them alone.
+
 ### Retouch
 
 Remove dust spots, blemishes and small distractions. Click **Remove Spots** (or press **Q**):
@@ -611,8 +642,8 @@ the whole painted shape, so wide patches blend smoothly. A photo can have up to 
   buttons at the top of the inspector. Each photo has its own history while Develop is open; one
   slider drag is one step.
 - **Reset All:** the whole edit back to Develop's defaults: every slider, white balance (as
-  shot), crop and angle, tone curve, color mixer, black and white, sharpening, lens correction and
-  retouching. Undo brings it back. Versions and the rating are kept.
+  shot), crop and angle, tone curve, color mixer, black and white, sharpening, lens correction,
+  masks and retouching. Undo brings it back. Versions and the rating are kept.
 - **Copy and paste settings:** **Ctrl+C** copies the open photo's settings (also from the
   right-click menu); **Ctrl+V** pastes them onto the open photo, or onto every selected photo.
   Pasting onto photos that are not open keeps each photo's own crop and rotation. Copying also
@@ -767,20 +798,23 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | Enter | Finish cropping |
 | W | White balance eyedropper (Esc cancels) |
 | Q | Retouch (spot removal) on / off |
-| [ / ] | Show / hide the folder panel / inspector; in Retouch, brush smaller / bigger |
-| Shift+[ / Shift+] | In Retouch: feather harder / softer |
+| K | Mask brush on / off |
+| O | With the mask brush: show / hide the red overlay |
+| Alt (held) | With the mask brush: paint with the other mode (erase while adding) |
+| [ / ] | Show / hide the folder panel / inspector; in Retouch or with the mask brush, brush smaller / bigger |
+| Shift+[ / Shift+] | In Retouch or with the mask brush: feather harder / softer |
 | Delete, Backspace | In Retouch: remove the selected spot |
 | H | In Retouch: hide / show the outlines |
-| Space+drag | In Retouch: pan |
-| Esc | In Retouch: deselect, then leave the tool; in the People view: back to the photo |
+| Space+drag | In Retouch or with the mask brush: pan |
+| Esc | In Retouch: deselect, then leave the tool; with the mask brush: leave it; in the People view: back to the photo |
 | Delete | In the People view: take the picked photos out of the set |
 
 | Mouse | Action |
 |---|---|
 | Scroll / pinch | Zoom around the pointer |
-| Drag | Pan (in Retouch: paint, or move an outline) |
+| Drag | Pan (in Retouch: paint, or move an outline; with the mask brush: paint) |
 | Double-click the photo | Fit / 100% (in crop mode: finish) |
-| Middle-button drag | Pan (also in Retouch) |
+| Middle-button drag | Pan (also in Retouch and with the mask brush) |
 | Double-click a slider's name | Back to its default |
 | Right-click a photo | Export, Convert to DNG, Copy / Paste settings, Rating, Show in File Explorer / Finder |
 | Right-click a folder | Add to / Remove from Library, Move to… |

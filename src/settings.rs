@@ -47,6 +47,8 @@ pub struct Saved {
     /// Black & white, and how bright each colour becomes in grey (-100..100, see tone::COLOURS).
     pub mono: bool,
     pub mono_mix: [f32; 8],
+    /// Masks: sliders that change only the parts brushed in (see masks.rs).
+    pub masks: Vec<crate::masks::Mask>,
 }
 
 /// A saved version of a photo's edit: a name, when it was saved (seconds since 1970), and the
@@ -200,7 +202,9 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     for (i, value) in sharpen.iter_mut().enumerate().skip(4) {
         *value = fields.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(SHARPEN_DEFAULT[i]).clamp(0.0, 100.0);
     }
-    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix }))
+    // Masks, after that (added in 0.6.0).
+    let masks = fields.next().map(crate::masks::from_field).unwrap_or_default();
+    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix, masks }))
 }
 
 /// What identifies a version's thumbnail: the photo, the version's name and when it was saved
@@ -253,7 +257,7 @@ const SIDECAR_HEADER: &str = "Develop settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -283,7 +287,8 @@ fn saved_fields(s: &Saved) -> String {
         s.sharpen[6],
         s.sharpen[7],
         s.sharpen[8],
-        s.sharpen[9]
+        s.sharpen[9],
+        crate::masks::to_field(&s.masks)
     )
 }
 
@@ -1047,6 +1052,20 @@ people	Talia	Miguel
         assert_eq!(side.keywords, vec!["wedding".to_owned(), "car".to_owned()], "repeats and blanks dropped");
         assert_eq!(side.people, vec!["Talia".to_owned(), "Miguel".to_owned()]);
         assert!(side.saved.is_none());
+    }
+
+    #[test]
+    fn masks_round_trip() {
+        let mut a = sample();
+        let mut m = crate::masks::Mask::new("Sky".into());
+        m.values[crate::masks::EXPOSURE] = -1.0;
+        m.strokes.push(crate::masks::Stroke { points: vec![[0.2, 0.1], [0.6, 0.12]], radius: 0.1, feather: 0.5, flow: 1.0, erase: false, auto: true });
+        a.masks.push(m);
+        let (_, back) = parse_line(&format!("photo	{}", saved_fields(&a))).expect("parses");
+        assert_eq!(back.masks, a.masks);
+        assert_eq!(back.sharpen, a.sharpen, "fields before the masks still read");
+        // A line from before masks has none.
+        assert!(sample().masks.is_empty());
     }
 
     #[test]

@@ -86,6 +86,11 @@ pub struct Uniforms {
     /// values in two vec4).
     pub mono_info: [f32; 4],
     pub mono_mix: [[f32; 4]; 2],
+    /// Masks (see masks.rs): x = number of masks, y = 1 + the mask shown as an overlay (0 =
+    /// none); per mask three vec4 of local slider changes and the white balance change.
+    pub mask_info: [f32; 4],
+    pub mask_vals: [[f32; 4]; crate::masks::MAX_MASKS * 3],
+    pub mask_wb: [[f32; 4]; crate::masks::MAX_MASKS],
 }
 
 /// Export renders into half floats and converts on the CPU, so 16-bit output is real 16-bit.
@@ -110,6 +115,10 @@ pub struct ImageRenderer {
     /// Healing gains, one slot per spot (see `spots::HealGrid`).
     heal_texture: wgpu::Texture,
     heal_view: wgpu::TextureView,
+    /// Where each mask applies, one layer per mask (see masks.rs), and its size.
+    mask_texture: wgpu::Texture,
+    mask_view: wgpu::TextureView,
+    pub mask_size: (u32, u32),
     bind_group: wgpu::BindGroup,
     /// Settings and bindings for rendering the picture small for the scopes.
     scope_uniform_buf: wgpu::Buffer,
@@ -170,6 +179,7 @@ impl ImageRenderer {
                 texture_entry(5, wgpu::TextureViewDimension::D2),
                 sampler_entry(6),
                 texture_entry(7, wgpu::TextureViewDimension::D2),
+                texture_entry(8, wgpu::TextureViewDimension::D2Array),
             ],
         });
 
@@ -244,6 +254,7 @@ impl ImageRenderer {
             view_formats: &[],
         });
         let heal_view = heal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (mask_texture, mask_view) = Self::create_masks(device, 1, 1);
 
         let scope_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scope uniforms"),
@@ -275,6 +286,9 @@ impl ImageRenderer {
             curve_view,
             heal_texture,
             heal_view,
+            mask_texture,
+            mask_view,
+            mask_size: (1, 1),
             shader_encodes_srgb: !target_format.is_srgb(),
         };
         this.rebuild_bind_group(device);
@@ -370,6 +384,7 @@ impl ImageRenderer {
                 view(5, &self.curve_view),
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.table_sampler) },
                 view(7, &self.heal_view),
+                view(8, &self.mask_view),
             ],
         })
     }
@@ -388,6 +403,51 @@ impl ImageRenderer {
             bytemuck::cast_slice(&texels),
             wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(grid.nx as u32 * 8), rows_per_image: Some(grid.ny as u32) },
             wgpu::Extent3d { width: grid.nx as u32, height: grid.ny as u32, depth_or_array_layers: 1 },
+        );
+    }
+
+    fn create_masks(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("masks"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: crate::masks::MAX_MASKS as u32 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        (texture, view)
+    }
+
+    /// Make the masks' texture afresh, `width` x `height`, all layers empty.
+    pub fn set_mask_size(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        (self.mask_texture, self.mask_view) = Self::create_masks(device, width, height);
+        self.mask_size = (width, height);
+        self.rebuild_bind_group(device);
+    }
+
+    /// Upload rows `y0..y1` of mask layer `layer` (`data` is the whole layer, row-major).
+    pub fn write_mask_rows(&self, queue: &wgpu::Queue, layer: usize, data: &[u8], y0: usize, y1: usize) {
+        let (w, h) = (self.mask_size.0 as usize, self.mask_size.1 as usize);
+        if data.len() != w * h || y0 >= y1.min(h) {
+            return;
+        }
+        let y1 = y1.min(h);
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.mask_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: y0 as u32, z: layer as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data[y0 * w..y1 * w],
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(w as u32), rows_per_image: Some((y1 - y0) as u32) },
+            wgpu::Extent3d { width: w as u32, height: (y1 - y0) as u32, depth_or_array_layers: 1 },
         );
     }
 

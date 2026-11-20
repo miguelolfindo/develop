@@ -1,3 +1,33 @@
+## Develop 0.6.0
+
+Masks: sliders that change only the parts of a photo you paint.
+
+### Masks
+- **Masks** (Inspector, above Retouch): click **Brush** (or press **K**) and paint on the photo
+  where the sliders should apply. Each mask has its own **Temp**, **Tint**, **Exposure**,
+  **Contrast**, **Highlights**, **Shadows**, **Whites**, **Blacks**, **Texture**, **Clarity**,
+  **Dehaze** and **Saturation**, added to the photo's own sliders where it is painted.
+- Up to 8 masks per photo: **+ New** starts another one. Tick or untick a mask to compare, rename
+  it, or delete it with **×**.
+- **Add** and **Erase** brushes (hold **Alt** for the other one), with **Size**, **Feather** and
+  **Flow**; `[` `]` change the size and Shift+`[` `]` the feather, as in Retouch.
+- **Auto Mask** keeps the brush to areas that look like the one under its centre, so it stops at
+  edges: paint a sky with the centre in the sky, and roofs, trees and people are left out.
+- The mask being painted shows in red (**O** shows or hides it).
+- Masks are saved with the photo's edit, in versions and in Undo, and copied with Copy settings.
+  Presets leave them alone. AI assistants see which masks a photo has.
+
+### Known limitations
+- The mask sliders use the same maths as the main sliders, but have not yet been compared with
+  Lightroom's masks on reference exports, so the same numbers may look a little different.
+- A mask's edge is worked out on a copy of the photo about 2,400 pixels across, so at 100% zoom
+  on a big photo its edge is soft rather than pixel-sharp.
+- No gradient or radial masks, and no AI subject or sky selection yet.
+- An older Develop shows these photos without their masks, and editing one there removes its
+  masks. Update every computer that edits the same photos (a shared library included).
+
+---
+
 ## Develop 0.5.0
 
 A big library on a network drive now stays fast, can be shared between computers, and can be

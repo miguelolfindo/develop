@@ -404,8 +404,9 @@ brought inside it.
 | `straighten` | -45 to 45 | Degrees |
 | `lens_correction` | true / false | Lens profile correction |
 
-`get_settings` also reports `retouch_spots` (how many heal and clone spots the photo has) and
-`ai_denoise`. Those, and retouching itself, are changed in the app.
+`get_settings` also reports `retouch_spots` (how many heal and clone spots the photo has),
+`masks` (the names of the photo's masks: sliders painted onto parts of the photo) and
+`ai_denoise`. Those, retouching and masks themselves, are changed in the app.
 
 ## Checking an edit with numbers
 
