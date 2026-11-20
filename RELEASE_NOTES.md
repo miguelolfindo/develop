@@ -10,7 +10,7 @@ smaller updates.
   people, names, keywords and search. Changes made on one show on the other within seconds.
 - Each new photo is read on one computer only, whichever gets to it first.
 - If two computers change the same thing, nothing is lost: the newer name wins, and the People
-  view says "named on <computer>".
+  view says which computer gave the name ("named on MacBook-Air").
 - **Stop sharing…** stops on this computer only (you can come back with **Use the shared library
   again**) or for everyone. Either way, every computer keeps a full copy, and the shared data is
   kept as a backup.
@@ -43,7 +43,7 @@ smaller updates.
 - Faces remember who they are **not**. A face you take out of someone's set is never put back by
   Regroup or offered as a possible match.
 - While you type a name, names you already use come up: press Tab or click to use one.
-- **Show** above a person's photos: **All**, **Least alike first**, or **Least like <name>**.
+- **Show** above a person's photos: **All**, **Least alike first**, or **Least like** the person.
   The last two bring wrong faces to the top: other people, things that aren't faces, and tiny
   faces. Nothing is taken out unless you take it out.
 - **Cards: Photo / Face** shows each card as the whole photo or as the face up close.

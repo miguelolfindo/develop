@@ -10,6 +10,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Add the Mac small update package to this existing release (a tag such as v0.5.0), built from that tag. Leave empty for a test build."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -80,6 +85,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Started by hand for an existing release: build that release's code.
+          ref: ${{ inputs.release || github.ref }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -152,10 +160,16 @@ jobs:
         shell: bash
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          app=$(find dist target/release -maxdepth 4 -name '*.app' -type d 2>/dev/null | head -1)
-          if [ -z "$app" ]; then echo "::warning::No .app found; Mac updates will use the full disk image."; exit 0; fi
           stage=$(mktemp -d)
+          # The app as it is in the disk image (packaging the .dmg leaves no .app behind).
+          dmg=$(ls dist/*.dmg | head -1)
+          mnt=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          app=$(find "$mnt" -maxdepth 1 -name '*.app' -type d | head -1)
+          [ -n "$app" ] || { hdiutil detach "$mnt"; echo "::error::No .app in $dmg"; exit 1; }
           ditto "$app" "$stage/Develop.app"
+          hdiutil detach "$mnt"
+          ls "$stage/Develop.app/Contents/Resources/models/"
           rm -f "$stage/Develop.app/Contents/Resources/models/"*.onnx
           (cd "$stage" && ditto -c -k --keepParent Develop.app "$GITHUB_WORKSPACE/dist/Develop_${v}_aarch64-update.zip")
           ls -l dist
@@ -169,6 +183,13 @@ jobs:
           shopt -s nullglob
           files=(${{ matrix.artifact }})
           gh release upload "${{ github.ref_name }}" "${files[@]}" --clobber
+
+      - name: Add the Mac small update package to an existing release
+        if: inputs.release != '' && runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release }}" dist/*-update.zip --repo "${{ github.repository }}" --clobber
 
       - name: Keep the installer as a build artifact
         uses: actions/upload-artifact@v4

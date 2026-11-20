@@ -269,7 +269,7 @@ file server. Right-click a library folder under **LIBRARY** and choose **Share t
   computer only, whichever gets there first.
 - Nothing is overwritten: when both computers change things at once, both changes are kept. If
   two computers rename the same person at about the same time, the later name wins; a name given
-  on another computer shows "named on <computer>".
+  on another computer shows which computer gave it, for example "named on MacBook-Air".
 - Each computer also keeps its own copy of the names, for when the folder can't be reached.
 - **Stop sharing…** offers **Stop on this computer** (the others carry on; come back later with
   **Use the shared library again**) or **Stop for everyone** (the `.develop` folder is renamed
@@ -322,7 +322,7 @@ Clicking a face fills the main window with that person:
   photo's corner for a close-up of the face in it, useful when a face is small.
 - **Cards: Photo / Face:** show each card as the whole photo, or as the face up close (easier to
   tell who it is).
-- **Show:** **All** the photos, **Least alike first**, or **Least like <name>** (only the faces
+- **Show:** **All** the photos, **Least alike first**, or **Least like** the person (only the faces
   well below the rest in likeness). The last two bring wrong faces to the top: other people,
   things that aren't faces, tiny faces, or the person as a small child. Nothing is taken out
   unless you take it out.
