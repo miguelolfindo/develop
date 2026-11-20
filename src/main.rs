@@ -663,7 +663,6 @@ fn justified(width: f32, count: usize, wish: f32, gap: f32) -> f32 {
 /// One photo card in the People view: the photo with the face outlined, a caption under it and
 /// a corner button. Returns the card's response and whether the corner button was clicked.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn person_card(ui: &mut egui::Ui, pictures: &mut pictures::Pictures, photo: &Path, area: [f32; 4], card: f32, picked: bool, dimmed: bool, button: CardButton, caption: &str, id: egui::Id, face_only: bool) -> (egui::Response, bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(card, card + 18.0), egui::Sense::click_and_drag());
     let tile = egui::Rect::from_min_size(rect.min, egui::Vec2::splat(card));
@@ -1072,6 +1071,8 @@ struct App {
     person_view_data: Option<(u64, u32, std::rc::Rc<PersonViewData>)>,
     /// `--person N`: open that person once the library has been read.
     person_at_start: Option<usize>,
+    /// Face pictures the People list may still read from disk this frame.
+    face_loads_left: usize,
     /// Writes people's names into `.dvlp` files of folders not open, in the background.
     names_writer: Option<std::sync::mpsc::Sender<(PathBuf, Vec<String>)>>,
     /// The person page: all their photos, least alike first, or only the unlike ones.
@@ -1337,6 +1338,7 @@ impl App {
             move_check: None,
             person_view_data: None,
             person_at_start: None,
+            face_loads_left: 0,
             names_writer: None,
             person_show: PersonShow::All,
             person_cards_face: false,
@@ -1500,6 +1502,8 @@ impl App {
                 _ => PersonShow::All,
             };
             app.person_cards_face = std::env::var("DEVELOP_PERSON_CARDS").is_ok_and(|v| v == "face");
+            // DEVELOP_PEOPLE_ALL: the People list with everyone shown (measuring).
+            app.people_show_all |= std::env::var_os("DEVELOP_PEOPLE_ALL").is_some();
         }
         // `--move-preview <folder> <into>`: start with Move to…'s summary showing (screenshots).
         if let Some(i) = args.iter().position(|a| a == "--move-preview") {
@@ -5206,17 +5210,24 @@ impl App {
     }
 
     /// The face picture of a People list entry (a small saved crop).
+    /// (A few new ones per frame at most, `face_loads_left`: the rest follow in the next frames,
+    /// so showing thousands of people never holds the window up.)
     fn face_texture(&mut self, ctx: &egui::Context, face: Option<&(String, u8)>) -> Option<egui::TextureHandle> {
         let file = face.and_then(|(k, n)| people::face_thumb(k, *n))?;
-        self.face_textures
-            .entry(file.clone())
-            .or_insert_with(|| {
-                image::open(&file).ok().map(|i| {
-                    let rgb = i.to_rgb8();
-                    ctx.load_texture(file.display().to_string(), egui::ColorImage::from_rgb([rgb.width() as usize, rgb.height() as usize], rgb.as_raw()), egui::TextureOptions::LINEAR)
-                })
-            })
-            .clone()
+        if let Some(t) = self.face_textures.get(&file) {
+            return t.clone();
+        }
+        if self.face_loads_left == 0 {
+            ctx.request_repaint();
+            return None;
+        }
+        self.face_loads_left -= 1;
+        let t = image::open(&file).ok().map(|i| {
+            let rgb = i.to_rgb8();
+            ctx.load_texture(file.display().to_string(), egui::ColorImage::from_rgb([rgb.width() as usize, rgb.height() as usize], rgb.as_raw()), egui::TextureOptions::LINEAR)
+        });
+        self.face_textures.insert(file, t.clone());
+        t
     }
 
     /// The People list: a grid of faces, named people first, then unnamed groups, largest first.
@@ -5272,17 +5283,35 @@ impl App {
         let mut open = None;
         let mut show_photos = None;
         let mut dropped = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 6.0);
-            for (id, name, count, face) in shown.iter().take(limit) {
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL, FACE + 30.0), egui::Sense::click());
+        self.face_loads_left = 24;
+        // The grid's space is taken in one go; only the people on screen are made and drawn
+        // (with "Show all", thousands are not on screen).
+        {
+            let cell = egui::vec2(CELL, FACE + 30.0);
+            let (gap_x, gap_y) = (4.0, 6.0);
+            let rows = shown.len().min(limit).div_ceil(columns);
+            let height = (rows as f32 * (cell.y + gap_y) - gap_y).max(0.0);
+            let (grid, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+            let clip = ui.clip_rect();
+            for (i, (id, name, count, face)) in shown.iter().take(limit).enumerate() {
+                let rect = egui::Rect::from_min_size(grid.min + egui::vec2((i % columns) as f32 * (cell.x + gap_x), (i / columns) as f32 * (cell.y + gap_y)), cell);
+                if !rect.intersects(clip) {
+                    continue;
+                }
+                let response = ui.interact(rect, ui.id().with(("people-cell", *id)), egui::Sense::click());
                 let circle = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + FACE / 2.0 + 2.0), egui::Vec2::splat(FACE));
+                let visible = ui.is_rect_visible(rect);
                 // The small face picture this computer made when it read the photo; in a shared
                 // library read by another computer there is none here: cut it from the photo.
-                let texture = self.face_texture(ui.ctx(), face.as_ref()).or_else(|| {
-                    let best = self.library.people.lock().ok().and_then(|p| p.best_face(*id));
-                    best.and_then(|f| self.people_pictures.face(&f.photo, f.area))
-                });
+                // Only for faces on screen (with "Show all", thousands are not).
+                let texture = if visible {
+                    self.face_texture(ui.ctx(), face.as_ref()).or_else(|| {
+                        let best = self.library.people.lock().ok().and_then(|p| p.best_face(*id));
+                        best.and_then(|f| self.people_pictures.face(&f.photo, f.area))
+                    })
+                } else {
+                    None
+                };
                 let drop_here = dragging && pointer.is_some_and(|p| rect.contains(p));
                 if drop_here {
                     self.drop_hint = Some(name.clone().unwrap_or_else(|| "this person".to_owned()));
@@ -5293,7 +5322,7 @@ impl App {
                     }
                 }
                 let selected = self.person_view == Some(*id);
-                if ui.is_rect_visible(rect) {
+                if visible {
                     let painter = ui.painter();
                     match texture {
                         Some(t) => {
@@ -5329,11 +5358,17 @@ impl App {
                 if response.clicked() {
                     open = Some(*id);
                 }
-                let tip = match name {
-                    Some(n) => format!("{n}: {count} photos. Click to see them; drop a photo here to move it to {n}"),
-                    None => format!("Someone in {count} photos. Click to see them and name them"),
+                // The tip only for the one under the pointer (making thousands each frame adds up).
+                let response = if response.hovered() {
+                    let tip = match name {
+                        Some(n) => format!("{n}: {count} photos. Click to see them; drop a photo here to move it to {n}"),
+                        None => format!("Someone in {count} photos. Click to see them and name them"),
+                    };
+                    response.on_hover_text(tip)
+                } else {
+                    response
                 };
-                response.on_hover_text(tip).context_menu(|ui| {
+                response.context_menu(|ui| {
                     if ui.button("Open").clicked() {
                         open = Some(*id);
                         ui.close_menu();
@@ -5344,7 +5379,7 @@ impl App {
                     }
                 });
             }
-        });
+        }
         if shown.len() > columns * 3 && filter.is_empty() {
             let text = if self.people_show_all { "Show fewer".to_owned() } else { format!("Show all {}", shown.len()) };
             if ui::button(ui, &text, egui::vec2(0.0, 22.0), ui::Look::ghost(), theme::font(11.5), None).clicked() {
@@ -5425,7 +5460,8 @@ impl App {
         }) else {
             return;
         };
-        let (faces, best, name, others, maybe, all_names, likeness) = (*data).clone();
+        // Borrowed, not copied: a set can hold thousands of photos.
+        let (faces, best, name, others, maybe, all_names, likeness) = &*data;
         if faces.is_empty() {
             self.person_view = None;
             return;
@@ -5615,30 +5651,37 @@ impl App {
             });
             ui.add_space(8.0);
         }
-        let faces: Vec<people::Face> = if self.person_show == PersonShow::All {
-            faces
+        let faces: Vec<&people::Face> = if self.person_show == PersonShow::All {
+            faces.iter().collect()
         } else {
-            let mut order: Vec<(f32, people::Face)> = likeness.iter().copied().zip(faces).filter(|(s, _)| self.person_show == PersonShow::LeastAlike || *s < UNLIKE).collect();
+            let mut order: Vec<(f32, &people::Face)> = likeness.iter().copied().zip(faces.iter()).filter(|(s, _)| self.person_show == PersonShow::LeastAlike || *s < UNLIKE).collect();
             order.sort_by(|a, b| a.0.total_cmp(&b.0));
             order.into_iter().map(|(_, f)| f).collect()
         };
-        let photos: Vec<PathBuf> = faces.iter().map(|f| f.photo.clone()).collect();
-        let maybe_photos: Vec<PathBuf> = maybe.iter().map(|(f, _)| f.photo.clone()).collect();
         egui::ScrollArea::vertical().id_source("person_photos").auto_shrink([false, false]).show(ui, |ui| {
             const GAP: f32 = 10.0;
             // Their photos: rows filling the width, the face outlined.
             let card = justified(ui.available_width(), faces.len(), 170.0, GAP);
             let top = ui.cursor().min;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(GAP, 12.0);
+            // The grid's space in one go; only the cards on screen are made and drawn (a set
+            // can hold thousands).
+            let columns = (((ui.available_width() + GAP) / (card + GAP)).floor() as usize).max(1);
+            let pitch = egui::vec2(card + GAP, card + 18.0 + 12.0);
+            let rows = faces.len().div_ceil(columns);
+            let (grid, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), (rows as f32 * pitch.y - 12.0).max(0.0)), egui::Sense::hover());
+            let clip = ui.clip_rect();
+            {
                 for (index, face) in faces.iter().enumerate() {
+                    let cell = egui::Rect::from_min_size(grid.min + egui::vec2((index % columns) as f32 * pitch.x, (index / columns) as f32 * pitch.y), egui::vec2(card, card + 18.0));
+                    if !cell.intersects(clip) {
+                        continue;
+                    }
                     let card_id = egui::Id::new(("person-photo", id, face.photo.clone()));
                     let pictures = &mut self.people_pictures;
                     let dimmed = dragged.as_ref().is_some_and(|d| d.items.iter().any(|(_, p)| p == &face.photo));
                     let picked = self.person_selected.contains(&face.photo);
                     let caption = face.photo.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    // Allocated through the wrapping row first, so each card wraps as a whole.
-                    ui.allocate_ui_with_layout(egui::vec2(card, card + 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.allocate_ui_at_rect(cell, |ui| {
                         let (response, corner) = person_card(ui, pictures, &face.photo, face.area, card, picked, dimmed, CardButton::Remove, &caption, card_id, self.person_cards_face);
                         if response.drag_started() {
                             drag_start = Some(index);
@@ -5660,7 +5703,7 @@ impl App {
                             });
                     });
                 }
-            });
+            }
             set_rect = egui::Rect::from_min_max(top, egui::pos2(top.x + ui.available_width(), ui.cursor().min.y));
             if maybe.is_empty() {
                 return;
@@ -5709,6 +5752,9 @@ impl App {
                 }
             });
         });
+        // The photos in order, for picking and dragging (only made when needed).
+        let photos: Vec<PathBuf> = if click.is_some() || drag_start.is_some() { faces.iter().map(|f| f.photo.clone()).collect() } else { Vec::new() };
+        let maybe_photos: Vec<PathBuf> = if maybe_click.is_some() || maybe_drag.is_some() { maybe.iter().map(|(f, _)| f.photo.clone()).collect() } else { Vec::new() };
         // Picking: click picks one, Ctrl-click adds or removes, Shift-click picks a run.
         if let Some((index, m)) = click {
             pick(&mut self.person_selected, &mut self.person_anchor, &photos, index, m);
@@ -5822,7 +5868,7 @@ impl App {
         if let Some(photo) = open {
             // The filmstrip shows this person's photos, with the one opened.
             let photos = self.library.photos_of(id);
-            let label = name.unwrap_or_else(|| "Unnamed".to_owned());
+            let label = name.clone().unwrap_or_else(|| "Unnamed".to_owned());
             self.filmstrip.show_results(photos, format!("People: {label}"));
             self.person_view = None;
             self.start_loading(photo, &ctx);
