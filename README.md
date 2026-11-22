@@ -123,7 +123,8 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   groups them into people you name. A People view shows each person's photos with their face
   outlined (as whole photos or face close-ups), lets you fix mistakes by dragging, offers possible
   matches to confirm, and shows the least alike faces first to find wrong ones. **Regroup** moves
-  unnamed faces that clearly match someone you named. Finding faces can be paused. Names go
+  unnamed faces that clearly match someone you named. **Faces** (F) on the open photo outlines
+  each face with its name; click one to name it or correct it. Finding faces can be paused. Names go
   into the photos' `.dvlp` files; face fingerprints stay on your computer.
 - **Shared library:** **Share this library…** lets several computers (PCs and Macs) use one
   library's people, names, keywords and search; changes show on the others within seconds, and

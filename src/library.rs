@@ -253,10 +253,10 @@ impl Library {
         }
         crate::store::set_not_shared_here(folder, true);
         let places = crate::store::places();
-        if let Ok(mut p) = self.people.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.people, "the people data") {
             p.use_places(&places);
         }
-        if let Ok(mut p) = self.pictures.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.pictures, "the photo descriptions") {
             p.use_places(&places);
         }
         let text = if everyone {
@@ -305,7 +305,7 @@ impl Library {
 
     /// Capture dates the index knows for photos in `dir` (unchanged since they were indexed).
     pub fn dates_in(&self, dir: &Path) -> HashMap<PathBuf, String> {
-        let Ok(s) = self.shared.lock() else { return HashMap::new() };
+        let Ok(s) = crate::freeze::lock(&self.shared, "the library index") else { return HashMap::new() };
         s.entries.values().filter(|e| e.path.parent() == Some(dir) && !e.taken.is_empty()).map(|e| (e.path.clone(), e.taken.clone())).collect()
     }
 
@@ -313,15 +313,15 @@ impl Library {
     /// at once. A library folder that was moved is replaced by its new place; a folder moved out
     /// of the library into a place outside it adds that place. Returns whether `to` was added.
     pub fn relocate(&mut self, from: &Path, to: &Path, ctx: &egui::Context) -> bool {
-        if let Ok(mut p) = self.people.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.people, "the people data") {
             p.relocate(from, to);
             p.save();
         }
-        if let Ok(mut p) = self.pictures.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.pictures, "the photo descriptions") {
             p.relocate(from, to);
             p.save();
         }
-        if let Ok(mut s) = self.shared.lock() {
+        if let Ok(mut s) = crate::freeze::lock(&self.shared, "the library index") {
             let moved: Vec<PathBuf> = s.entries.keys().filter(|p| crate::mover::relocated(p, from, to).is_some()).cloned().collect();
             for old in moved {
                 if let (Some(mut e), Some(new)) = (s.entries.remove(&old), crate::mover::relocated(&old, from, to)) {
@@ -379,7 +379,7 @@ impl Library {
     /// The slow part of a pass under way: (new photos read, new photos to read, seconds left),
     /// while faces and content are being read for photos not seen before.
     pub fn reading(&self) -> Option<(usize, usize, f32)> {
-        let s = self.shared.lock().ok()?;
+        let s = crate::freeze::lock(&self.shared, "the library index").ok()?;
         if !(s.indexing && s.to_read > s.read) {
             return None;
         }
@@ -394,24 +394,24 @@ impl Library {
     /// Save the faces and content read so far (when quitting in the middle of a pass); the rest
     /// is read on the next pass.
     pub fn save_progress(&self) {
-        if let Ok(mut p) = self.people.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.people, "the people data") {
             p.save();
         }
-        if let Ok(mut p) = self.pictures.lock() {
+        if let Ok(mut p) = crate::freeze::lock(&self.pictures, "the photo descriptions") {
             p.save();
         }
     }
 
     /// Indexing state: (running, photos looked at, photos found, photos indexed).
     pub fn status(&self) -> (bool, usize, usize, usize) {
-        let s = self.shared.lock().map(|s| (s.indexing, s.seen, s.found, s.entries.len()));
+        let s = crate::freeze::lock(&self.shared, "the library index").map(|s| (s.indexing, s.seen, s.found, s.entries.len()));
         s.unwrap_or((false, 0, 0, 0))
     }
 
     /// Start a pass over the library in the background, unless one is running.
     pub fn reindex(&mut self, ctx: &egui::Context) {
         {
-            let Ok(mut s) = self.shared.lock() else { return };
+            let Ok(mut s) = crate::freeze::lock(&self.shared, "the library index") else { return };
             if s.indexing {
                 return;
             }
@@ -606,21 +606,21 @@ impl Library {
             match change {
                 crate::store::Change::File(data, kind, name) => match kind.as_str() {
                     "content" => {
-                        if let Ok(mut p) = self.pictures.lock() {
+                        if let Ok(mut p) = crate::freeze::lock(&self.pictures, "the photo descriptions") {
                             p.reload(&data, &name);
                         }
                     }
                     _ => {
-                        if let Ok(mut p) = self.people.lock() {
+                        if let Ok(mut p) = crate::freeze::lock(&self.people, "the people data") {
                             p.reload(&data, &kind, &name);
                         }
                     }
                 },
                 crate::store::Change::All(data) => {
-                    if let Ok(mut p) = self.people.lock() {
+                    if let Ok(mut p) = crate::freeze::lock(&self.people, "the people data") {
                         p.reload_all(&data);
                     }
-                    if let Ok(mut p) = self.pictures.lock() {
+                    if let Ok(mut p) = crate::freeze::lock(&self.pictures, "the photo descriptions") {
                         p.reload_all(&data);
                     }
                 }
@@ -642,7 +642,7 @@ impl Library {
         if !self.contains(photo) {
             return;
         }
-        if let Ok(mut s) = self.shared.lock() {
+        if let Ok(mut s) = crate::freeze::lock(&self.shared, "the library index") {
             let entry = s.entries.entry(photo.to_path_buf()).or_insert_with(|| Entry {
                 path: photo.to_path_buf(),
                 stamp: (0, 0, 0),
@@ -660,7 +660,7 @@ impl Library {
 
     /// Note the names of the people in a photo in the index (its other tags as they were).
     pub fn note_people(&self, photo: &Path, people: &[String]) {
-        if let Ok(mut s) = self.shared.lock() {
+        if let Ok(mut s) = crate::freeze::lock(&self.shared, "the library index") {
             if let Some(entry) = s.entries.get_mut(photo) {
                 entry.people = people.to_vec();
                 entry.stamp = (0, 0, 0); // read it again on the next pass
@@ -670,13 +670,13 @@ impl Library {
 
     /// People's names the app should write into photos' `.dvlp` files (taken once).
     pub fn take_names_due(&self) -> Vec<(PathBuf, Vec<String>)> {
-        self.shared.lock().map(|mut s| std::mem::take(&mut s.names_due)).unwrap_or_default()
+        crate::freeze::lock(&self.shared, "the library index").map(|mut s| std::mem::take(&mut s.names_due)).unwrap_or_default()
     }
 
     /// The photos showing a person, oldest first (from the index's capture dates).
     pub fn photos_of(&self, id: u32) -> Vec<PathBuf> {
-        let photos = self.people.lock().map(|p| p.photos_of(id)).unwrap_or_default();
-        let Ok(s) = self.shared.lock() else { return photos };
+        let photos = crate::freeze::lock(&self.people, "the people data").map(|p| p.photos_of(id)).unwrap_or_default();
+        let Ok(s) = crate::freeze::lock(&self.shared, "the library index") else { return photos };
         let mut dated: Vec<(String, PathBuf)> = photos.into_iter().map(|p| (s.entries.get(&p).map(|e| e.taken.clone()).unwrap_or_default(), p)).collect();
         dated.sort();
         dated.into_iter().map(|(_, p)| p).collect()
@@ -686,7 +686,7 @@ impl Library {
     /// (oldest first), then those whose content fits the description best (by CLIP, best
     /// first). Returns the photos and how many matched by words.
     pub fn search(&self, query: &str, min_stars: u8) -> (Vec<PathBuf>, usize) {
-        let Ok(s) = self.shared.lock() else { return (Vec::new(), 0) };
+        let Ok(s) = crate::freeze::lock(&self.shared, "the library index") else { return (Vec::new(), 0) };
         let mut hits: Vec<&Entry> = s.entries.values().filter(|e| e.rating >= min_stars && matches(query, e)).collect();
         hits.sort_by(|a, b| a.taken.cmp(&b.taken).then_with(|| a.path.cmp(&b.path)));
         let mut out: Vec<PathBuf> = hits.into_iter().map(|e| e.path.clone()).collect();
@@ -718,7 +718,7 @@ impl Library {
             return Vec::new();
         }
         let k = crate::people::key(photo);
-        let cached = self.pictures.lock().ok().and_then(|p| p.get(&k).cloned());
+        let cached = crate::freeze::lock(&self.pictures, "the photo descriptions").ok().and_then(|p| p.get(&k).cloned());
         let Some(e) = cached.or_else(|| crate::clip::embed_photo(photo).ok()) else { return Vec::new() };
         crate::clip::suggest(&e).unwrap_or_default().into_iter().filter(|(w, _)| !have.iter().any(|h| h.eq_ignore_ascii_case(w))).collect()
     }
@@ -726,7 +726,7 @@ impl Library {
     /// Bring entries up to date with their sidecars now (ratings, keywords, people), without
     /// a full pass: for the MCP server, which reads the index written by the app.
     pub fn refresh_tags(&self) {
-        let Ok(mut s) = self.shared.lock() else { return };
+        let Ok(mut s) = crate::freeze::lock(&self.shared, "the library index") else { return };
         for e in s.entries.values_mut() {
             let st = stamp(&e.path);
             if st != e.stamp {

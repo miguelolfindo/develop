@@ -380,6 +380,17 @@ When several photos are selected and you right-click one of them, the menu appli
   "before" instead.
 - **Clipping:** marks blown highlights in red (every channel at maximum) or amber (some
   channels), and crushed blacks in blue.
+- **Faces** (or **F**): outlines the faces found in the photo, with each person's name under
+  their face ("Who is this?" for someone not named yet). Click a face (or its name) to name it:
+  type the name and press **Enter**. Names you already use come up as you type; click one, or
+  press **Tab** for the first. **Esc** closes the box.
+  - A face nobody has named yet is grouped with faces that look like it, and naming it names
+    the whole group, as naming them under [People](#people) does. The box says how many other
+    faces that is.
+  - A face that already has a name is being corrected: only that face moves to the new name.
+    **Not (name)** takes the name off it; it is never put back with that person.
+  - A photo that is not in your library is looked at for faces when you first show them (it
+    takes a moment).
 - **Histogram:** red, green and blue, white where all three overlap.
 - **Vectorscope:** colours by hue (angle) and strength (distance from the centre); the amber line
   is skin tone.
@@ -743,6 +754,7 @@ on a Mac.
 | `dates/` | Capture dates of folders' photos, so folders open in order at once |
 | `faces-paused` | There while finding faces is paused |
 | `moves.log` | A record of folders moved with Move to… |
+| `freeze.log` | Notes made when the window stops responding for a few seconds: what Develop was doing (see Troubleshooting) |
 | `keyword-vocabulary.txt` | Your own list of words for keyword suggestions, if you make one |
 | `thumbs/` | Thumbnails of edited photos and of versions, and small pictures of faces |
 
@@ -797,6 +809,7 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | R | Crop and straighten on / off |
 | Enter | Finish cropping |
 | W | White balance eyedropper (Esc cancels) |
+| F | Show / hide the faces on the photo, to name them |
 | Q | Retouch (spot removal) on / off |
 | K | Mask brush on / off |
 | O | With the mask brush: show / hide the red overlay |
@@ -879,6 +892,10 @@ Other `--name value` options set sliders for testing.
 - **Ctrl+V does nothing.** Copy the settings with Ctrl+C in Develop first (that also puts text on
   the clipboard Ctrl+V needs), or use the right-click menu.
 - **Edits did not follow a copied photo.** Copy its `.dvlp` file along with it.
+- **Develop stopped responding.** Whenever the window stops responding for more than a few
+  seconds, Develop writes down what it was doing in `freeze.log` in the settings folder (times
+  in UTC), and notes when it responds again. If it happens, send that file along with what you
+  were doing: it shows the step it was stuck on.
 - **A network computer is missing.** Add it by address in Network; on Windows, make sure network
   discovery is on; on a Mac, use Connect….
 - **Changes made by an AI assistant do not show.** They normally appear within a second. On some

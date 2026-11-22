@@ -783,6 +783,94 @@ impl People {
         touched
     }
 
+    /// The faces found in the photo with content key `k`: which face, its box (fractions of the
+    /// upright picture), its person and that person's name.
+    pub fn faces_in(&self, k: &str) -> Vec<(u8, [f32; 4], u32, Option<String>)> {
+        let mut out: Vec<_> = self
+            .faces
+            .iter()
+            .filter(|f| f.key == k)
+            .map(|f| (f.n, f.area, f.person, self.people.iter().find(|p| p.id == f.person).and_then(|p| p.name.clone())))
+            .collect();
+        out.sort_by(|a, b| a.1[0].total_cmp(&b.1[0]));
+        out
+    }
+
+    /// How many faces person `id` has.
+    pub fn face_count(&self, id: u32) -> usize {
+        self.faces.iter().filter(|f| f.person == id).count()
+    }
+
+    /// Every name in use, in order.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.people.iter().filter_map(|p| p.name.clone()).collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        names
+    }
+
+    /// Name face `n` of the photo with content key `k`, from the photo itself. A face in an
+    /// unnamed group names the whole group (as naming it under People does; a name already in
+    /// use joins that person). A face that already has a name is being corrected: only this
+    /// face moves, to the person with the new name (a new person if nobody has it), and it is
+    /// remembered as not being who it was. Returns the photos whose names change.
+    pub fn name_face(&mut self, k: &str, n: u8, name: &str) -> Vec<PathBuf> {
+        let name = crate::settings::clean_name(name);
+        let Some(i) = self.faces.iter().position(|f| f.key == k && f.n == n) else { return Vec::new() };
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let from = self.faces[i].person;
+        let current = self.name_of(from);
+        if current.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+            return Vec::new();
+        }
+        if current.is_none() {
+            return self.rename(from, &name);
+        }
+        let to = match self.people.iter().find(|p| p.name.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(&name))) {
+            Some(p) => p.id,
+            None => {
+                let id = self.next_id;
+                self.next_id += 1;
+                let mut p = Person::new(id, self.faces[i].print.clone());
+                p.name = Some(name);
+                p.named = (crate::store::now(), crate::store::computer());
+                self.people.push(p);
+                id
+            }
+        };
+        self.move_face(i, from, to)
+    }
+
+    /// Face `n` of the photo with content key `k` is not who it was named as: it becomes a
+    /// person of its own, never put back with them.
+    pub fn unname_face(&mut self, k: &str, n: u8) -> Vec<PathBuf> {
+        let Some(i) = self.faces.iter().position(|f| f.key == k && f.n == n) else { return Vec::new() };
+        let from = self.faces[i].person;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.people.push(Person::new(id, self.faces[i].print.clone()));
+        self.move_face(i, from, id)
+    }
+
+    fn move_face(&mut self, i: usize, from: u32, to: u32) -> Vec<PathBuf> {
+        let f = &mut self.faces[i];
+        f.person = to;
+        f.not.retain(|x| *x != to);
+        if !f.not.contains(&from) {
+            f.not.push(from);
+        }
+        let photo = f.photo.clone();
+        self.recentre(from);
+        self.recentre(to);
+        if !self.faces.iter().any(|f| f.person == from) {
+            self.people.retain(|p| p.id != from || p.name.is_some());
+        }
+        self.changed = true;
+        vec![photo]
+    }
+
     /// Take `photo`'s faces out of person `id` (a wrong match); they become people of their own.
     pub fn not_this_person(&mut self, id: u32, photo: &Path) -> Vec<PathBuf> {
         let moved: Vec<usize> = self.faces.iter().enumerate().filter(|(_, f)| f.person == id && f.photo == photo).map(|(i, _)| i).collect();
@@ -1050,6 +1138,30 @@ mod tests {
 
     fn print(seed: f32) -> Vec<f32> {
         normalised((0..128).map(|i| ((i as f32 + 1.0) * seed).sin()).collect())
+    }
+
+    #[test]
+    fn naming_a_face_on_the_photo() {
+        let mut p = People::default();
+        let (a, b) = (print(1.0), print(2.0));
+        let mut a2 = a.clone();
+        a2[0] += 0.05;
+        p.add_faces(Path::new("one.ARW"), "one|1", vec![(0, [0.1, 0.1, 0.1, 0.1], a.clone())]);
+        p.add_faces(Path::new("two.ARW"), "two|1", vec![(0, [0.1, 0.1, 0.1, 0.1], normalised(a2)), (1, [0.5, 0.1, 0.1, 0.1], b)]);
+        // An unnamed group: the whole group takes the name.
+        p.name_face("one|1", 0, "Talia");
+        assert_eq!(p.faces_in("two|1")[0].3.as_deref(), Some("Talia"));
+        // A named face corrected: only that face moves, to a new person.
+        p.name_face("two|1", 0, "Kaye");
+        assert_eq!(p.faces_in("two|1")[0].3.as_deref(), Some("Kaye"));
+        assert_eq!(p.faces_in("one|1")[0].3.as_deref(), Some("Talia"));
+        // A name in use: the face joins that person.
+        p.name_face("two|1", 1, "Talia");
+        assert_eq!(p.faces_in("two|1")[1].3.as_deref(), Some("Talia"));
+        // Not this person: the face loses the name, and remembers it.
+        p.unname_face("two|1", 1);
+        assert_eq!(p.faces_in("two|1")[1].3, None);
+        assert!(p.faces.iter().any(|f| f.key == "two|1" && f.n == 1 && !f.not.is_empty()));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 ## Develop 0.6.0
 
-Masks: sliders that change only the parts of a photo you paint.
+Masks: sliders that change only the parts of a photo you paint. And name people right on the
+photo.
 
 ### Masks
 - **Masks** (Inspector, above Retouch): click **Brush** (or press **K**) and paint on the photo
@@ -16,6 +17,18 @@ Masks: sliders that change only the parts of a photo you paint.
 - The mask being painted shows in red (**O** shows or hides it).
 - Masks are saved with the photo's edit, in versions and in Undo, and copied with Copy settings.
   Presets leave them alone. AI assistants see which masks a photo has.
+
+### Name people on the photo
+- **Faces** at the bottom of the photo (or **F**) outlines the faces found in it, with each
+  person's name under their face. Click a face to name it; names you already use come up as you
+  type.
+- Naming a face nobody has named yet names the faces grouped with it too, as under People. A face
+  that already has a name is corrected on its own, and **Not (name)** takes the name off it.
+- Works on photos outside your library too: their faces are found when you first show them.
+
+### Also new
+- If the window ever stops responding for more than a few seconds, Develop notes what it was
+  doing in `freeze.log` in its settings folder, to help find the cause.
 
 ### Known limitations
 - The mask sliders use the same maths as the main sliders, but have not yet been compared with

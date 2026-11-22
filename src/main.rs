@@ -17,6 +17,7 @@ mod explorer;
 mod export;
 mod faces;
 mod filmstrip;
+mod freeze;
 mod focus;
 mod headless;
 mod heic;
@@ -1226,6 +1227,15 @@ struct App {
     mask_reveal: bool,
     /// The masks' pictures as drawn and sent to the GPU (see `sync_masks`).
     mask_state: std::cell::RefCell<masks::Drawn>,
+    /// Faces on the photo (F): shown or not, the face being named (which face, and the name
+    /// typed so far), the open photo's content key (how its faces are filed) and how the camera
+    /// turned it (its faces were found on the upright preview), and a search for faces under way
+    /// for a photo never looked at.
+    show_faces: bool,
+    face_naming: Option<(u8, String, bool)>,
+    face_key: String,
+    camera_turns: u8,
+    face_search: Option<String>,
     /// `--name value` pairs from the command line, applied to the first file opened.
     overrides: Vec<(String, f32)>,
     /// `--focus-out <file>`: with `--export`, also measure focus on the full-size picture and
@@ -1444,6 +1454,11 @@ impl App {
             mask_overlay: true,
             mask_reveal: false,
             mask_state: Default::default(),
+            show_faces: false,
+            face_naming: None,
+            face_key: String::new(),
+            camera_turns: 0,
+            face_search: None,
             overrides: {
                 let args: Vec<String> = std::env::args().skip(2).collect();
                 args.chunks_exact(2).filter_map(|p| Some((p[0].clone(), p[1].parse().ok()?))).collect()
@@ -1563,6 +1578,7 @@ impl App {
     /// The "Update available" dialog: the new version's release notes, and downloading and
     /// installing it.
     fn update_dialog(&mut self, ctx: &egui::Context) {
+        freeze::step("update dialog");
         if let Some(rx) = &self.update_check {
             if let Ok(result) = rx.try_recv() {
                 self.update_check = None;
@@ -1706,6 +1722,7 @@ impl App {
     }
 
     fn poll_loader(&mut self) {
+        freeze::step("poll loader");
         let Some((_, rx)) = &self.loading else { return };
         let result = match rx.try_recv() {
             Ok(result) => result,
@@ -1936,6 +1953,9 @@ impl App {
                         // set the brush first; `--mask-exposure 1` (any slider) sets the selected
                         // mask's slider; `--mask-tool 1` shows the brush, `--mask-overlay 0`
                         // hides the overlay.
+                        // `--faces 1` shows the faces found on the photo.
+                        "--faces" => self.show_faces = value > 0.5,
+                        "--face-naming" => self.face_naming = Some((value as u8, String::new(), true)),
                         "--mask-new" => self.new_mask(),
                         "--mask-tool" => self.set_mask_tool(value > 0.5),
                         "--mask-overlay" => self.mask_overlay = value > 0.5,
@@ -1996,6 +2016,11 @@ impl App {
                     }
                 }
                 self.quarter_turns = image.quarter_turns;
+                self.camera_turns = image.quarter_turns % 4;
+                self.face_key = people::key(&path);
+                if self.face_naming.as_ref().is_some_and(|f| !f.2) {
+                    self.face_naming = None;
+                }
                 self.loaded = Some(Loaded {
                     name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                     info: format!(
@@ -2238,6 +2263,7 @@ impl App {
     /// Put stored settings on the open photo. A stored white balance of 0 means "as shot".
     /// Rotation is left alone (the caller decides).
     fn apply_saved(&mut self, saved: &settings::Saved) {
+        freeze::step("apply saved");
         let mut values = saved.values;
         if values[0] <= 0.0 {
             values[0] = self.loaded.as_ref().map_or(KELVIN_DEFAULT, |l| l.color.as_shot_kelvin);
@@ -2286,6 +2312,7 @@ impl App {
 
     /// Carry out a click or menu choice from the filmstrip or the picture's right-click menu.
     fn apply_action(&mut self, action: filmstrip::Action, ctx: &egui::Context) {
+        freeze::step("apply action");
         use filmstrip::Action;
         let open = self.loaded.as_ref().map(|l| l.path.clone());
         match action {
@@ -2395,6 +2422,7 @@ impl App {
     /// Rebuild the profile's matrices and lookup tables when the profile changes, or when the
     /// white-balance temperature moves under an Adobe profile (its tables depend on it).
     fn sync_profile(&mut self) {
+        freeze::step("sync profile");
         let Some(loaded) = &self.loaded else { return };
         let kelvin = match self.profile {
             Profile::Dcp(_) => self.adjust.kelvin.round() as i32,
@@ -2476,6 +2504,7 @@ impl App {
     /// they depend on (exposure, white balance, profile, lens) have changed: a small render
     /// with the tone and presence sliders at zero, read back from the GPU.
     fn measure_scene(&self, loaded: &Loaded) {
+        freeze::step("measure scene");
         let blank = Adjust { contrast: 1.0, saturation: 0.0, vibrance: 0.0, whites: 0.0, highlights: 0.0, shadows: 0.0, blacks: 0.0, ..self.adjust };
         let key = format!(
             "{}|{:?}|{}|{}|{}|{:?}|{:?}",
@@ -3001,6 +3030,7 @@ impl App {
     /// background thread. The GPU part takes a moment and runs here; the slow part (resize
     /// and compression) does not block the window.
     fn start_export(&mut self, path: PathBuf, ctx: &egui::Context) {
+        freeze::step("start export");
         self.sync_heal();
         self.sync_masks();
         let Some(loaded) = &self.loaded else { return };
@@ -3067,6 +3097,7 @@ impl App {
     }
 
     fn poll_export(&mut self, ctx: &egui::Context) {
+        freeze::step("poll export");
         let Some(rx) = &self.export_job else { return };
         let result = match rx.try_recv() {
             Ok(result) => result,
@@ -3117,6 +3148,7 @@ impl App {
 
     /// One step of a batch export; called every frame while one is running.
     fn advance_batch(&mut self, ctx: &egui::Context) {
+        freeze::step("advance batch");
         if self.loading.is_some() || self.export_job.is_some() {
             return;
         }
@@ -3467,6 +3499,7 @@ impl App {
     /// Record a change in the open photo's history once it is finished: not while a slider
     /// is being dragged or a number typed, so one drag is one undo step.
     fn track_history(&mut self, ctx: &egui::Context) {
+        freeze::step("track history");
         if self.loading.is_some() {
             return;
         }
@@ -3492,6 +3525,7 @@ impl App {
     /// folder (an AI assistant through the MCP server, another copy of Develop): the newer
     /// change wins. The open photo shows them at once, and Undo brings back what it had.
     fn take_outside_changes(&mut self, ctx: &egui::Context) {
+        freeze::step("take outside changes");
         let Some(watch) = &mut self.folder_watch else { return };
         let settled = watch.settled(ctx);
         let dir = watch.dir().to_path_buf();
@@ -3645,6 +3679,7 @@ impl App {
     /// Export progress (a bar with the percentage done) while exporting, then a window saying
     /// it is complete, with the way to the exported files.
     fn export_windows(&mut self, ctx: &egui::Context) {
+        freeze::step("export windows");
         // Convert to DNG: take in its progress; when it is done, the completion window below
         // shows the result.
         if let Some(rx) = &self.dng_job {
@@ -3767,6 +3802,7 @@ impl App {
     /// already worked out for the same spot, if it only moved in the list) and upload them
     /// to the spot's atlas slot. Called once a frame, before anything holds the renderer.
     fn sync_heal(&self) {
+        freeze::step("sync heal");
         if self.loaded.is_none() || self.spot_preview.width == 0 {
             return;
         }
@@ -3811,6 +3847,7 @@ impl App {
     /// stroke being painted, and send what changed to the GPU. Called once a frame, before
     /// anything holds the renderer.
     fn sync_masks(&self) {
+        freeze::step("sync masks");
         if self.loaded.is_none() || self.spot_preview.width == 0 {
             return;
         }
@@ -3859,6 +3896,166 @@ impl App {
                 &layer.data
             };
             res.write_mask_rows(&rs.queue, i, data, y0, y1);
+        }
+    }
+
+    /// Where a point of the upright picture (as faces were found on it) lies on the stored
+    /// picture.
+    fn upright_to_stored(&self, p: [f32; 2]) -> [f32; 2] {
+        match self.camera_turns {
+            1 => [p[1], 1.0 - p[0]],
+            2 => [1.0 - p[0], 1.0 - p[1]],
+            3 => [1.0 - p[1], p[0]],
+            _ => p,
+        }
+    }
+
+    /// The faces found in the open photo, outlined with their names; click one to name it.
+    /// A photo never looked at for faces (not in the library yet) is looked at now.
+    fn face_overlay(&mut self, ui: &mut egui::Ui, map: &spots::ScreenMap, rect: egui::Rect) {
+        freeze::step("face overlay");
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        let key = self.face_key.clone();
+        let (faces, known, names) = match freeze::lock(&self.library.people, "the people data") {
+            Ok(p) => (p.faces_in(&key), p.seen.contains_key(&key), p.names()),
+            Err(_) => return,
+        };
+        if !known && self.face_search.as_deref() != Some(key.as_str()) {
+            // Look for faces now, in the background (about a tenth of a second).
+            self.face_search = Some(key.clone());
+            let people = self.library.people.clone();
+            let ctx = ui.ctx().clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                let found = filmstrip::preview(&path, 1600).map(|pic| people::find_faces_in(&pic, &key)).unwrap_or_default();
+                if let Ok(mut p) = people.lock() {
+                    if !p.seen.contains_key(&key) {
+                        p.add_faces(&path, &key, found);
+                        p.save();
+                    }
+                }
+                ctx.request_repaint();
+            });
+        }
+        let painter = ui.painter().with_clip_rect(rect);
+        let note = |text: &str| {
+            let galley = painter.layout_no_wrap(text.to_owned(), theme::font(11.5), theme::TEXT);
+            let back = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 10.0 + galley.size().y * 0.5 + 4.0), galley.size() + egui::vec2(16.0, 8.0));
+            painter.rect_filled(back, 5.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xD8));
+            painter.galley(back.min + egui::vec2(8.0, 4.0), galley, theme::TEXT);
+        };
+        if faces.is_empty() {
+            note(if known { "No faces found in this photo" } else { "Looking for faces…" });
+            return;
+        }
+        let shadow = egui::Stroke::new(3.0_f32, egui::Color32::from_black_alpha(120));
+        let mut open = None;
+        let mut commit = None;
+        let mut unname = None;
+        // Tags already placed: a tag that would cover one moves down below it.
+        let mut placed: Vec<egui::Rect> = Vec::new();
+        for (n, area, person, name) in &faces {
+            let [x, y, w, h] = *area;
+            let corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]].map(|c| map.to_screen(self.upright_to_stored(c)));
+            let bounds = egui::Rect::from_points(&corners);
+            if !bounds.intersects(rect) {
+                continue;
+            }
+            let naming = self.face_naming.as_ref().is_some_and(|(m, ..)| m == n);
+            let id = ui.id().with(("face", *n));
+            let hit = ui.interact(bounds.expand(4.0), id, egui::Sense::click());
+            let colour = if naming || hit.hovered() { theme::ACCENT } else if name.is_some() { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(170) };
+            painter.add(egui::Shape::closed_line(corners.to_vec(), shadow));
+            painter.add(egui::Shape::closed_line(corners.to_vec(), egui::Stroke::new(1.5_f32, colour)));
+            // The name (or a prompt) under the face.
+            let label = name.clone().unwrap_or_else(|| "Who is this?".to_owned());
+            let galley = painter.layout_no_wrap(label, if name.is_some() { theme::bold(11.5) } else { theme::font(11.5) }, if name.is_some() { theme::TEXT_BRIGHT } else { theme::TEXT });
+            let mut tag = egui::Rect::from_min_size(egui::pos2(bounds.center().x - galley.size().x * 0.5 - 6.0, bounds.bottom() + 4.0), galley.size() + egui::vec2(12.0, 6.0));
+            while let Some(other) = placed.iter().find(|o| o.expand(1.0).intersects(tag)) {
+                tag = tag.translate(egui::vec2(0.0, other.bottom() + 2.0 - tag.top()));
+            }
+            placed.push(tag);
+            let tag_hit = ui.interact(tag, id.with("tag"), egui::Sense::click());
+            painter.rect_filled(tag, 4.0, if name.is_some() { egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xE0) } else { egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xB0) });
+            painter.galley(tag.min + egui::vec2(6.0, 3.0), galley, theme::TEXT_BRIGHT);
+            let hint = match name {
+                Some(n) => format!("{n}. Click to correct the name"),
+                None => "Click to name this face".to_owned(),
+            };
+            if (hit.on_hover_text(&hint).clicked() || tag_hit.on_hover_text(&hint).clicked()) && !naming {
+                open = Some((*n, String::new(), true));
+            }
+            if naming {
+                // The naming box under the tag: type a name and press Enter (Tab takes the
+                // first suggestion), Esc closes.
+                let group = freeze::lock(&self.library.people, "the people data").map(|p| p.face_count(*person)).unwrap_or(1);
+                let Some((_, text, first)) = self.face_naming.as_mut() else { continue };
+                egui::Area::new(id.with("naming")).order(egui::Order::Foreground).fixed_pos(egui::pos2(tag.left(), tag.bottom() + 4.0)).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_width(220.0);
+                        let edit = ui.add(egui::TextEdit::singleline(text).hint_text(name.as_deref().unwrap_or("Name")).desired_width(f32::INFINITY));
+                        if std::mem::take(first) {
+                            edit.request_focus();
+                        }
+                        let typed = text.trim().to_lowercase();
+                        let matches: Vec<&String> = names.iter().filter(|m| !typed.is_empty() && m.to_lowercase().contains(&typed) && Some(*m) != name.as_ref()).take(6).collect();
+                        let (enter, tab, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Tab), i.key_pressed(egui::Key::Escape)));
+                        if tab {
+                            if let Some(m) = matches.first() {
+                                *text = (*m).clone();
+                            }
+                        }
+                        for m in &matches {
+                            if ui.selectable_label(false, m.as_str()).clicked() {
+                                commit = Some((*n, (*m).clone()));
+                            }
+                        }
+                        if enter && !text.trim().is_empty() {
+                            commit = Some((*n, text.trim().to_owned()));
+                        }
+                        let what = match name {
+                            None if group > 1 => format!("Names this face and the {} others grouped with it", group - 1),
+                            None => "Names this face".to_owned(),
+                            Some(_) => "Moves only this face to that name".to_owned(),
+                        };
+                        ui.label(ui::dim(what, 11.0));
+                        if let Some(current) = name {
+                            if ui.small_button(format!("Not {current}")).on_hover_text("This face is someone else: take it out of their photos").clicked() {
+                                unname = Some(*n);
+                            }
+                        }
+                        if esc {
+                            open = Some((u8::MAX, String::new(), false));
+                        }
+                    });
+                });
+            }
+        }
+        let busy = commit.is_some() || unname.is_some();
+        if let Some((n, name)) = commit {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
+                let t = p.name_face(&key, n, &name);
+                p.save();
+                t
+            });
+            self.refresh_names(touched.unwrap_or_default());
+        }
+        if let Some(n) = unname {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
+                let t = p.unname_face(&key, n);
+                p.save();
+                t
+            });
+            self.refresh_names(touched.unwrap_or_default());
+        }
+        if busy {
+            self.face_naming = None;
+        } else if let Some(o) = open {
+            self.face_naming = (o.0 != u8::MAX).then_some(o);
+        }
+        if self.face_naming.is_none() {
+            let named = faces.iter().filter(|f| f.3.is_some()).count();
+            note(&format!("{} face{}, {named} named  ·  Click a face to name it  ·  F hides", faces.len(), if faces.len() == 1 { "" } else { "s" }));
         }
     }
 
@@ -4618,6 +4815,7 @@ impl App {
     /// The bar across the top of the window: panel toggle, app name, what is open, and
     /// which graphics backend is in use.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        freeze::step("top bar");
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if let Some(icon) = &self.icon {
@@ -4707,6 +4905,7 @@ impl App {
 
     /// Right pane, pinned at the top: what is open, Reset All, then View and the scopes.
     fn pane_top(&mut self, ui: &mut egui::Ui) {
+        freeze::step("pane top");
         ui.spacing_mut().item_spacing.y = 3.0;
         // The file name, with the whole width of the pane.
         ui.horizontal(|ui| {
@@ -4844,6 +5043,7 @@ impl App {
     /// Give the scopes the open picture as it currently looks (whole crop, display-encoded)
     /// and ask for a recount. Called every frame the picture is drawn.
     fn feed_scopes(&self) {
+        freeze::step("feed scopes");
         let Some(loaded) = &self.loaded else { return };
         let c = self.crop_region();
         let uniforms = self.uniforms(loaded, [c[2], c[3], c[0] + 0.5 * c[2], c[1] + 0.5 * c[3]], true);
@@ -4858,6 +5058,7 @@ impl App {
     /// The Library list under the folder tree: folders searched by the filmstrip's Library
     /// scope. Returns a folder clicked to open.
     fn library_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        freeze::step("library panel");
         let mut open = None;
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -4940,6 +5141,7 @@ impl App {
     /// The Faces & Metadata panel: the open photo's keywords, people and suggestions; the people
     /// found across the library; the library's folders. Returns a library folder clicked.
     fn faces_metadata_panel(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        freeze::step("faces metadata panel");
         let mut open = None;
         egui::ScrollArea::vertical().id_source("faces_metadata").auto_shrink([false, false]).show(ui, |ui| {
             // Which photo the EXIF and Keywords below are for.
@@ -4980,7 +5182,7 @@ impl App {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
             }
             ui::section(ui, "People", true, "Faces found across the library, grouped into people: click one to see and name them", |ui| {
-                if self.library.people.lock().map(|p| p.list_is_empty()).unwrap_or(true) {
+                if freeze::lock(&self.library.people, "the people data").map(|p| p.list_is_empty()).unwrap_or(true) {
                     ui.label(ui::dim("Faces found in the library's photos are grouped here, for you to name.", 11.5));
                 } else {
                     self.people_list(ui);
@@ -5101,6 +5303,7 @@ impl App {
     /// The bar above the panels: Folders and Faces & Metadata choose the left panel (clicking
     /// the one showing hides it), Inspector shows or hides the right panel.
     fn view_bar(&mut self, ui: &mut egui::Ui) {
+        freeze::step("view bar");
         // The whole bar, margins included, for the line along its bottom.
         let bar = ui.max_rect().expand2(egui::vec2(8.0, 0.0));
         // Where the active tabs are: the line breaks under them, so each joins the panel below.
@@ -5163,6 +5366,7 @@ impl App {
 
     /// Share this library…: what it means, then do it.
     fn share_windows(&mut self, ctx: &egui::Context) {
+        freeze::step("share windows");
         if let Some(folder) = self.share_ask.clone() {
             let (mut go, mut cancel) = (false, false);
             let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string());
@@ -5265,6 +5469,7 @@ impl App {
 
     /// The move's windows: the summary to confirm, progress, and how it ended.
     fn move_windows(&mut self, ctx: &egui::Context) {
+        freeze::step("move windows");
         let size = |b: u64| if b >= 1 << 30 { format!("{:.1} GB", b as f64 / (1u64 << 30) as f64) } else { format!("{:.0} MB", b as f64 / (1u64 << 20) as f64) };
         // The summary.
         if let Some(plan) = self.move_plan.clone() {
@@ -5470,6 +5675,7 @@ impl App {
     /// Closing the window while faces are still being read asks first. Quitting keeps what is
     /// done; the rest is read the next time Develop opens.
     fn quit_guard(&mut self, ctx: &egui::Context) {
+        freeze::step("quit guard");
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_ok && self.library.reading().is_some() && !library::user_paused() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_asked = true;
@@ -5528,7 +5734,8 @@ impl App {
 
     /// Bring the `.dvlp` names of these photos up to date with the people store.
     fn refresh_names(&mut self, photos: Vec<PathBuf>) {
-        let names = self.library.people.lock().map(|p| p.names_for(&photos)).unwrap_or_default();
+        freeze::step("refresh names");
+        let names = freeze::lock(&self.library.people, "the people data").map(|p| p.names_for(&photos)).unwrap_or_default();
         self.apply_names_many(names);
     }
 
@@ -5536,6 +5743,7 @@ impl App {
     /// photos in folders already open are updated here; for the rest only their `people`
     /// line is rewritten, in the background, so the window never waits on the disk or network.
     fn apply_names_many(&mut self, names: Vec<(PathBuf, Vec<String>)>) {
+        freeze::step("apply names many");
         let mut later = Vec::new();
         for (photo, names) in names {
             if photo.parent().is_some_and(|d| self.store.has_folder(d)) {
@@ -5568,6 +5776,7 @@ impl App {
     /// (A few new ones per frame at most, `face_loads_left`: the rest follow in the next frames,
     /// so showing thousands of people never holds the window up.)
     fn face_texture(&mut self, ctx: &egui::Context, face: Option<&(String, u8)>) -> Option<egui::TextureHandle> {
+        freeze::step("face texture");
         let file = face.and_then(|(k, n)| people::face_thumb(k, *n))?;
         if let Some(t) = self.face_textures.get(&file) {
             return t.clone();
@@ -5589,8 +5798,9 @@ impl App {
     /// Click one to see and name them in the main pane; drop a photo from the People view on one
     /// to move it to them. Long lists show their first rows until "Show all".
     fn people_list(&mut self, ui: &mut egui::Ui) {
+        freeze::step("people list");
         self.people_pictures.poll(ui.ctx());
-        let list = self.library.people.lock().map(|p| p.list()).unwrap_or_default();
+        let list = freeze::lock(&self.library.people, "the people data").map(|p| p.list()).unwrap_or_default();
         if list.is_empty() {
             return;
         }
@@ -5661,7 +5871,7 @@ impl App {
                 // Only for faces on screen (with "Show all", thousands are not).
                 let texture = if visible {
                     self.face_texture(ui.ctx(), face.as_ref()).or_else(|| {
-                        let best = self.library.people.lock().ok().and_then(|p| p.best_face(*id));
+                        let best = freeze::lock(&self.library.people, "the people data").ok().and_then(|p| p.best_face(*id));
                         best.and_then(|f| self.people_pictures.face(&f.photo, f.area))
                     })
                 } else {
@@ -5745,7 +5955,7 @@ impl App {
             self.open_person(id);
         }
         if regroup {
-            let result = self.library.people.lock().map(|mut p| {
+            let result = freeze::lock(&self.library.people, "the people data").map(|mut p| {
                 let r = p.regroup();
                 p.save();
                 r
@@ -5763,7 +5973,8 @@ impl App {
             self.regroup_note = Some((note, std::time::Instant::now()));
         }
         if let Some((items, to)) = dropped {
-            let touched = self.library.people.lock().map(|mut p| {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
+                freeze::step(format!("moving {} photos to a person", items.len()));
                 let t: Vec<PathBuf> = items.iter().flat_map(|(from, photo)| p.move_photo(*from, photo, to)).collect();
                 p.save();
                 t
@@ -5780,6 +5991,7 @@ impl App {
 
     /// Show a person in the main pane.
     fn open_person(&mut self, id: u32) {
+        freeze::step("open person");
         if self.person_view != Some(id) {
             self.person_selected.clear();
             self.person_anchor = None;
@@ -5794,9 +6006,10 @@ impl App {
     /// they are in. × takes a photo out of the set; a photo dragged onto a face in the People
     /// list moves to that person; double-click opens a photo.
     fn person_view_ui(&mut self, ui: &mut egui::Ui) {
+        freeze::step("person view ui");
         self.people_pictures.poll(ui.ctx());
         let Some(id) = self.person_view else { return };
-        let Some(data) = self.library.people.lock().ok().map(|p| {
+        let Some(data) = freeze::lock(&self.library.people, "the people data").ok().map(|p| {
             let generation = p.shown_generation();
             match &self.person_view_data {
                 Some((g, i, data)) if *g == generation && *i == id => data.clone(),
@@ -5847,7 +6060,7 @@ impl App {
             ui.label(egui::RichText::new(title).font(theme::bold(16.0)).color(theme::TEXT_BRIGHT));
             ui.label(ui::dim(&format!("{} photo{}", faces.len(), if faces.len() == 1 { "" } else { "s" }), 12.0));
             // Named on another computer (a shared library): say where.
-            if let Some((computer, _)) = self.library.people.lock().ok().and_then(|p| p.named_on(id)).filter(|(c, _)| *c != crate::store::computer()) {
+            if let Some((computer, _)) = freeze::lock(&self.library.people, "the people data").ok().and_then(|p| p.named_on(id)).filter(|(c, _)| *c != crate::store::computer()) {
                 ui.label(egui::RichText::new(format!("named on {computer}")).font(theme::font(11.5)).color(theme::TEAL));
             }
             let picked = self.person_selected.len();
@@ -6176,7 +6389,7 @@ impl App {
             painter.galley(label.min + egui::vec2(6.0, 3.0), galley, theme::TEXT_BRIGHT);
         }
         if !confirm.is_empty() {
-            let touched = self.library.people.lock().map(|mut p| {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
                 let t: Vec<PathBuf> = confirm.iter().flat_map(|(from, photo)| p.move_photo(*from, photo, id)).collect();
                 p.save();
                 t
@@ -6207,7 +6420,7 @@ impl App {
             self.person_rename = None;
         }
         if !remove.is_empty() {
-            let touched = self.library.people.lock().map(|mut p| {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
                 let t: Vec<PathBuf> = remove.iter().flat_map(|photo| p.not_this_person(id, photo)).collect();
                 p.save();
                 t
@@ -6249,7 +6462,7 @@ impl App {
             }
         });
         if let Some(name) = remove {
-            let touched = self.library.people.lock().map(|mut p| {
+            let touched = freeze::lock(&self.library.people, "the people data").map(|mut p| {
                 let ids: Vec<u32> = p.list().into_iter().filter(|(_, n, _, _)| n.as_deref() == Some(name.as_str())).map(|(id, ..)| id).collect();
                 let mut t = Vec::new();
                 for id in ids {
@@ -6272,6 +6485,7 @@ impl App {
 
     /// Keywords of the open photo, or of every selected photo: add words, remove them.
     fn keywords_panel(&mut self, ui: &mut egui::Ui) {
+        freeze::step("keywords panel");
         let targets = self.keyword_targets();
         if targets.is_empty() {
             ui.label(ui::dim("Open or select a photo to add keywords.", 12.0));
@@ -6412,6 +6626,7 @@ impl App {
     }
 
     fn pane_middle(&mut self, ui: &mut egui::Ui) {
+        freeze::step("pane middle");
         let amber = theme::ACCENT;
         // In the order most photos are worked on: profile, crop, white balance, tone, presence,
         // detail, lens. Retouching comes last, after the darkroom adjustments.
@@ -6841,6 +7056,7 @@ impl App {
 
     /// Right pane, pinned at the bottom: Export.
     fn pane_bottom(&mut self, ui: &mut egui::Ui) {
+        freeze::step("pane bottom");
         let count = self.export_targets().len();
         let label = if count > 1 { format!("Export {count} photos…") } else { "Export…".to_owned() };
         let width = ui.available_width();
@@ -6856,7 +7072,8 @@ impl App {
 
     /// The floating strip at the bottom-left of the canvas: zoom, before/after, clipping.
     fn canvas_hud(&mut self, ui: &mut egui::Ui, outer: egui::Rect, zoom: f32) {
-        let at = egui::Rect::from_min_size(outer.left_bottom() + egui::vec2(16.0, -46.0), egui::vec2(360.0, 30.0));
+        freeze::step("canvas hud");
+        let at = egui::Rect::from_min_size(outer.left_bottom() + egui::vec2(16.0, -46.0), egui::vec2(430.0, 30.0));
         let fill = egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xE6);
         let border = egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(20));
         ui.allocate_ui_at_rect(at, |ui| {
@@ -6881,12 +7098,21 @@ impl App {
                     {
                         self.clipping = !self.clipping;
                     }
+                    ui::vdivider(ui);
+                    if ui::hud_item(ui, "Faces", theme::font(12.0), theme::TEXT, self.show_faces, Some(theme::TEAL))
+                        .on_hover_text("F. Show the faces found in this photo; click a face to name it")
+                        .clicked()
+                    {
+                        self.show_faces = !self.show_faces;
+                        self.face_naming = None;
+                    }
                 });
             });
         });
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
+        freeze::step("viewport");
         let (outer, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         // The photo keeps a margin from the panel edges; nothing is drawn around it.
         let rect = outer.shrink(16.0);
@@ -7081,6 +7307,10 @@ impl App {
             let map = self.spot_map(loaded, rect, scale, cropped);
             self.mask_overlay_ui(ui, &response, &map, rect);
         }
+        if self.show_faces && !self.spot_tool && !self.mask_tool && !self.ab_split {
+            let map = self.spot_map(loaded, rect, scale, cropped);
+            self.face_overlay(ui, &map, rect);
+        }
         self.canvas_hud(ui, outer, zoom);
     }
 }
@@ -7089,11 +7319,15 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // DEVELOP_FRAMES=<file>: note every frame, how long it took (for measuring stutter).
         let start = std::time::Instant::now();
+        freeze::start();
+        freeze::frame_begin();
         if self.starting.is_some() {
+            freeze::step("start-up box");
             self.starting_frame(ctx);
         } else {
             self.frame(ctx);
         }
+        freeze::frame_end();
         if let Some(file) = std::env::var_os("DEVELOP_FRAMES") {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
@@ -7124,7 +7358,7 @@ impl App {
             self.library = library;
             self.starting = None;
             if let Some(n) = self.person_at_start.take() {
-                let id = self.library.people.lock().ok().and_then(|p| p.list().get(n).map(|e| e.0));
+                let id = freeze::lock(&self.library.people, "the people data").ok().and_then(|p| p.list().get(n).map(|e| e.0));
                 if let Some(id) = id {
                     self.open_person(id);
                 }
@@ -7177,6 +7411,22 @@ impl App {
     }
 
     fn frame(&mut self, ctx: &egui::Context) {
+        freeze::step("frame");
+        // DEVELOP_TEST_FREEZE=<seconds>: freeze one frame that long, five seconds in, holding the
+        // people data (for testing the freeze log).
+        if let Some(secs) = std::env::var("DEVELOP_TEST_FREEZE").ok().and_then(|v| v.parse::<u64>().ok()) {
+            static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if started().elapsed().as_secs() >= 5 && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let people = self.library.people.clone();
+                std::thread::spawn(move || {
+                    let _held = people.lock();
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                freeze::step("test freeze");
+                drop(freeze::lock(&self.library.people, "the people data"));
+            }
+        }
         self.quit_guard(ctx);
         self.poll_loader();
         self.sync_heal();
@@ -7329,6 +7579,7 @@ impl App {
         let people_view = browsing && self.person_view.is_some();
         let grid = browsing && (self.filmstrip.grid() || people_view);
         let strip_height = if self.layout.strip_height > 0.0 { self.layout.strip_height } else { filmstrip::PANEL_HEIGHT };
+        freeze::step("filmstrip");
         let strip = egui::TopBottomPanel::bottom("filmstrip")
             .resizable(true)
             .default_height(strip_height.clamp(filmstrip::MIN_HEIGHT, filmstrip::MAX_HEIGHT))
@@ -7503,6 +7754,11 @@ impl App {
                 self.set_wb_pick(!self.wb_pick);
             } else if esc && self.wb_pick {
                 self.wb_pick = false;
+            }
+            // F shows the faces on the photo.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::F)) {
+                self.show_faces = !self.show_faces;
+                self.face_naming = None;
             }
             // Masks: K switches the brush on and off, O shows the overlay, Esc leaves.
             let (k, o) = ctx.input(|i| (!i.modifiers.any() && i.key_pressed(egui::Key::K), !i.modifiers.any() && i.key_pressed(egui::Key::O)));
