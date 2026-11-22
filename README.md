@@ -239,6 +239,13 @@ Then open the app again.
 codesign --force --deep --sign - /Applications/Develop.app
 ```
 
+### If Develop stops responding
+
+When the window stops responding for more than a few seconds, Develop notes what it was doing
+in `freeze.log` in its settings folder (`%APPDATA%\Develop` on Windows,
+`~/Library/Application Support/Develop` on a Mac). Please attach that file to a bug report,
+with what you were doing at the time.
+
 ## Building from source
 
 Requires [Rust](https://rustup.rs/) (stable).

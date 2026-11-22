@@ -712,6 +712,7 @@ on a Mac.
 | `dates/` | Capture dates of folders' photos, so folders open in order at once |
 | `faces-paused` | There while finding faces is paused |
 | `moves.log` | A record of folders moved with Move to… |
+| `freeze.log` | Notes made when the window stops responding for a few seconds: what Develop was doing (see Troubleshooting) |
 | `keyword-vocabulary.txt` | Your own list of words for keyword suggestions, if you make one |
 | `thumbs/` | Thumbnails of edited photos and of versions, and small pictures of faces |
 
@@ -845,6 +846,10 @@ Other `--name value` options set sliders for testing.
 - **Ctrl+V does nothing.** Copy the settings with Ctrl+C in Develop first (that also puts text on
   the clipboard Ctrl+V needs), or use the right-click menu.
 - **Edits did not follow a copied photo.** Copy its `.dvlp` file along with it.
+- **Develop stopped responding.** Whenever the window stops responding for more than a few
+  seconds, Develop writes down what it was doing in `freeze.log` in the settings folder (times
+  in UTC), and notes when it responds again. If it happens, send that file along with what you
+  were doing: it shows the step it was stuck on.
 - **A network computer is missing.** Add it by address in Network; on Windows, make sure network
   discovery is on; on a Mac, use Connect….
 - **Changes made by an AI assistant do not show.** They normally appear within a second. On some

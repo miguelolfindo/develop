@@ -1,4 +1,58 @@
-## Develop 0.5.0
+## Develop 0.5.1
+
+A small update that helps find the cause when Develop stops responding.
+
+### New
+- If the window stops responding for more than a few seconds, Develop now writes down what it
+  was doing in `freeze.log` in its settings folder, and notes when it responds again. If Develop
+  ever freezes for you, please send that file along with what you were doing.
+
+### Installing
+- **Windows:** run `develop_0.5.1_x64-setup.exe`, or update from inside Develop. It installs
+  over an earlier version and keeps your settings, library and sidecar files.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.1_aarch64.dmg`, see below.
+- Coming from 0.4.1 or earlier: the first time it opens, it moves the library into its new form.
+  The old files are left as they were, so an older Develop still works.
+
+#### macOS
+
+**1. Install**
+
+1. Double-click the `.dmg`. A window opens showing Develop.
+2. Drag Develop into the Applications folder.
+3. Eject the disk image (the eject icon next to it in Finder's sidebar).
+
+**2. First launch (the app is unsigned)**
+
+Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
+
+1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
+   it can't verify the developer.
+2. Click **Done** or **Cancel**.
+3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
+   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
+4. Double-click Develop again and click **Open** in the dialog.
+
+From then on it opens normally.
+
+**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
+flag, not real damage. Open Terminal and run:
+
+```
+xattr -cr /Applications/Develop.app
+```
+
+Then open the app again.
+
+**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
+
+```
+codesign --force --deep --sign - /Applications/Develop.app
+```
+
+---
+
+## What came in Develop 0.5.0
 
 A big library on a network drive now stays fast, can be shared between computers, and can be
 moved safely. Plus noise reduction for every photo, quick ways to tidy up people, and much
@@ -69,49 +123,6 @@ smaller updates.
 
 ### Also new
 - Right-click any photo and choose **Show in File Explorer** (Windows) or **Show in Finder** (Mac).
-
-### Installing
-- **Windows:** run `develop_0.5.0_x64-setup.exe`. It installs over an earlier version and keeps
-  your settings, library and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.0_aarch64.dmg`, see below.
-- The first time 0.5.0 opens, it moves the library into its new form. The old files are left
-  as they were, so an older Develop still works.
-
-#### macOS
-
-**1. Install**
-
-1. Double-click the `.dmg`. A window opens showing Develop.
-2. Drag Develop into the Applications folder.
-3. Eject the disk image (the eject icon next to it in Finder's sidebar).
-
-**2. First launch (the app is unsigned)**
-
-Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
-
-1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
-   it can't verify the developer.
-2. Click **Done** or **Cancel**.
-3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
-   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
-4. Double-click Develop again and click **Open** in the dialog.
-
-From then on it opens normally.
-
-**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
-flag, not real damage. Open Terminal and run:
-
-```
-xattr -cr /Applications/Develop.app
-```
-
-Then open the app again.
-
-**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
-
-```
-codesign --force --deep --sign - /Applications/Develop.app
-```
 
 ### Known limitations
 - A shared library needs every computer on Develop 0.5.0.

@@ -424,6 +424,7 @@ impl Store {
     }
 
     fn load_folder_inner(&mut self, dir: &Path) {
+        crate::freeze::step(format!("reading the .dvlp files in {}", dir.display()));
         self.folders.insert(dir.to_path_buf());
         for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -649,8 +650,11 @@ impl Store {
             return;
         }
         self.changed = None;
-        for photo in std::mem::take(&mut self.dirty) {
+        let dirty = std::mem::take(&mut self.dirty);
+        let count = dirty.len();
+        for (i, photo) in dirty.into_iter().enumerate() {
             let sidecar = sidecar_path(&photo);
+            crate::freeze::step(format!("writing .dvlp file {} of {count}: {}", i + 1, sidecar.display()));
             let (saved, rating) = (self.photos.get(&photo), self.rating(&photo));
             let legacy = sidecar_with(&photo, LEGACY_SIDECAR_EXTENSION);
             let versions = self.versions(&photo);
