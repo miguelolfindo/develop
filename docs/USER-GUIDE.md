@@ -19,7 +19,8 @@ covers everything the app does, in the order you would use it.
      · [Crop and straighten](#crop-and-straighten) · [White balance](#white-balance)
      · [Tone](#tone) · [Presence](#presence) · [Tone curve](#tone-curve)
      · [Color mixer](#color-mixer) · [Black and white mix](#black-and-white-mix)
-     · [Detail](#detail) · [Lens correction](#lens-correction) · [Masks](#masks)
+     · [Detail](#detail) · [Lens correction](#lens-correction) · [Transform](#transform)
+     · [Masks](#masks)
      · [Retouch](#retouch)
 6. [Undo, reset, copy and paste](#6-undo-reset-copy-and-paste)
 7. [Exporting](#7-exporting)
@@ -419,8 +420,8 @@ Save the current look and reuse it on other photos.
 - **Delete:** the **×** next to a preset.
 
 A preset carries the profile, tone, presence, tone curve, color mixer or black and white mix,
-and detail settings. Crop, rotation, lens correction, masks, retouching and AI denoise stay as
-they are on each photo. Presets with white balance are marked **WB** in the list.
+and detail settings. Crop, rotation, lens correction, perspective (Transform), masks, retouching
+and AI denoise stay as they are on each photo. Presets with white balance are marked **WB** in the list.
 
 ### Versions
 
@@ -594,6 +595,40 @@ For Nikon Z, Panasonic, Olympus / OM System and Fujifilm cameras, distortion cor
 applied automatically even with profile corrections off, as Lightroom does for these cameras.
 To add lenses, open the Lensfun folder from the panel, drop Lensfun `.xml` files in, and reload.
 
+### Transform
+
+Straightens converging lines: buildings that lean in because the camera was pointed up, a wall
+photographed at an angle, a horizon that tilts.
+
+- **Upright** finds the long straight lines in the photo and sets the sliders below for you:
+  - **Level:** only turns the photo, so level lines lie level.
+  - **Vertical:** turns it and corrects **Vertical**, so upright lines (buildings, poles, door
+    frames) stand straight.
+  - **Full:** also corrects **Horizontal**, so level lines straighten too.
+  - **Auto:** a balanced version of Full that holds back where a strong correction would distort
+    the photo.
+- **Guided:** draw the lines yourself. Click **Guided**, then drag along two to four things that
+  should be upright or level (the edge of a building, a door frame, the horizon). Each line you
+  draw turns the photo to match: two upright lines set **Vertical**, two level lines set
+  **Horizontal**, and any line sets the angle. Right-click a line to remove it; **Clear Guides**
+  removes them all; **Done** (or **Esc**) when finished. The lines are not kept with the photo.
+- The sliders, which you can also move yourself or after Upright:
+  - **Vertical:** tilts the photo forward or back. Move it left when buildings lean in at the
+    top.
+  - **Horizontal:** turns the photo left or right, for a wall seen at an angle.
+  - **Rotate:** the same angle as in [Crop and straighten](#crop-and-straighten).
+  - **Aspect:** stretches the photo wider (right) or taller (left), when a strong correction
+    makes things look squashed.
+  - **Scale:** makes the corrected photo bigger or smaller.
+  - **X Offset** and **Y Offset:** move it.
+- The crop always stays inside the corrected photo, so no empty corners show (it gets smaller as
+  the correction gets stronger). **Crop & Straighten** shows the whole corrected photo.
+- **Grid** draws lines over the photo, to judge what is straight. **Reset** puts every slider
+  back, the angle too.
+
+The correction uses the focal length the photo records, so it bends lines as a differently
+pointed camera would have.
+
 ### Masks
 
 Masks are sliders that change only part of the photo: you paint where they apply. Darken a bright
@@ -653,11 +688,11 @@ the whole painted shape, so wide patches blend smoothly. A photo can have up to 
   buttons at the top of the inspector. Each photo has its own history while Develop is open; one
   slider drag is one step.
 - **Reset All:** the whole edit back to Develop's defaults: every slider, white balance (as
-  shot), crop and angle, tone curve, color mixer, black and white, sharpening, lens correction,
-  masks and retouching. Undo brings it back. Versions and the rating are kept.
+  shot), crop and angle, perspective (Transform), tone curve, color mixer, black and white,
+  sharpening, lens correction, masks and retouching. Undo brings it back. Versions and the rating are kept.
 - **Copy and paste settings:** **Ctrl+C** copies the open photo's settings (also from the
   right-click menu); **Ctrl+V** pastes them onto the open photo, or onto every selected photo.
-  Pasting onto photos that are not open keeps each photo's own crop and rotation. Copying also
+  Pasting onto photos that are not open keeps each photo's own crop, rotation and perspective. Copying also
   puts a line of text on the system clipboard, which is what makes Ctrl+V reliable on Windows.
 
 ---
@@ -819,13 +854,13 @@ Ctrl means Cmd on a Mac. Keys work when no text box has the keyboard.
 | Delete, Backspace | In Retouch: remove the selected spot |
 | H | In Retouch: hide / show the outlines |
 | Space+drag | In Retouch or with the mask brush: pan |
-| Esc | In Retouch: deselect, then leave the tool; with the mask brush: leave it; in the People view: back to the photo |
+| Esc | In Retouch: deselect, then leave the tool; with the mask brush or Guided: leave it; in the People view: back to the photo |
 | Delete | In the People view: take the picked photos out of the set |
 
 | Mouse | Action |
 |---|---|
 | Scroll / pinch | Zoom around the pointer |
-| Drag | Pan (in Retouch: paint, or move an outline; with the mask brush: paint) |
+| Drag | Pan (in Retouch: paint, or move an outline; with the mask brush: paint; in Guided: draw a line) |
 | Double-click the photo | Fit / 100% (in crop mode: finish) |
 | Middle-button drag | Pan (also in Retouch and with the mask brush) |
 | Double-click a slider's name | Back to its default |

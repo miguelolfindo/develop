@@ -1019,13 +1019,14 @@ curve is a list of [x, y] points 0..1; hsl_hue / hsl_saturation / hsl_luminance 
     ])
 }
 
-const SETTING_NAMES: [&str; 37] = [
+const SETTING_NAMES: [&str; 43] = [
     "temperature", "tint", "exposure", "contrast", "highlights", "shadows", "whites", "blacks",
     "texture", "clarity", "dehaze", "vibrance", "saturation", "sharpening", "sharpen_radius",
     "sharpen_detail", "sharpen_masking", "noise_luminance", "noise_luminance_detail",
     "noise_luminance_contrast", "noise_color", "noise_color_detail", "noise_color_smoothness", "profile", "curve", "curve_highlights", "curve_lights",
     "curve_darks", "curve_shadows", "hsl_hue", "hsl_saturation", "hsl_luminance", "black_and_white",
-    "mono_mix", "crop", "straighten", "lens_correction",
+    "mono_mix", "crop", "straighten", "perspective_vertical", "perspective_horizontal", "perspective_aspect",
+    "perspective_scale", "perspective_x_offset", "perspective_y_offset", "lens_correction",
 ];
 
 const COLOUR_KEYS: [&str; 8] = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"];
@@ -1055,13 +1056,14 @@ fn blank() -> Saved {
         mono: false,
         mono_mix: [0.0; 8],
         masks: Vec::new(),
+        transform: crate::transform::DEFAULT,
     }
 }
 
 /// A photo's settings as JSON, on the sliders' own scales.
 fn to_json(s: &Saved) -> Value {
     let colours = |row: &[f32; 8]| -> Value { COLOUR_KEYS.iter().zip(row).map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>().into() };
-    json!({
+    let mut out = json!({
         "temperature": s.values[0], "tint": s.tint,
         "exposure": s.values[1], "contrast": contrast_to_slider(s.values[2]),
         "highlights": s.values[6], "shadows": s.values[7], "whites": s.values[5], "blacks": s.values[8],
@@ -1079,7 +1081,13 @@ fn to_json(s: &Saved) -> Value {
         "retouch_spots": s.spots.len(),
         "masks": s.masks.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
         "ai_denoise": s.denoise,
-    })
+    });
+    // Added apart: one more field in the macro above is past its nesting limit.
+    let names = ["perspective_vertical", "perspective_horizontal", "perspective_aspect", "perspective_scale", "perspective_x_offset", "perspective_y_offset"];
+    for (name, value) in names.iter().zip(s.transform) {
+        out[*name] = json!(value);
+    }
+    out
 }
 
 /// Apply the named settings in `changes` to `s`, checking names and ranges.
@@ -1149,6 +1157,12 @@ fn apply_json(s: &mut Saved, changes: &Value) -> Result<(), String> {
                 s.crop = [c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), c[3].clamp(0.0, 1.0)];
             }
             "straighten" => s.angle = num(key, v, -45.0, 45.0)?,
+            "perspective_vertical" => s.transform[0] = num(key, v, -100.0, 100.0)?,
+            "perspective_horizontal" => s.transform[1] = num(key, v, -100.0, 100.0)?,
+            "perspective_aspect" => s.transform[2] = num(key, v, -100.0, 100.0)?,
+            "perspective_scale" => s.transform[3] = num(key, v, 50.0, 150.0)?,
+            "perspective_x_offset" => s.transform[4] = num(key, v, -100.0, 100.0)?,
+            "perspective_y_offset" => s.transform[5] = num(key, v, -100.0, 100.0)?,
             "lens_correction" => s.lens.enabled = v.as_bool().ok_or("lens_correction must be true or false")?,
             other => return Err(format!("Unknown setting {other}. Known: {}", SETTING_NAMES.join(", "))),
         }

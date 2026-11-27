@@ -402,6 +402,10 @@ brought inside it.
 | `mono_mix` | -100 to 100 per colour | How bright each colour becomes in black & white (same keys as above) |
 | `crop` | `[left, top, right, bottom]` | 0 to 1 on the photo as stored |
 | `straighten` | -45 to 45 | Degrees |
+| `perspective_vertical`, `perspective_horizontal` | -100 to 100 | Transform: tilt the photo forward or back (negative when buildings lean in at the top), or turn it left or right |
+| `perspective_aspect` | -100 to 100 | Stretch wider (positive) or taller (negative) after a strong correction |
+| `perspective_scale` | 50 to 150 | Percent; default 100 |
+| `perspective_x_offset`, `perspective_y_offset` | -100 to 100 | Move the corrected photo |
 | `lens_correction` | true / false | Lens profile correction |
 
 `get_settings` also reports `retouch_spots` (how many heal and clone spots the photo has),

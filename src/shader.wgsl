@@ -106,6 +106,12 @@ struct Params {
     mask_info: vec4<f32>,
     mask_vals: array<vec4<f32>, 24>,
     mask_wb: array<vec4<f32>, 8>,
+    // Perspective correction: rows of the matrix from a point shown to the point of the
+    // displayed picture it comes from (centred, in picture heights); persp_info.x = 1 when on.
+    persp_0: vec4<f32>,
+    persp_1: vec4<f32>,
+    persp_2: vec4<f32>,
+    persp_info: vec4<f32>,
 };
 
 // The gamma the tone curve's 0..1 scale is on (measured on Lightroom's point curves).
@@ -1084,7 +1090,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let frame = (in.view - vec2<f32>(0.5)) * params.view.xy + params.view.zw;
     let q = frame - vec2<f32>(0.5);
     let st = params.straighten;
-    let d = vec2<f32>(st.x * q.x - st.y * q.y / st.z, st.y * q.x * st.z + st.x * q.y) + vec2<f32>(0.5);
+    let shown = vec2<f32>(st.x * q.x - st.y * q.y / st.z, st.y * q.x * st.z + st.x * q.y) + vec2<f32>(0.5);
+    // Perspective correction: the point of the picture shown here (behind the camera = none).
+    var d = shown;
+    var behind = false;
+    if (params.persp_info.x > 0.5) {
+        let c = vec3<f32>((shown.x - 0.5) * st.z, shown.y - 0.5, 1.0);
+        let s = vec3<f32>(dot(params.persp_0.xyz, c), dot(params.persp_1.xyz, c), dot(params.persp_2.xyz, c));
+        behind = s.z <= 1.0e-6;
+        d = vec2<f32>(s.x / max(s.z, 1.0e-6) / st.z + 0.5, s.y / max(s.z, 1.0e-6) + 0.5);
+    }
     // Where this point lies on the stored picture, then where the lens actually put it.
     let uv_out = vec2<f32>(dot(params.rot.xy, d), dot(params.rot.zw, d)) + params.rot_off.xy;
     let lens = lens_coords(uv_out);
@@ -1098,7 +1113,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         raw_at(uv, base_lod).g,
         raw_at(lens.b, base_lod).b,
     );
-    if (d.x < 0.0 || d.y < 0.0 || d.x > 1.0 || d.y > 1.0) {
+    if (behind || d.x < 0.0 || d.y < 0.0 || d.x > 1.0 || d.y > 1.0) {
         discard;
     }
     // Lens correction can pull in points from outside the picture: leave those empty.

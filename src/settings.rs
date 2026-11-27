@@ -49,6 +49,9 @@ pub struct Saved {
     pub mono_mix: [f32; 8],
     /// Masks: sliders that change only the parts brushed in (see masks.rs).
     pub masks: Vec<crate::masks::Mask>,
+    /// Perspective correction: Vertical, Horizontal, Aspect, Scale, X and Y Offset (see
+    /// transform.rs).
+    pub transform: crate::transform::Settings,
 }
 
 /// A saved version of a photo's edit: a name, when it was saved (seconds since 1970), and the
@@ -202,9 +205,14 @@ fn parse_line(line: &str) -> Option<(PathBuf, Saved)> {
     for (i, value) in sharpen.iter_mut().enumerate().skip(4) {
         *value = fields.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite()).unwrap_or(SHARPEN_DEFAULT[i]).clamp(0.0, 100.0);
     }
-    // Masks, after that (added in 0.6.0).
+    // Masks, after that (added in 0.5.2).
     let masks = fields.next().map(crate::masks::from_field).unwrap_or_default();
-    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix, masks }))
+    // Perspective correction, after that.
+    let transform = match fields.next().map(|f| crate::tone::numbers_from_field::<6>(f, -1000.0, 1000.0)) {
+        Some(t) if t != [0.0; 6] => crate::transform::clamp(t),
+        _ => crate::transform::DEFAULT,
+    };
+    Some((PathBuf::from(path), Saved { values, quarter_turns, profile, denoise, crop, angle, sharpen, tint, presence, lens, spots, curve, regions, hsl, mono, mono_mix, masks, transform }))
 }
 
 /// What identifies a version's thumbnail: the photo, the version's name and when it was saved
@@ -257,7 +265,7 @@ const SIDECAR_HEADER: &str = "Develop settings\t1";
 fn saved_fields(s: &Saved) -> String {
     let values: Vec<String> = s.values.iter().map(|v| v.to_string()).collect();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         values.join("\t"),
         s.quarter_turns,
         s.profile,
@@ -288,7 +296,8 @@ fn saved_fields(s: &Saved) -> String {
         s.sharpen[7],
         s.sharpen[8],
         s.sharpen[9],
-        crate::masks::to_field(&s.masks)
+        crate::masks::to_field(&s.masks),
+        crate::tone::numbers_to_field(&s.transform)
     )
 }
 
@@ -1065,8 +1074,11 @@ people	Talia	Miguel
         m.values[crate::masks::EXPOSURE] = -1.0;
         m.strokes.push(crate::masks::Stroke { points: vec![[0.2, 0.1], [0.6, 0.12]], radius: 0.1, feather: 0.5, flow: 1.0, erase: false, auto: true });
         a.masks.push(m);
+        a.transform = [-25.5, 10.0, 5.0, 90.0, -3.0, 4.0];
         let (_, back) = parse_line(&format!("photo	{}", saved_fields(&a))).expect("parses");
         assert_eq!(back.masks, a.masks);
+        assert_eq!(back.transform, a.transform);
+        assert_eq!(sample().transform, crate::transform::DEFAULT, "older lines have no perspective");
         assert_eq!(back.sharpen, a.sharpen, "fields before the masks still read");
         // A line from before masks has none.
         assert!(sample().masks.is_empty());

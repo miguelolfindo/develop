@@ -613,6 +613,8 @@ pub struct ScreenMap {
     rect: eframe::egui::Rect,
     view: [f32; 4],
     straighten: [f32; 4],
+    /// Perspective correction: shown -> picture, and picture -> shown (None when off).
+    persp: Option<(crate::transform::M3, crate::transform::M3)>,
     rot: [f32; 4],
     rot_off: [f32; 2],
     lens: crate::lens::Gpu,
@@ -633,7 +635,11 @@ impl ScreenMap {
             fringe: u.fringe,
             knots: u.knots,
         };
-        Self { rect, view: u.view, straighten: u.straighten, rot: u.rot, rot_off: [u.rot_off[0], u.rot_off[1]], lens, aspect }
+        let persp = (u.persp_info[0] > 0.5).then(|| {
+            let back: crate::transform::M3 = std::array::from_fn(|i| [u.persp[i][0], u.persp[i][1], u.persp[i][2]]);
+            (back, crate::transform::invert(&back).unwrap_or(back))
+        });
+        Self { rect, view: u.view, straighten: u.straighten, persp, rot: u.rot, rot_off: [u.rot_off[0], u.rot_off[1]], lens, aspect }
     }
 
     /// Where the lens put an output point (texture coordinates before lens correction).
@@ -644,18 +650,36 @@ impl ScreenMap {
 
     /// Screen point to stored-picture texture coordinates. Mirrors the start of `fs_main`.
     pub fn to_texture(&self, p: eframe::egui::Pos2) -> [f32; 2] {
-        let v = [(p.x - self.rect.min.x) / self.rect.width(), (p.y - self.rect.min.y) / self.rect.height()];
-        let frame = [(v[0] - 0.5) * self.view[0] + self.view[2], (v[1] - 0.5) * self.view[1] + self.view[3]];
-        let q = [frame[0] - 0.5, frame[1] - 0.5];
-        let [c, s, a, _] = self.straighten;
-        let d = [c * q[0] - s * q[1] / a + 0.5, s * q[0] * a + c * q[1] + 0.5];
+        let d = self.to_picture(p);
         let r = self.rot;
         let out = [r[0] * d[0] + r[1] * d[1] + self.rot_off[0], r[2] * d[0] + r[3] * d[1] + self.rot_off[1]];
         self.lens_source(out)
     }
 
+    /// Screen point to the displayed picture (0..1 across and down, before perspective
+    /// correction, after lens correction).
+    pub fn to_picture(&self, p: eframe::egui::Pos2) -> [f32; 2] {
+        let v = [(p.x - self.rect.min.x) / self.rect.width(), (p.y - self.rect.min.y) / self.rect.height()];
+        let frame = [(v[0] - 0.5) * self.view[0] + self.view[2], (v[1] - 0.5) * self.view[1] + self.view[3]];
+        let q = [frame[0] - 0.5, frame[1] - 0.5];
+        let [c, s, a, _] = self.straighten;
+        let d = [c * q[0] - s * q[1] / a + 0.5, s * q[0] * a + c * q[1] + 0.5];
+        match &self.persp {
+            Some((back, _)) => match crate::transform::apply(back, [(d[0] - 0.5) * a, d[1] - 0.5]) {
+                Some(p) => [p[0] / a + 0.5, p[1] + 0.5],
+                None => [-9.0, -9.0],
+            },
+            None => d,
+        }
+    }
+
     /// Texture coordinates back to the screen (the lens part solved by iteration).
     pub fn to_screen(&self, t: [f32; 2]) -> eframe::egui::Pos2 {
+        self.picture_to_screen(self.texture_to_picture(t))
+    }
+
+    /// Stored-picture texture coordinates to the displayed picture (as `to_picture`).
+    pub fn texture_to_picture(&self, t: [f32; 2]) -> [f32; 2] {
         let mut out = t;
         for _ in 0..12 {
             let got = self.lens_source(out);
@@ -663,8 +687,20 @@ impl ScreenMap {
         }
         let r = self.rot;
         let p = [out[0] - self.rot_off[0], out[1] - self.rot_off[1]];
-        let d = [r[0] * p[0] + r[2] * p[1] - 0.5, r[1] * p[0] + r[3] * p[1] - 0.5];
+        [r[0] * p[0] + r[2] * p[1], r[1] * p[0] + r[3] * p[1]]
+    }
+
+    /// A point of the displayed picture to the screen.
+    pub fn picture_to_screen(&self, d: [f32; 2]) -> eframe::egui::Pos2 {
         let [c, s, a, _] = self.straighten;
+        let d = match &self.persp {
+            Some((_, fwd)) => match crate::transform::apply(fwd, [(d[0] - 0.5) * a, d[1] - 0.5]) {
+                Some(p) => [p[0] / a + 0.5, p[1] + 0.5],
+                None => [-9.0, -9.0],
+            },
+            None => d,
+        };
+        let d = [d[0] - 0.5, d[1] - 0.5];
         let q = [c * d[0] + s * d[1] / a, -s * a * d[0] + c * d[1]];
         let frame = [q[0] + 0.5, q[1] + 0.5];
         let v = [(frame[0] - self.view[2]) / self.view[0] + 0.5, (frame[1] - self.view[3]) / self.view[1] + 0.5];

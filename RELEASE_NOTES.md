@@ -1,7 +1,7 @@
-## Develop 0.6.0
+## Develop 0.5.2
 
-Masks: sliders that change only the parts of a photo you paint. And name people right on the
-photo.
+Masks: sliders that change only the parts of a photo you paint, perspective correction, and
+naming people right on the photo.
 
 ### Masks
 - **Masks** (Inspector, above Retouch): click **Brush** (or press **K**) and paint on the photo
@@ -18,6 +18,19 @@ photo.
 - Masks are saved with the photo's edit, in versions and in Undo, and copied with Copy settings.
   Presets leave them alone. AI assistants see which masks a photo has.
 
+### Perspective correction (Transform)
+- A new **Transform** section straightens converging lines: buildings leaning in, a wall seen at
+  an angle, a tilted horizon.
+- **Upright** finds the photo's long straight lines and sets the correction: **Level** (turn
+  only), **Vertical** (upright lines stand straight), **Full** (level lines too) and **Auto** (a
+  balanced Full).
+- **Guided:** drag along two to four things that should be upright or level, and the photo turns
+  to match as you draw.
+- **Vertical**, **Horizontal**, **Rotate**, **Aspect**, **Scale** and **X / Y Offset** sliders, as
+  in Lightroom. The correction follows the lens's focal length from the photo, and the crop stays
+  inside the corrected photo. **Grid** shows lines over the photo while you judge it.
+- Saved with the photo's edit and in versions; AI assistants can set the sliders too.
+
 ### Name people on the photo
 - **Faces** at the bottom of the photo (or **F**) outlines the faces found in it, with each
   person's name under their face. Click a face to name it; names you already use come up as you
@@ -32,24 +45,19 @@ photo.
 - A mask's edge is worked out on a copy of the photo about 2,400 pixels across, so at 100% zoom
   on a big photo its edge is soft rather than pixel-sharp.
 - No gradient or radial masks, and no AI subject or sky selection yet.
-- An older Develop shows these photos without their masks, and editing one there removes its
-  masks. Update every computer that edits the same photos (a shared library included).
-
----
-
-## What came in Develop 0.5.1
-
-A small update that helps find the cause when Develop stops responding.
-
-### New
-- If the window stops responding for more than a few seconds, Develop now writes down what it
-  was doing in `freeze.log` in its settings folder, and notes when it responds again. If Develop
-  ever freezes for you, please send that file along with what you were doing.
+- Upright and the Transform sliders have not yet been compared with Lightroom's on reference
+  photos, so the same numbers may correct a little more or less. Guided lines are not kept with
+  the photo (the correction they set is).
+- Upright looks at a copy of the photo about 1,200 pixels across: photos with few long straight
+  edges (night scenes, nature) may give little or no correction; Guided works on any photo.
+- An older Develop shows these photos without their masks and perspective correction, and
+  editing one there removes them. Update every computer that edits the same photos (a shared
+  library included).
 
 ### Installing
-- **Windows:** run `develop_0.5.1_x64-setup.exe`, or update from inside Develop. It installs
+- **Windows:** run `develop_0.5.2_x64-setup.exe`, or update from inside Develop. It installs
   over an earlier version and keeps your settings, library and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.1_aarch64.dmg`, see below.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.2_aarch64.dmg`, see below.
 - Coming from 0.4.1 or earlier: the first time it opens, it moves the library into its new form.
   The old files are left as they were, so an older Develop still works.
 
@@ -88,6 +96,17 @@ Then open the app again.
 ```
 codesign --force --deep --sign - /Applications/Develop.app
 ```
+
+---
+
+## What came in Develop 0.5.1
+
+A small update that helps find the cause when Develop stops responding.
+
+### New
+- If the window stops responding for more than a few seconds, Develop now writes down what it
+  was doing in `freeze.log` in its settings folder, and notes when it responds again. If Develop
+  ever freezes for you, please send that file along with what you were doing.
 
 ---
 

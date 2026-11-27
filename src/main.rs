@@ -40,6 +40,7 @@ mod skin;
 mod spots;
 mod theme;
 mod tone;
+mod transform;
 mod todng;
 mod ui;
 mod update;
@@ -1231,6 +1232,20 @@ struct App {
     /// typed so far), the open photo's content key (how its faces are filed) and how the camera
     /// turned it (its faces were found on the upright preview), and a search for faces under way
     /// for a photo never looked at.
+    /// Perspective correction (Transform): the sliders, the grid over the photo, Guided Upright
+    /// (on, the lines drawn, the line being drawn from), Upright waiting for the photo (from the
+    /// command line) and a note on what Upright did.
+    transform: transform::Settings,
+    /// The photo, perspective and angle the crop was last fitted inside.
+    fitted_for: Option<(PathBuf, [u32; 6], u32)>,
+    transform_grid: bool,
+    /// Open the Transform section and scroll to it on the next frame.
+    transform_reveal: bool,
+    guide_tool: bool,
+    guides: Vec<transform::Line>,
+    guide_drag: Option<[f32; 2]>,
+    upright_wanted: Option<transform::Upright>,
+    upright_note: Option<String>,
     show_faces: bool,
     face_naming: Option<(u8, String, bool)>,
     face_key: String,
@@ -1454,6 +1469,15 @@ impl App {
             mask_overlay: true,
             mask_reveal: false,
             mask_state: Default::default(),
+            transform: transform::DEFAULT,
+            fitted_for: None,
+            transform_grid: false,
+            transform_reveal: false,
+            guide_tool: false,
+            guides: Vec::new(),
+            guide_drag: None,
+            upright_wanted: None,
+            upright_note: None,
             show_faces: false,
             face_naming: None,
             face_key: String::new(),
@@ -1766,6 +1790,10 @@ impl App {
                 self.spot_drag = None;
                 self.spot_preview = spots::Preview::from_mips(&image.mips, 2400);
                 self.heal_grids.borrow_mut().clear();
+                self.transform = transform::DEFAULT;
+                self.guides.clear();
+                self.guide_drag = None;
+                self.upright_note = None;
                 self.masks.clear();
                 self.mask_selected = None;
                 self.mask_paint = None;
@@ -1913,6 +1941,46 @@ impl App {
                         "--noise-color-smoothness" => self.sharpen[9] = value.clamp(0.0, 100.0),
                         "--sharpen-scale" => self.sharpen_scale = value,
                         "--angle" => self.angle = value.clamp(-45.0, 45.0),
+                        // Perspective, for testing: the sliders; `--upright 1..4` (Level, Vertical,
+                        // Full, Auto); a guide with `--guide-ax 0.2 --guide-ay 0.1 --guide-bx 0.25
+                        // --guide-by 0.9` (the last adds it and solves); `--grid 1`, `--guide-tool 1`.
+                        "--vertical" => self.transform[0] = value.clamp(-100.0, 100.0),
+                        "--horizontal" => self.transform[1] = value.clamp(-100.0, 100.0),
+                        "--t-aspect" => self.transform[2] = value.clamp(-100.0, 100.0),
+                        "--t-scale" => self.transform[3] = value.clamp(50.0, 150.0),
+                        "--t-x" => self.transform[4] = value.clamp(-100.0, 100.0),
+                        "--t-y" => self.transform[5] = value.clamp(-100.0, 100.0),
+                        "--grid" => self.transform_grid = value > 0.5,
+                        "--guide-tool" => {
+                            self.guide_tool = value > 0.5;
+                            self.transform_reveal = true;
+                        }
+                        "--upright" => {
+                            self.upright_wanted = match value as i32 {
+                                1 => Some(transform::Upright::Level),
+                                2 => Some(transform::Upright::Vertical),
+                                3 => Some(transform::Upright::Full),
+                                4 => Some(transform::Upright::Auto),
+                                _ => None,
+                            }
+                        }
+                        "--guide-ax" => self.guides.push(transform::Line { a: [value, 0.0], b: [0.0, 0.0], weight: 1.0 }),
+                        "--guide-ay" => {
+                            if let Some(g) = self.guides.last_mut() {
+                                g.a[1] = value;
+                            }
+                        }
+                        "--guide-bx" => {
+                            if let Some(g) = self.guides.last_mut() {
+                                g.b[0] = value;
+                            }
+                        }
+                        "--guide-by" => {
+                            if let Some(g) = self.guides.last_mut() {
+                                g.b[1] = value;
+                            }
+                            self.upright_wanted = Some(transform::Upright::Guided);
+                        }
                         "--crop-l" => self.crop[0] = value,
                         "--crop-t" => self.crop[1] = value,
                         "--crop-r" => self.crop[2] = value,
@@ -2068,6 +2136,7 @@ impl App {
                         self.crop = saved.crop;
                         self.crop_wish = saved.crop;
                         self.angle = saved.angle;
+                        self.transform = saved.transform;
                         self.render_key = None;
                         self.thumb_shows = None;
                     }
@@ -2356,6 +2425,7 @@ impl App {
                         saved.quarter_turns = existing.map_or(255, |s| s.quarter_turns);
                         saved.crop = existing.map_or(crop::FULL, |s| s.crop);
                         saved.angle = existing.map_or(0.0, |s| s.angle);
+                        saved.transform = existing.map_or(transform::DEFAULT, |s| s.transform);
                         self.store.put(&target, saved);
                         if let Some(file) = settings::thumb_file(&target) {
                             let _ = std::fs::remove_file(file);
@@ -2398,6 +2468,7 @@ impl App {
             denoise: self.denoise,
             crop: self.crop,
             angle: self.angle,
+            transform: self.transform,
             sharpen: self.sharpen,
             tint: self.tint,
             presence: self.presence,
@@ -2667,6 +2738,11 @@ impl App {
             mask_info: [0.0; 4],
             mask_vals: [[0.0; 4]; masks::MAX_MASKS * 3],
             mask_wb: [[0.0; 4]; masks::MAX_MASKS],
+            persp: {
+                let back = self.persp_forward(loaded).and_then(|f| transform::invert(&f));
+                back.map_or([[0.0; 4]; 3], |m| m.map(|r| [r[0], r[1], r[2], 0.0]))
+            },
+            persp_info: [if self.persp_forward(loaded).is_some() { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
             srgb_to_work: {
                 let inv = color::invert(&render.work_to_srgb).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
                 rows(&inv)
@@ -2711,7 +2787,262 @@ impl App {
     fn geometry(&self) -> Option<crop::Geometry> {
         let loaded = self.loaded.as_ref()?;
         let (w, h) = self.display_size(loaded);
-        Some(crop::Geometry::new(w as f32, h as f32, self.angle))
+        Some(crop::Geometry::new(w as f32, h as f32, self.angle).with_perspective(self.persp_forward(loaded)))
+    }
+
+    /// The lens's focal length in heights of the displayed picture (for the perspective
+    /// correction).
+    fn focal_heights(&self, loaded: &Loaded) -> f32 {
+        let crop = self.lens_db.find_camera(&loaded.exif.make, &loaded.exif.model).map_or(1.0, |c| c.crop);
+        let (w, h) = self.display_size(loaded);
+        transform::focal_heights(loaded.exif.focal, crop, h > w)
+    }
+
+    /// The perspective correction (picture -> shown), when the sliders change anything.
+    fn persp_forward(&self, loaded: &Loaded) -> Option<transform::M3> {
+        (!transform::is_identity(&self.transform)).then(|| transform::forward(&self.transform, self.focal_heights(loaded)))
+    }
+
+    /// Upright: find the photo's straight lines (or take the drawn guides) and set Vertical,
+    /// Horizontal and the angle so they stand straight. The crop is fitted inside again.
+    fn upright(&mut self, mode: transform::Upright) {
+        let Some(loaded) = &self.loaded else { return };
+        let (w, h) = self.display_size(loaded);
+        let aspect = w as f32 / h.max(1) as f32;
+        let focal = self.focal_heights(loaded);
+        let lines: Vec<transform::Line> = if mode == transform::Upright::Guided {
+            self.guides.clone()
+        } else {
+            // On the small copy of the photo (as stored), then onto the displayed picture with
+            // the lens correction, as the guides are.
+            let p = &self.spot_preview;
+            let (mut rgb, mut pw, mut ph) = (p.rgb.clone(), p.width, p.height);
+            while pw.max(ph) > 1400 {
+                let (nw, nh) = (pw / 2, ph / 2);
+                let mut half = vec![0.0f32; nw * nh * 3];
+                for y in 0..nh {
+                    for x in 0..nw {
+                        for c in 0..3 {
+                            let at = |xx: usize, yy: usize| rgb[(yy * pw + xx) * 3 + c];
+                            half[(y * nw + x) * 3 + c] = 0.25 * (at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1));
+                        }
+                    }
+                }
+                (rgb, pw, ph) = (half, nw, nh);
+            }
+            let found = transform::find_lines(&rgb, pw, ph);
+            // DEVELOP_DEBUG_UPRIGHT=<file.png>: the small copy with the lines found drawn on it.
+            if let Some(file) = std::env::var_os("DEVELOP_DEBUG_UPRIGHT").filter(|f| f.to_string_lossy().ends_with(".png")) {
+                let mut img = image::RgbImage::from_fn(pw as u32, ph as u32, |x, y| {
+                    let i = (y as usize * pw + x as usize) * 3;
+                    image::Rgb([0, 1, 2].map(|c| (rgb[i + c].max(0.0).sqrt().min(1.0) * 200.0) as u8))
+                });
+                for (a, b, _) in &found {
+                    for k in 0..=400 {
+                        let t = k as f32 / 400.0;
+                        let (x, y) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                        if x >= 0.0 && y >= 0.0 && (x as u32) < pw as u32 && (y as u32) < ph as u32 {
+                            img.put_pixel(x as u32, y as u32, image::Rgb([255, 40, 40]));
+                        }
+                    }
+                }
+                let _ = img.save(file);
+            }
+            let mut u = self.uniforms_with(loaded, [1.0, 1.0, 0.5, 0.5], true, &self.adjust, self.tint, self.sharpen, self.presence, &self.lens);
+            u.persp_info[0] = 0.0;
+            let map = spots::ScreenMap::new(&u, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)), loaded.width / loaded.height.max(1.0));
+            let to_picture = |q: [f32; 2]| map.texture_to_picture([q[0] / pw as f32, q[1] / ph as f32]);
+            found.into_iter().map(|(a, b, n)| transform::Line { a: to_picture(a), b: to_picture(b), weight: n }).collect()
+        };
+        if lines.is_empty() {
+            self.upright_note = Some(match mode {
+                transform::Upright::Guided => "Draw a line along something that should be straight.".to_owned(),
+                _ => "No straight lines found to set it by.".to_owned(),
+            });
+            return;
+        }
+        let (v, hz, angle) = transform::solve(&lines, aspect, focal, mode);
+        if std::env::var_os("DEVELOP_DEBUG_UPRIGHT").is_some() {
+            eprintln!("upright {mode:?}: {} lines, focal {focal:.2} heights -> vertical {v:.1}, horizontal {hz:.1}, angle {angle:.2}", lines.len());
+        }
+        self.transform[0] = (v * 10.0).round() / 10.0;
+        self.transform[1] = (hz * 10.0).round() / 10.0;
+        self.angle = (angle * 100.0).round() / 100.0;
+        self.refit_crop();
+        self.upright_note = Some(match mode {
+            transform::Upright::Guided => format!("Set from {} guide{}.", lines.len(), if lines.len() == 1 { "" } else { "s" }),
+            _ => format!("Set from {} straight lines.", lines.len()),
+        });
+    }
+
+    /// The "Transform" section: Upright, the guides, and the sliders.
+    fn transform_panel(&mut self, ui: &mut egui::Ui) {
+        let amber = theme::ACCENT;
+        let has = self.loaded.is_some();
+        ui.add_enabled_ui(has, |ui| {
+            ui.label(egui::RichText::new("Upright").font(theme::font(12.0)).color(theme::TEXT_HEADER));
+            let mut run = None;
+            ui.columns(4, |cols| {
+                let modes = [
+                    ("Auto", transform::Upright::Auto, "A balanced correction: the angle, and the tilt where the photo's lines call for it, held back where it would be strong"),
+                    ("Level", transform::Upright::Level, "Only the angle, so the horizon and level lines lie level"),
+                    ("Vertical", transform::Upright::Vertical, "The angle and Vertical: upright lines (buildings, poles) stand straight"),
+                    ("Full", transform::Upright::Full, "The angle, Vertical and Horizontal: upright and level lines both straight"),
+                ];
+                for (col, (label, mode, hint)) in cols.iter_mut().zip(modes) {
+                    let width = col.available_width();
+                    if ui::button(col, label, egui::vec2(width, 24.0), ui::Look::bordered(), theme::font(12.0), None).on_hover_text(hint).clicked() {
+                        run = Some(mode);
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.columns(2, |cols| {
+                let width = cols[0].available_width();
+                let look = if self.guide_tool { ui::Look::teal() } else { ui::Look::bordered() };
+                let text = if self.guide_tool { "Done" } else { "Guided" };
+                if ui::button(&mut cols[0], text, egui::vec2(width, 24.0), look, theme::font(12.0), None)
+                    .on_hover_text("Draw two to four lines on the photo along things that should be upright or level; the photo is turned to match")
+                    .clicked()
+                {
+                    self.guide_tool = !self.guide_tool;
+                    self.guide_drag = None;
+                    if self.guide_tool {
+                        self.spot_tool = false;
+                        self.mask_tool = false;
+                        self.crop_mode = false;
+                        self.wb_pick = false;
+                    }
+                }
+                let width = cols[1].available_width();
+                if cols[1]
+                    .add_enabled_ui(!self.guides.is_empty(), |ui| ui::button(ui, "Clear Guides", egui::vec2(width, 24.0), ui::Look::secondary(), theme::font(12.0), None))
+                    .inner
+                    .clicked()
+                {
+                    self.guides.clear();
+                }
+            });
+            if let Some(mode) = run {
+                self.upright(mode);
+            }
+            if let Some(note) = &self.upright_note {
+                ui.label(ui::dim(note.as_str(), 11.0));
+            }
+            ui.add_space(6.0);
+            let before = (self.transform, self.angle);
+            for i in 0..6 {
+                let (name, lo, hi, default, unit, hint) = transform::SLIDERS[i];
+                if i == 2 {
+                    // The angle is the Crop section's, shown here too (Lightroom's Rotate).
+                    ui::pro_slider_with(ui, "Rotate", &mut self.angle, -45.0..=45.0, 0.0, "°", amber, 2, 0.01, false);
+                }
+                let decimals = if i < 2 { 1 } else { 0 };
+                ui::pro_slider_with(ui, name, &mut self.transform[i], lo..=hi, default, unit, amber, decimals, if i < 2 { 0.1 } else { 1.0 }, false);
+                let _ = hint;
+            }
+            if (self.transform, self.angle) != before {
+                self.refit_crop();
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui::toggle(ui, &mut self.transform_grid, "Grid").on_hover_text("Lines over the photo, to judge what is straight");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui::button(ui, "Reset", egui::vec2(58.0, 22.0), ui::Look::secondary(), theme::font(12.0), None).on_hover_text("Set every Transform slider back (the angle too)").clicked() {
+                        self.transform = transform::DEFAULT;
+                        self.angle = 0.0;
+                        self.upright_note = None;
+                        self.refit_crop();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Guided Upright on the photo: drag to draw a line along something that should be upright
+    /// or level; each line drawn sets the photo again. Right-click a line to remove it.
+    fn guide_input(guides: &mut Vec<transform::Line>, guide_drag: &mut Option<[f32; 2]>, wanted: &mut Option<transform::Upright>, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, pan: bool) {
+        let inside = |t: [f32; 2]| (0.0..=1.0).contains(&t[0]) && (0.0..=1.0).contains(&t[1]);
+        if response.drag_started_by(egui::PointerButton::Primary) && !pan {
+            if let Some(t) = ui.input(|i| i.pointer.press_origin()).map(|o| map.to_picture(o)).filter(|&t| inside(t)) {
+                *guide_drag = Some(t);
+            }
+        }
+        if guide_drag.is_some() && !ui.input(|i| i.pointer.primary_down()) {
+            let start = guide_drag.take();
+            if let (Some(a), Some(p)) = (start, response.interact_pointer_pos().or(ui.input(|i| i.pointer.latest_pos()))) {
+                let b = map.to_picture(p);
+                let (sa, sb) = (map.picture_to_screen(a), map.picture_to_screen(b));
+                if inside(b) && (sa - sb).length() > 20.0 {
+                    if guides.len() >= 4 {
+                        guides.remove(0);
+                    }
+                    guides.push(transform::Line { a, b, weight: 1.0 });
+                    *wanted = Some(transform::Upright::Guided);
+                }
+            }
+        }
+        if response.secondary_clicked() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let near = guides.iter().position(|g| {
+                    let (a, b) = (map.picture_to_screen(g.a), map.picture_to_screen(g.b));
+                    let ab = b - a;
+                    let t = ((p - a).dot(ab) / ab.length_sq().max(1.0)).clamp(0.0, 1.0);
+                    (a + ab * t - p).length() < 8.0
+                });
+                if let Some(i) = near {
+                    guides.remove(i);
+                    if !guides.is_empty() {
+                        *wanted = Some(transform::Upright::Guided);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The guides and the line being drawn, and a hint, over the photo.
+    fn guide_overlay(&self, ui: &egui::Ui, response: &egui::Response, map: &spots::ScreenMap, rect: egui::Rect) {
+        let painter = ui.painter().with_clip_rect(rect);
+        let shadow = egui::Stroke::new(3.5_f32, egui::Color32::from_black_alpha(130));
+        let line = egui::Stroke::new(1.75_f32, theme::ACCENT);
+        let draw = |a: egui::Pos2, b: egui::Pos2| {
+            painter.line_segment([a, b], shadow);
+            painter.line_segment([a, b], line);
+            for p in [a, b] {
+                painter.circle(p, 4.0, theme::ACCENT, egui::Stroke::new(1.0_f32, egui::Color32::BLACK));
+            }
+        };
+        for g in &self.guides {
+            draw(map.picture_to_screen(g.a), map.picture_to_screen(g.b));
+        }
+        if let (Some(a), Some(p)) = (self.guide_drag, response.interact_pointer_pos().or(response.hover_pos())) {
+            draw(map.picture_to_screen(a), p);
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let hint = format!("Guided  ·  Drag along something that should be upright or level ({} of 4 drawn)  ·  Right-click a line to remove it  ·  Esc done", self.guides.len());
+        let galley = painter.layout_no_wrap(hint, theme::font(11.5), theme::TEXT);
+        let back = egui::Rect::from_center_size(rect.center_top() + egui::vec2(0.0, 10.0 + galley.size().y * 0.5 + 4.0), galley.size() + egui::vec2(16.0, 8.0));
+        painter.rect_filled(back, 5.0, egui::Color32::from_rgba_unmultiplied(0x18, 0x1A, 0x1E, 0xD8));
+        painter.galley(back.min + egui::vec2(8.0, 4.0), galley, theme::TEXT);
+    }
+
+    /// Even lines over the shown photo, to judge what is straight.
+    fn grid_overlay(&self, ui: &egui::Ui, rect: egui::Rect, photo: egui::Rect) {
+        let painter = ui.painter().with_clip_rect(rect.intersect(photo));
+        let thin = egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(70));
+        let step = (photo.width().min(photo.height()) / 8.0).max(24.0);
+        let mut x = photo.left() + step;
+        while x < photo.right() {
+            painter.line_segment([egui::pos2(x, photo.top()), egui::pos2(x, photo.bottom())], thin);
+            x += step;
+        }
+        let mut y = photo.top() + step;
+        while y < photo.bottom() {
+            painter.line_segment([egui::pos2(photo.left(), y), egui::pos2(photo.right(), y)], thin);
+            y += step;
+        }
     }
 
     /// After the straighten angle changed: fit the wanted crop inside the turned picture.
@@ -2886,8 +3217,9 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let view_px = rect.size() * ppp;
         // How many frame units the viewport spans, for a given angle.
+        let persp = self.loaded.as_ref().and_then(|l| self.persp_forward(l));
         let span_for = |angle: f32| {
-            let (bw, bh) = crop::Geometry::new(full.x, full.y, angle).bounds();
+            let (bw, bh) = crop::Geometry::new(full.x, full.y, angle).with_perspective(persp).bounds();
             let dims = egui::vec2(full.x * bw, full.y * bh);
             let fit = (view_px.x / dims.x).min(view_px.y / dims.y) * 0.9;
             view_px / (dims * fit) * egui::vec2(bw, bh)
@@ -2934,7 +3266,7 @@ impl App {
         }
         if response.dragged_by(egui::PointerButton::Primary) {
             if let (Some(drag), Some(p)) = (self.crop_drag, response.interact_pointer_pos()) {
-                let geometry = crop::Geometry::new(full.x, full.y, self.angle);
+                let geometry = crop::Geometry::new(full.x, full.y, self.angle).with_perspective(persp);
                 match drag.handle {
                     Some(handle) => {
                         let delta = (p - drag.origin) / rect.size() * span;
@@ -3031,6 +3363,7 @@ impl App {
     /// and compression) does not block the window.
     fn start_export(&mut self, path: PathBuf, ctx: &egui::Context) {
         freeze::step("start export");
+        self.fit_crop_to_geometry();
         self.sync_heal();
         self.sync_masks();
         let Some(loaded) = &self.loaded else { return };
@@ -3585,6 +3918,7 @@ impl App {
         self.crop = saved.crop;
         self.crop_wish = saved.crop;
         self.angle = saved.angle;
+        self.transform = saved.transform;
         self.render_key = None;
     }
 
@@ -3846,6 +4180,17 @@ impl App {
     /// Draw the masks' pictures that are new or have changed, paint the newest part of the
     /// stroke being painted, and send what changed to the GPU. Called once a frame, before
     /// anything holds the renderer.
+    fn fit_crop_to_geometry(&mut self) {
+        let Some(path) = self.loaded.as_ref().map(|l| l.path.clone()) else { return };
+        let now = (path, self.transform.map(f32::to_bits), self.angle.to_bits());
+        if self.fitted_for.as_ref() != Some(&now) {
+            if self.fitted_for.as_ref().is_some_and(|f| f.0 == now.0) || !transform::is_identity(&self.transform) || self.angle != 0.0 {
+                self.refit_crop();
+            }
+            self.fitted_for = Some(now);
+        }
+    }
+
     fn sync_masks(&self) {
         freeze::step("sync masks");
         if self.loaded.is_none() || self.spot_preview.width == 0 {
@@ -4646,6 +4991,7 @@ impl App {
             mono: false,
             mono_mix: [0.0; 8],
             masks: Vec::new(),
+            transform: transform::DEFAULT,
         }
     }
 
@@ -4808,6 +5154,9 @@ impl App {
         self.masks.clear();
         self.mask_selected = None;
         self.mask_paint = None;
+        self.transform = transform::DEFAULT;
+        self.guides.clear();
+        self.upright_note = None;
         self.lens = lens::LensSettings::default();
         self.reset_crop();
     }
@@ -6823,6 +7172,14 @@ impl App {
         });
 
         ui::section(ui, "Lens Correction", false, "Lens profiles (Lensfun XML or the camera's own data) and manual distortion, fringe and vignette", |ui| self.lens_panel(ui));
+        let reveal = std::mem::take(&mut self.transform_reveal);
+        if reveal {
+            ui::set_section_open("Transform", true);
+        }
+        ui::section(ui, "Transform", false, "Perspective correction: Upright, Guided lines, and the Vertical, Horizontal, Aspect, Scale and offset sliders", |ui| self.transform_panel(ui));
+        if reveal {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        }
 
         // Switching the brush on opens this section and scrolls it into view.
         let reveal = std::mem::take(&mut self.mask_reveal);
@@ -7139,6 +7496,7 @@ impl App {
             self.spot_paint = None;
             self.mask_tool = false;
             self.mask_paint = None;
+            self.guide_tool = false;
             self.crop_viewport(ui, rect, &response);
             return;
         }
@@ -7186,6 +7544,12 @@ impl App {
             let mut io = SpotInput { spots: &mut self.spots, selected: &mut self.spot_selected, drag: &mut self.spot_drag, paint: &mut self.spot_paint };
             io.handle(&self.spot_brush, &self.spot_preview, ui, &response, &map, pan);
         }
+        // Guided Upright: drags draw guide lines.
+        if self.guide_tool {
+            let map = self.spot_map(loaded, rect, view_px / (dims * zoom), cropped);
+            let pan = ui.input(|i| i.key_down(egui::Key::Space));
+            Self::guide_input(&mut self.guides, &mut self.guide_drag, &mut self.upright_wanted, ui, &response, &map, pan);
+        }
         // Mask brush: drags paint, clicks dab (before panning sees them).
         if self.mask_tool {
             let map = self.spot_map(loaded, rect, view_px / (dims * zoom), cropped);
@@ -7212,7 +7576,7 @@ impl App {
         if factor != 1.0 {
             target = Some(zoom * factor);
         }
-        if response.double_clicked() && !self.spot_tool && !self.mask_tool && !self.wb_pick {
+        if response.double_clicked() && !self.spot_tool && !self.mask_tool && !self.guide_tool && !self.wb_pick {
             target = Some(if self.zoom.is_some() { fit } else { 1.0_f32.max(fit * 2.0) });
         }
         if let Some(target) = target {
@@ -7223,7 +7587,9 @@ impl App {
             zoom = new_zoom;
         }
         let space = ui.input(|i| i.key_down(egui::Key::Space));
-        let spot_busy = (self.spot_tool && (!space || self.spot_drag.is_some() || self.spot_paint.is_some())) || (self.mask_tool && (!space || self.mask_paint.is_some()));
+        let spot_busy = (self.spot_tool && (!space || self.spot_drag.is_some() || self.spot_paint.is_some()))
+            || (self.mask_tool && (!space || self.mask_paint.is_some()))
+            || (self.guide_tool && (!space || self.guide_drag.is_some()));
         if (response.dragged_by(egui::PointerButton::Primary) && !spot_busy) || response.dragged_by(egui::PointerButton::Middle) {
             self.center -= response.drag_delta() * ppp / (dims * zoom);
         }
@@ -7306,6 +7672,16 @@ impl App {
         if self.mask_tool {
             let map = self.spot_map(loaded, rect, scale, cropped);
             self.mask_overlay_ui(ui, &response, &map, rect);
+        }
+        if self.transform_grid || self.guide_tool {
+            // The photo's area on screen: the cropped picture, centred, at this zoom.
+            let shown = egui::vec2(rect.width().min(rect.width() / scale.x), rect.height().min(rect.height() / scale.y));
+            let centre = rect.center() + egui::vec2((0.5 - self.center.x) / scale.x * rect.width(), (0.5 - self.center.y) / scale.y * rect.height());
+            self.grid_overlay(ui, rect, egui::Rect::from_center_size(centre, shown));
+        }
+        if self.guide_tool {
+            let map = self.spot_map(loaded, rect, scale, cropped);
+            self.guide_overlay(ui, &response, &map, rect);
         }
         if self.show_faces && !self.spot_tool && !self.mask_tool && !self.ab_split {
             let map = self.spot_map(loaded, rect, scale, cropped);
@@ -7429,6 +7805,12 @@ impl App {
         }
         self.quit_guard(ctx);
         self.poll_loader();
+        if self.loaded.is_some() && self.loading.is_none() {
+            if let Some(mode) = self.upright_wanted.take() {
+                self.upright(mode);
+            }
+            self.fit_crop_to_geometry();
+        }
         self.sync_heal();
         self.sync_masks();
         self.update_dialog(ctx);
@@ -7754,6 +8136,10 @@ impl App {
                 self.set_wb_pick(!self.wb_pick);
             } else if esc && self.wb_pick {
                 self.wb_pick = false;
+            }
+            if self.guide_tool && esc {
+                self.guide_tool = false;
+                self.guide_drag = None;
             }
             // F shows the faces on the photo.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::F)) {

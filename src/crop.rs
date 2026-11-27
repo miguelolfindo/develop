@@ -129,26 +129,41 @@ fn lerp(a: Rect, b: Rect, t: f32) -> Rect {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 
-/// The displayed picture's shape and straighten angle.
+/// The displayed picture's shape, straighten angle and perspective correction.
 #[derive(Clone, Copy)]
 pub struct Geometry {
     /// Width / height of the displayed picture.
     pub aspect: f32,
     pub cos: f32,
     pub sin: f32,
+    /// Perspective correction (see transform.rs): shown -> picture, picture -> shown.
+    pub persp: Option<(crate::transform::M3, crate::transform::M3)>,
 }
 
 impl Geometry {
     pub fn new(width: f32, height: f32, angle_degrees: f32) -> Self {
         let a = angle_degrees.to_radians();
-        Self { aspect: width / height.max(1.0), cos: a.cos(), sin: a.sin() }
+        Self { aspect: width / height.max(1.0), cos: a.cos(), sin: a.sin(), persp: None }
+    }
+
+    /// With the perspective correction `forward` (picture -> shown).
+    pub fn with_perspective(mut self, forward: Option<crate::transform::M3>) -> Self {
+        self.persp = forward.and_then(|f| Some((crate::transform::invert(&f)?, f)));
+        self
     }
 
     /// Where a point of the straightened frame falls on the picture (0..1 = inside).
     /// The shader does the same sum.
     pub fn source(&self, (x, y): (f32, f32)) -> (f32, f32) {
         let (qx, qy) = (x - 0.5, y - 0.5);
-        (self.cos * qx - self.sin * qy / self.aspect + 0.5, self.sin * qx * self.aspect + self.cos * qy + 0.5)
+        let d = (self.cos * qx - self.sin * qy / self.aspect + 0.5, self.sin * qx * self.aspect + self.cos * qy + 0.5);
+        match &self.persp {
+            Some((back, _)) => match crate::transform::apply(back, [(d.0 - 0.5) * self.aspect, d.1 - 0.5]) {
+                Some(p) => (p[0] / self.aspect + 0.5, p[1] + 0.5),
+                None => (-9.0, -9.0),
+            },
+            None => d,
+        }
     }
 
     /// True if the whole rectangle shows picture (no empty corners).
@@ -160,9 +175,27 @@ impl Geometry {
         })
     }
 
-    /// Size of the turned picture's bounding box, in the same normalised units.
+    /// Size of the turned (and corrected) picture's bounding box around the centre, in the
+    /// same normalised units.
     pub fn bounds(&self) -> (f32, f32) {
-        (self.cos.abs() + self.sin.abs() / self.aspect, self.sin.abs() * self.aspect + self.cos.abs())
+        let Some((_, fwd)) = &self.persp else {
+            return (self.cos.abs() + self.sin.abs() / self.aspect, self.sin.abs() * self.aspect + self.cos.abs());
+        };
+        let a = self.aspect;
+        let (mut bx, mut by) = (0.0f32, 0.0f32);
+        // Along the edges, as a corrected edge stays straight but the picture may not be centred.
+        for i in 0..=16 {
+            let t = i as f32 / 16.0 - 0.5;
+            for p in [[t * a, -0.5], [t * a, 0.5], [-0.5 * a, t], [0.5 * a, t]] {
+                if let Some(s) = crate::transform::apply(fwd, p) {
+                    // Turned back into the frame.
+                    let (x, y) = (self.cos * s[0] + self.sin * s[1], -self.sin * s[0] + self.cos * s[1]);
+                    bx = bx.max(x.abs() / a);
+                    by = by.max(y.abs());
+                }
+            }
+        }
+        ((2.0 * bx).clamp(0.05, 8.0), (2.0 * by).clamp(0.05, 8.0))
     }
 
     /// As far from the valid rectangle `from` towards `wanted` as stays inside the picture.

@@ -91,6 +91,11 @@ pub struct Uniforms {
     pub mask_info: [f32; 4],
     pub mask_vals: [[f32; 4]; crate::masks::MAX_MASKS * 3],
     pub mask_wb: [[f32; 4]; crate::masks::MAX_MASKS],
+    /// Perspective correction (see transform.rs): rows of the matrix from a point shown to the
+    /// point of the displayed picture it comes from, in centred picture-height units; x of
+    /// `persp_info` = 1 when on.
+    pub persp: [[f32; 4]; 3],
+    pub persp_info: [f32; 4],
 }
 
 /// Export renders into half floats and converts on the CPU, so 16-bit output is real 16-bit.
