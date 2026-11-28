@@ -1,4 +1,62 @@
-## Develop 0.5.2
+## Develop 0.5.3
+
+A small update with two export fixes.
+
+### Fixed
+- **Show in folder** after an export opened your Documents folder instead of the one you exported
+  to, whenever the folder's name or path had a space in it. It now opens the right folder, with
+  the exported photo selected. Show in File Explorer on photos and faces is fixed the same way.
+- The **Export…** button in the Export dialog was easy to miss. It is now the large orange
+  button at the bottom, like the one in the Inspector.
+
+### Installing
+- **Windows:** run `develop_0.5.3_x64-setup.exe`, or update from inside Develop. It installs
+  over an earlier version and keeps your settings, library and sidecar files.
+- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.3_aarch64.dmg`, see below.
+- Coming from 0.4.1 or earlier: the first time it opens, it moves the library into its new form.
+  The old files are left as they were, so an older Develop still works.
+- Coming from 0.5.1 or earlier: see what came in 0.5.2 below (masks, perspective correction,
+  naming people on the photo), including its note about older versions.
+
+#### macOS
+
+**1. Install**
+
+1. Double-click the `.dmg`. A window opens showing Develop.
+2. Drag Develop into the Applications folder.
+3. Eject the disk image (the eject icon next to it in Finder's sidebar).
+
+**2. First launch (the app is unsigned)**
+
+Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
+
+1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
+   it can't verify the developer.
+2. Click **Done** or **Cancel**.
+3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
+   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
+4. Double-click Develop again and click **Open** in the dialog.
+
+From then on it opens normally.
+
+**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
+flag, not real damage. Open Terminal and run:
+
+```
+xattr -cr /Applications/Develop.app
+```
+
+Then open the app again.
+
+**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
+
+```
+codesign --force --deep --sign - /Applications/Develop.app
+```
+
+---
+
+## What came in Develop 0.5.2
 
 Masks: sliders that change only the parts of a photo you paint, perspective correction, and
 naming people right on the photo.
@@ -53,49 +111,6 @@ naming people right on the photo.
 - An older Develop shows these photos without their masks and perspective correction, and
   editing one there removes them. Update every computer that edits the same photos (a shared
   library included).
-
-### Installing
-- **Windows:** run `develop_0.5.2_x64-setup.exe`, or update from inside Develop. It installs
-  over an earlier version and keeps your settings, library and sidecar files.
-- **macOS (Apple silicon, macOS 13.4 or later):** `Develop_0.5.2_aarch64.dmg`, see below.
-- Coming from 0.4.1 or earlier: the first time it opens, it moves the library into its new form.
-  The old files are left as they were, so an older Develop still works.
-
-#### macOS
-
-**1. Install**
-
-1. Double-click the `.dmg`. A window opens showing Develop.
-2. Drag Develop into the Applications folder.
-3. Eject the disk image (the eject icon next to it in Finder's sidebar).
-
-**2. First launch (the app is unsigned)**
-
-Develop isn't signed with an Apple developer certificate, so macOS blocks it the first time.
-
-1. Open Applications and double-click Develop. macOS will say it can't be opened, or that
-   it can't verify the developer.
-2. Click **Done** or **Cancel**.
-3. Open **System Settings → Privacy & Security** and scroll down to **Security**. You'll see
-   a line saying "Develop" was blocked. Click **Open Anyway**, then enter your password.
-4. Double-click Develop again and click **Open** in the dialog.
-
-From then on it opens normally.
-
-**If macOS says "Develop is damaged and can't be opened":** that's the download quarantine
-flag, not real damage. Open Terminal and run:
-
-```
-xattr -cr /Applications/Develop.app
-```
-
-Then open the app again.
-
-**If it bounces in the Dock and quits immediately,** re-sign it locally and try again:
-
-```
-codesign --force --deep --sign - /Applications/Develop.app
-```
 
 ---
 

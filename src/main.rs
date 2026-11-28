@@ -798,7 +798,19 @@ fn maker_baseline(make: &str, model: &str) -> f32 {
 fn reveal_in_folder(path: &Path) {
     let result = if cfg!(windows) {
         if path.is_file() {
-            std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
+            // Explorer reads `/select,"path"` itself: the usual quoting of the whole argument
+            // ("/select,O:\a b\c.jpg" in quotes) makes it ignore the path when the path has a
+            // space, and it opens Documents instead. Explorer also wants backslashes.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let shown = path.display().to_string().replace('/', "\\");
+                std::process::Command::new("explorer").raw_arg(format!("/select,\"{shown}\"")).spawn()
+            }
+            #[cfg(not(windows))]
+            {
+                std::process::Command::new("explorer").arg(path).spawn()
+            }
         } else {
             std::process::Command::new("explorer").arg(path).spawn()
         }
@@ -3770,7 +3782,13 @@ impl App {
             ui.horizontal(|ui| {
                 let label = if count > 1 { format!("Export {count} photos…") } else { "Export…".to_owned() };
                 let hint = if count > 1 { "Each selected photo is exported with its own settings, into a folder you choose" } else { "Choose where to save" };
-                if ui.add_enabled(!busy, egui::Button::new(label)).on_hover_text(hint).clicked() {
+                // The dialog's main action, so it looks like the Export button in the side pane.
+                let clicked = ui
+                    .add_enabled_ui(!busy, |ui| ui::button(ui, &label, egui::vec2(150.0, 32.0), ui::Look::primary(), theme::bold(13.5), None))
+                    .inner
+                    .on_hover_text(hint)
+                    .clicked();
+                if clicked {
                     export_now = true;
                 }
                 if busy {

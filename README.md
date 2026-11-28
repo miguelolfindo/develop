@@ -150,7 +150,8 @@ also connect an AI assistant of your own through the [MCP server](#ai-assistants
   the original is never changed. Changes made by another program (an AI assistant, or a
   second copy of Develop) show at once in the open folder, and Undo goes back.
 - **Export** to JPEG, PNG or TIFF, with resizing and metadata options, one photo or a
-  batch (right-click a photo, or select several), with a progress bar.
+  batch (right-click a photo, or select several), with a progress bar and **Show in folder**
+  when it is done.
 - **Convert to DNG:** choose **DNG (original raw)** as the format in the Export dialog, or
   right-click raw photos and choose **Convert to DNG…**, to save the
   original raw data in Adobe's open DNG format, losslessly compressed (optionally with the

@@ -700,8 +700,10 @@ the whole painted shape, so wide patches blend smoothly. A photo can have up to 
 ## 7. Exporting
 
 Click **Export…** at the bottom of the inspector, press **Ctrl+E**, or right-click photos and
-choose **Export…**. With several photos selected, each is exported with its own settings into a
-folder you choose, with a progress bar; Develop says when it is finished and can show the files.
+choose **Export…**. Set the options below, then click the orange **Export…** button at the bottom
+of the dialog and choose where to save. With several photos selected, each is exported with its
+own settings into a folder you choose, with a progress bar. When it is finished, Develop says so;
+**Show in folder** opens that folder, with the exported photo selected.
 
 **Preset:** keep the export settings below under a name (**Save**), pick one, or **Delete** it.
 
